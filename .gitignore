@@ -1,0 +1,12 @@
+.cache/
+.gocache/
+.gomodcache/
+.gopath/
+.runtime/
+node_modules/
+.pnpm-store/
+*.exe
+*.exe~
+*.db
+*.db-shm
+*.db-wal
