@@ -170,6 +170,17 @@ export function addBatchTag(ids: string[], name: string) {
   });
 }
 
+export function getWebRTCConfig() {
+	return request<{ iceServers: RTCIceServer[] }>("/api/webrtc/config");
+}
+
+export function createWebRTCAnswer(sdp: string, resourceId: string) {
+	return request<{ type: "answer"; sdp: string }>("/api/webrtc/offer", {
+		method: "POST",
+		body: JSON.stringify({ sdp, resourceId }),
+	});
+}
+
 export function fileURL(id: string, download = false) {
-	return `/api/resources/${id}/file${download ? "?download=1" : ""}`;
+	return "/api/resources/" + id + "/file" + (download ? "?download=1" : "");
 }

@@ -126,6 +126,11 @@ func connectNode(hubURL, token string) error {
 func handleNodeRequest(parent context.Context, conn *websocket.Conn, writeMu *sync.Mutex, input *wireMessage) {
 	ctx, cancel := context.WithTimeout(parent, 2*time.Hour)
 	defer cancel()
+	if !allowedRemoteRequest(input.Method, input.Path) {
+		_ = writeWire(conn, ctx, writeMu, wireMessage{Type: "start", ID: input.ID, Status: http.StatusForbidden})
+		_ = writeWire(conn, ctx, writeMu, wireMessage{Type: "end", ID: input.ID})
+		return
+	}
 	target := "http://127.0.0.1:4317" + input.Path
 	request, err := http.NewRequestWithContext(ctx, input.Method, target, bytes.NewReader(input.Body))
 	if err != nil {
@@ -133,7 +138,10 @@ func handleNodeRequest(parent context.Context, conn *websocket.Conn, writeMu *sy
 		return
 	}
 	copyAllowedHeaders(request.Header, input.Headers, false)
-	response, err := http.DefaultClient.Do(request)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	response, err := client.Do(request)
 	if err != nil {
 		_ = writeWire(conn, ctx, writeMu, wireMessage{Type: "start", ID: input.ID, Status: http.StatusBadGateway})
 		_ = writeWire(conn, ctx, writeMu, wireMessage{Type: "chunk", ID: input.ID, Data: []byte("local resource service unavailable")})
@@ -224,16 +232,8 @@ func (h *remoteHub) readNode(conn *websocket.Conn) {
 }
 
 func (h *remoteHub) proxy(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/api/session") {
-		writeError(w, http.StatusNotFound, "接口不存在")
-		return
-	}
-	if r.URL.Path == "/api/directories" {
-		writeError(w, http.StatusForbidden, "目录浏览只能从家中电脑本机打开")
-		return
-	}
-	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodDelete {
-		writeError(w, http.StatusMethodNotAllowed, "不支持该请求方法")
+	if !allowedRemoteRequest(r.Method, r.URL.RequestURI()) {
+		writeError(w, http.StatusForbidden, "远程访问不支持此操作")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
@@ -317,7 +317,7 @@ func (h *remoteHub) send(conn *websocket.Conn, message wireMessage) error {
 func filteredHeaders(headers http.Header, response bool) http.Header {
 	allowed := []string{"Content-Type", "Range", "If-Modified-Since", "If-None-Match"}
 	if response {
-		allowed = []string{"Content-Type", "Content-Disposition", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag", "Cache-Control"}
+		allowed = []string{"Content-Type", "Content-Disposition", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag", "Cache-Control", "Content-Security-Policy"}
 	}
 	result := make(http.Header)
 	for _, name := range allowed {
@@ -344,4 +344,44 @@ func randomToken() (string, error) {
 
 func safeEqual(left, right string) bool {
 	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
+// allowedRemoteRequest is shared by the hub and the home node. The node must
+// not treat a connected hub as permission to invoke every loopback API.
+func allowedRemoteRequest(method, rawURI string) bool {
+	parsed, err := url.ParseRequestURI(rawURI)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.Fragment != "" || !strings.HasPrefix(rawURI, "/api/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.ContainsAny(part, "\\") {
+			return false
+		}
+	}
+	if len(parts) < 2 || parts[0] != "api" {
+		return false
+	}
+	switch {
+	case len(parts) == 2 && parts[1] == "roots":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "roots" && parts[3] == "scan":
+		return method == http.MethodPost
+	case len(parts) == 2 && parts[1] == "resources":
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "resources" && parts[2] == "tags":
+		return method == http.MethodPost
+	case len(parts) == 4 && parts[1] == "resources" && (parts[3] == "file" || parts[3] == "tag-suggestions"):
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "resources" && parts[3] == "tags":
+		return method == http.MethodPost
+	case len(parts) == 5 && parts[1] == "resources" && parts[3] == "tags":
+		return method == http.MethodDelete
+	case len(parts) == 2 && (parts[1] == "tags" || parts[1] == "tag-batch-suggestions"):
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "webrtc" && parts[2] == "offer":
+		return method == http.MethodPost
+	default:
+		return false
+	}
 }

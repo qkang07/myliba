@@ -15,7 +15,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -23,7 +26,11 @@ import (
 //go:embed web/dist
 var assets embed.FS
 
-type server struct{ db *sql.DB }
+type server struct {
+	db          *sql.DB
+	webrtcMu    sync.Mutex
+	webrtcPeers map[*webrtc.PeerConnection]struct{}
+}
 
 type resource struct {
 	ID        string   `json:"id"`
@@ -64,7 +71,7 @@ func main() {
 	if err := migrate(db); err != nil {
 		log.Fatal(err)
 	}
-	app := &server{db: db}
+	app := &server{db: db, webrtcPeers: map[*webrtc.PeerConnection]struct{}{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/session", localSession)
@@ -77,6 +84,7 @@ func main() {
 	mux.HandleFunc("GET /api/resources/{id}/tag-suggestions", app.tagSuggestions)
 	mux.HandleFunc("GET /api/tag-batch-suggestions", app.tagBatchSuggestions)
 	mux.HandleFunc("GET /api/resources/{id}/file", app.serveFile)
+	mux.HandleFunc("POST /api/webrtc/offer", app.createWebRTCAnswer)
 	mux.HandleFunc("POST /api/resources/{id}/tags", app.addTag)
 	mux.HandleFunc("DELETE /api/resources/{id}/tags/{tagID}", app.removeTag)
 	mux.HandleFunc("GET /api/tags", app.tags)
@@ -436,10 +444,18 @@ func (s *server) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGone, "无法读取文件")
 		return
 	}
-	if contentType := mime.TypeByExtension(filepath.Ext(path)); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if contentType == "" {
+		contentType = "application/octet-stream"
 	}
-	if r.URL.Query().Get("download") == "1" {
+	inline := safeInlineContentType(contentType)
+	if inline {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	if r.URL.Query().Get("download") == "1" || !inline {
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(path)}))
 	}
 	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
@@ -571,6 +587,18 @@ func ftsQuery(query string) string {
 		parts[i] = `"` + strings.ReplaceAll(part, `"`, `""`) + `"*`
 	}
 	return strings.Join(parts, " AND ")
+}
+
+func safeInlineContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	if mediaType == "application/pdf" || mediaType == "text/plain" {
+		return true
+	}
+	return (strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml") ||
+		strings.HasPrefix(mediaType, "video/") || strings.HasPrefix(mediaType, "audio/")
 }
 
 func fileKind(path string) string {
