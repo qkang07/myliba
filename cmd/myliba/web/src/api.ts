@@ -188,7 +188,7 @@ export function addBatchTag(ids: string[], name: string) {
 }
 
 export function fileURL(id: string, download = false) {
-	return `/api/resources/${id}/file${download ? "?download=1" : ""}`;
+	return "/api/resources/" + id + "/file" + (download ? "?download=1" : "");
 }
 
 export function thumbnailURL(resource: Pick<Resource, "id" | "size" | "modified">, revision = 0) {

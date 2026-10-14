@@ -455,10 +455,18 @@ func (s *server) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGone, "无法读取文件")
 		return
 	}
-	if contentType := mime.TypeByExtension(filepath.Ext(path)); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if contentType == "" {
+		contentType = "application/octet-stream"
 	}
-	if r.URL.Query().Get("download") == "1" {
+	inline := safeInlineContentType(contentType)
+	if inline {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	if r.URL.Query().Get("download") == "1" || !inline {
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(path)}))
 	}
 	http.ServeContent(w, r, filepath.Base(path), info.ModTime(), file)
@@ -590,6 +598,18 @@ func ftsQuery(query string) string {
 		parts[i] = `"` + strings.ReplaceAll(part, `"`, `""`) + `"*`
 	}
 	return strings.Join(parts, " AND ")
+}
+
+func safeInlineContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	if mediaType == "application/pdf" || mediaType == "text/plain" {
+		return true
+	}
+	return (strings.HasPrefix(mediaType, "image/") && mediaType != "image/svg+xml") ||
+		strings.HasPrefix(mediaType, "video/") || strings.HasPrefix(mediaType, "audio/")
 }
 
 func fileKind(path string) string {

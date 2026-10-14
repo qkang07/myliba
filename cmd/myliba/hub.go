@@ -82,7 +82,7 @@ func (h *remoteHub) sessionStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *remoteHub) login(w http.ResponseWriter, r *http.Request) {
-	if !sameOrigin(r) {
+	if !sameOrigin(r, h.secure) {
 		writeError(w, http.StatusForbidden, "请求来源无效")
 		return
 	}
@@ -119,16 +119,14 @@ func (h *remoteHub) login(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	h.sessions[token] = time.Now().Add(30 * 24 * time.Hour)
-	h.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: hubSessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteStrictMode, Expires: time.Now().Add(30 * 24 * time.Hour)})
-	h.mu.Lock()
 	online := h.online
 	h.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: hubSessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteStrictMode, Expires: time.Now().Add(30 * 24 * time.Hour)})
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online, "iceServers": h.iceServers})
 }
 
 func (h *remoteHub) logout(w http.ResponseWriter, r *http.Request) {
-	if !sameOrigin(r) {
+	if !sameOrigin(r, h.secure) {
 		writeError(w, http.StatusForbidden, "请求来源无效")
 		return
 	}
@@ -147,7 +145,7 @@ func (h *remoteHub) requireSession(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "请先登录")
 			return
 		}
-		if r.Method != http.MethodGet && !sameOrigin(r) {
+		if r.Method != http.MethodGet && !sameOrigin(r, h.secure) {
 			writeError(w, http.StatusForbidden, "请求来源无效")
 			return
 		}
@@ -173,13 +171,19 @@ func (h *remoteHub) hasSession(r *http.Request) bool {
 	return true
 }
 
-func sameOrigin(r *http.Request) bool {
+func sameOrigin(r *http.Request, secure bool) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return false
 	}
 	parsed, err := url.Parse(origin)
-	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host) && (parsed.Scheme == "https" || parsed.Scheme == "http")
+	if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Host, r.Host) {
+		return false
+	}
+	if secure {
+		return parsed.Scheme == "https"
+	}
+	return parsed.Scheme == "http"
 }
 
 func hubHeaders(next http.Handler) http.Handler {
@@ -187,7 +191,7 @@ func hubHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' stun: stuns: turn: turns:; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; webrtc 'allow'")
 		next.ServeHTTP(w, r)
 	})
 }

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -222,7 +221,7 @@ func (m *nodeRTCManager) serveRTCRequest(session *nodeRTCSession, channel *webrt
 		}
 		return channel.SendText(string(data))
 	}
-	if !strings.HasPrefix(input.Path, "/api/") || strings.HasPrefix(input.Path, "/api/session") || strings.HasPrefix(input.Path, "/api/directories") {
+	if !allowedRemoteRequest(input.Method, input.Path) {
 		_ = write(wireMessage{Type: "start", ID: input.ID, Status: http.StatusForbidden})
 		_ = write(wireMessage{Type: "chunk", ID: input.ID, Data: []byte("接口不允许通过远程节点连接")})
 		_ = write(wireMessage{Type: "end", ID: input.ID})

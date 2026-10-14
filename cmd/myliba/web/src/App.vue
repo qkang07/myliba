@@ -110,6 +110,8 @@ const loginError = ref("");
 const toastMessage = ref("");
 const toastVisible = ref(false);
 const listMode = ref<"grid" | "list">("grid");
+const openingResourceID = ref("");
+const downloadingResourceID = ref("");
 
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -117,6 +119,7 @@ let statusTimer: ReturnType<typeof setInterval> | undefined;
 let requestGeneration = 0;
 let lastWebRTCAttempt = 0;
 let retryingWebRTC = false;
+let authGeneration = 0;
 
 const onShortcut = (event: KeyboardEvent) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -284,6 +287,102 @@ function showError(error: unknown) {
   errorMessage.value = error instanceof Error ? error.message : "发生了意外错误";
 }
 
+async function openResource(resource: Resource) {
+  const popup = window.open("about:blank", "_blank");
+  if (!popup) {
+    notify("浏览器阻止了新窗口，请允许此站点打开文件预览");
+    return;
+  }
+  popup.opener = null;
+
+  if (!remoteMode.value || resource.kind === "video" || resource.size > maxDirectFileSize) {
+    if (remoteMode.value && (resource.kind === "video" || resource.size > maxDirectFileSize)) {
+      notify(resource.kind === "video" ? "视频预览暂通过服务器中继" : "文件较大，改用服务器中继打开");
+    }
+    popup.location.replace(fileURL(resource.id));
+    return;
+  }
+
+  const generation = authGeneration;
+  openingResourceID.value = resource.id;
+  try {
+    const transferred = await transferFileDirectly(resource.id);
+    if (generation !== authGeneration || !authenticated.value) {
+      popup.close();
+      return;
+    }
+    if (!canPreviewInline(transferred.blob.type)) {
+      saveBlob(transferred);
+      popup.close();
+      notify("此文件已安全下载");
+      return;
+    }
+    const objectURL = URL.createObjectURL(transferred.blob);
+    popup.location.replace(objectURL);
+    window.setTimeout(() => URL.revokeObjectURL(objectURL), 10 * 60_000);
+    notify("已建立设备直连");
+  } catch {
+    if (generation !== authGeneration || !authenticated.value) {
+      popup.close();
+      return;
+    }
+    notify("设备直连不可用，正在通过服务器中继");
+    popup.location.replace(fileURL(resource.id));
+  } finally {
+    openingResourceID.value = "";
+  }
+}
+
+function canPreviewInline(contentType: string) {
+  const type = contentType.split(";")[0].trim().toLowerCase();
+  return type === "application/pdf" || type === "text/plain" ||
+    (type.startsWith("image/") && type !== "image/svg+xml") ||
+    type.startsWith("video/") || type.startsWith("audio/");
+}
+
+function startRelayDownload(resource: Resource) {
+  const link = document.createElement("a");
+  link.href = fileURL(resource.id, true);
+  link.download = resource.name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+function saveBlob(transferred: { blob: Blob; name: string }) {
+  const objectURL = URL.createObjectURL(transferred.blob);
+  const link = document.createElement("a");
+  link.href = objectURL;
+  link.download = transferred.name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectURL), 60_000);
+}
+
+async function downloadResource(resource: Resource) {
+  if (!remoteMode.value || resource.size > maxDirectFileSize) {
+    if (remoteMode.value) notify("文件较大，使用服务器中继下载");
+    startRelayDownload(resource);
+    return;
+  }
+
+  const generation = authGeneration;
+  downloadingResourceID.value = resource.id;
+  try {
+    const transferred = await transferFileDirectly(resource.id);
+    if (generation !== authGeneration || !authenticated.value) return;
+    saveBlob(transferred);
+    notify("已通过设备直连下载");
+  } catch {
+    if (generation !== authGeneration || !authenticated.value) return;
+    notify("设备直连不可用，正在通过服务器中继");
+    startRelayDownload(resource);
+  } finally {
+    downloadingResourceID.value = "";
+  }
+}
+
 async function loadResources(append = false) {
   const generation = ++requestGeneration;
   if (!append) {
@@ -311,13 +410,19 @@ async function loadResources(append = false) {
 }
 
 async function loadRoots() {
-  try { roots.value = await getRoots(); }
-  catch (error) { showError(error); }
+  const generation = authGeneration;
+  try {
+    const result = await getRoots();
+    if (generation === authGeneration) roots.value = result;
+  } catch (error) { if (generation === authGeneration) showError(error); }
 }
 
 async function loadTags() {
-  try { tags.value = await getTags(); }
-  catch (error) { showError(error); }
+  const generation = authGeneration;
+  try {
+    const result = await getTags();
+    if (generation === authGeneration) tags.value = result;
+  } catch (error) { if (generation === authGeneration) showError(error); }
 }
 
 async function loadWorkspace() {
@@ -416,13 +521,15 @@ async function toggleBatchSuggestions() {
 }
 
 async function loadBatchSuggestions() {
+  const generation = authGeneration;
   loadingBatchSuggestions.value = true;
   try {
     const result = await getBatchTagSuggestions();
+    if (generation !== authGeneration) return;
     batchSuggestions.value = result.suggestions;
     batchSuggestionsScanned.value = result.scanned;
-  } catch (error) { showError(error); }
-  finally { loadingBatchSuggestions.value = false; }
+  } catch (error) { if (generation === authGeneration) showError(error); }
+  finally { if (generation === authGeneration) loadingBatchSuggestions.value = false; }
 }
 
 async function applyBatchSuggestion(suggestion: BatchTagSuggestion) {
@@ -536,6 +643,7 @@ async function submitLogin() {
   loginError.value = "";
   try {
     const session = await login(password.value);
+    authGeneration++;
     authenticated.value = session.authenticated;
     nodeOnline.value = session.nodeOnline;
     webTraffic.value = session.webTraffic ?? webTraffic.value;
@@ -548,20 +656,36 @@ async function submitLogin() {
   finally { loginBusy.value = false; }
 }
 
-async function signOut() {
-  try { await logout(); }
-  catch (error) { showError(error); }
+function clearRemoteSession() {
+  authGeneration++;
+  requestGeneration++;
   authenticated.value = false;
+  nodeOnline.value = false;
   password.value = "";
+  resources.value = [];
+  roots.value = [];
+  tags.value = [];
+  batchSuggestions.value = [];
+  tagSuggestions.value = [];
+  total.value = 0;
+  selectedIDs.value = new Set();
+  selectedTag.value = "";
+  editingTagID.value = "";
+  errorMessage.value = "";
+  toastMessage.value = "";
   stopStatusPolling();
   closeWebRTC();
 }
 
+async function signOut() {
+  try { await logout(); }
+  catch (error) { showError(error); return; }
+  clearRemoteSession();
+}
+
 function handleUnauthorized() {
   if (!remoteMode.value) return;
-  authenticated.value = false;
-  stopStatusPolling();
-  closeWebRTC();
+  clearRemoteSession();
 }
 
 async function refreshNodeStatus() {
@@ -569,9 +693,7 @@ async function refreshNodeStatus() {
     const session = await getSession();
     if (session) {
       if (!session.authenticated) {
-        authenticated.value = false;
-        stopStatusPolling();
-        closeWebRTC();
+        clearRemoteSession();
       }
       nodeOnline.value = session.nodeOnline;
       webTraffic.value = session.webTraffic ?? { downloadBps: 0, uploadBps: 0 };
@@ -618,7 +740,9 @@ watch(resources, (items) => {
 
 watch(query, () => {
   if (debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => { void loadResources(); }, 220);
+  debounceTimer = setTimeout(() => {
+    if (!remoteMode.value || authenticated.value) void loadResources();
+  }, 220);
 });
 
 onMounted(async () => {

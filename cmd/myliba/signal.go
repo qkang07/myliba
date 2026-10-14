@@ -53,7 +53,7 @@ func pionICEConfiguration(servers []iceServerConfig) webrtc.Configuration {
 }
 
 func (h *remoteHub) signal(w http.ResponseWriter, r *http.Request) {
-	if !h.hasSession(r) || !sameOrigin(r) {
+	if !h.hasSession(r) || !sameOrigin(r, h.secure) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
