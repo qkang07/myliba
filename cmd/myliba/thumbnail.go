@@ -14,10 +14,12 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +54,23 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnsupportedMediaType, "资源不是普通文件")
 		return
 	}
+	width, height := thumbnailSize(r.URL.Query().Get("size"))
+	at := 0.0
+	if raw := r.URL.Query().Get("at"); raw != "" {
+		if kind != "video" {
+			writeError(w, http.StatusBadRequest, "仅视频支持指定截图时间")
+			return
+		}
+		at, err = strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(at) || math.IsInf(at, 0) || at < 0 || at > 86400 {
+			writeError(w, http.StatusBadRequest, "截图时间超出范围")
+			return
+		}
+	}
 	version := fmt.Sprintf("%s\x00%d\x00%d", r.PathValue("id"), info.Size(), info.ModTime().UnixNano())
+	if width != thumbnailWidth || at != 0 {
+		version += fmt.Sprintf("\x00%d\x00%.3f", width, at)
+	}
 	digest := sha256.Sum256([]byte(version))
 	etag := `"` + hex.EncodeToString(digest[:]) + `"`
 	w.Header().Set("ETag", etag)
@@ -88,7 +106,7 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := s.generateThumbnail(r.Context(), sourcePath, kind)
+	content, err := s.generateThumbnail(r.Context(), sourcePath, kind, width, height, at)
 	if err != nil {
 		log.Printf("thumbnail generation failed for %s: %v", filepath.Base(sourcePath), err)
 		if kind == "video" && s.ffmpegPath == "" {
@@ -132,14 +150,29 @@ func (s *server) thumbnailLock(id string) *sync.Mutex {
 	return lock
 }
 
-func (s *server) generateThumbnail(parent context.Context, sourcePath, kind string) ([]byte, error) {
+func thumbnailSize(level string) (int, int) {
+	switch level {
+	case "small":
+		return 240, 160
+	case "large":
+		return 1280, 960
+	default:
+		return thumbnailWidth, thumbnailHeight
+	}
+}
+
+func (s *server) generateThumbnail(parent context.Context, sourcePath, kind string, width, height int, at float64) ([]byte, error) {
 	if s.ffmpegPath != "" {
 		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, s.ffmpegPath,
-			"-v", "error", "-nostdin", "-i", sourcePath, "-frames:v", "1",
-			"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease", thumbnailWidth, thumbnailHeight),
+		args := []string{"-v", "error", "-nostdin"}
+		if kind == "video" && at > 0 {
+			args = append(args, "-ss", strconv.FormatFloat(at, 'f', 3, 64))
+		}
+		args = append(args, "-i", sourcePath, "-frames:v", "1",
+			"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease", width, height),
 			"-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1")
+		cmd := exec.CommandContext(ctx, s.ffmpegPath, args...)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		var output bytes.Buffer
@@ -156,10 +189,10 @@ func (s *server) generateThumbnail(parent context.Context, sourcePath, kind stri
 	if kind == "video" {
 		return nil, fmt.Errorf("FFmpeg is required to extract video frames")
 	}
-	return makeImageThumbnail(sourcePath)
+	return makeImageThumbnail(sourcePath, width, height)
 }
 
-func makeImageThumbnail(path string) ([]byte, error) {
+func makeImageThumbnail(path string, maxWidth, maxHeight int) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -180,8 +213,8 @@ func makeImageThumbnail(path string) ([]byte, error) {
 		return nil, err
 	}
 	width, height := config.Width, config.Height
-	if width > thumbnailWidth || height > thumbnailHeight {
-		ratio := min(float64(thumbnailWidth)/float64(width), float64(thumbnailHeight)/float64(height))
+	if width > maxWidth || height > maxHeight {
+		ratio := min(float64(maxWidth)/float64(width), float64(maxHeight)/float64(height))
 		width = max(1, int(float64(width)*ratio))
 		height = max(1, int(float64(height)*ratio))
 	}

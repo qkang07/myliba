@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"embed"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ type server struct {
 	db             *sql.DB
 	thumbnailDir   string
 	ffmpegPath     string
+	ffprobePath    string
 	thumbnailMu    sync.Mutex
 	thumbnailLocks map[string]*sync.Mutex
 }
@@ -77,7 +80,8 @@ func main() {
 		log.Fatal(err)
 	}
 	ffmpegPath, _ := exec.LookPath("ffmpeg")
-	app := &server{db: db, thumbnailDir: thumbnailDir, ffmpegPath: ffmpegPath, thumbnailLocks: map[string]*sync.Mutex{}}
+	ffprobePath, _ := exec.LookPath("ffprobe")
+	app := &server{db: db, thumbnailDir: thumbnailDir, ffmpegPath: ffmpegPath, ffprobePath: ffprobePath, thumbnailLocks: map[string]*sync.Mutex{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/session", localSession)
@@ -86,6 +90,8 @@ func main() {
 	mux.HandleFunc("PUT /api/roots", app.addRoot)
 	mux.HandleFunc("POST /api/roots/{id}/scan", app.scanRoot)
 	mux.HandleFunc("GET /api/resources", app.listResources)
+	mux.HandleFunc("GET /api/resources/{id}", app.getResource)
+	mux.HandleFunc("GET /api/resources/{id}/video-info", app.videoInfo)
 	mux.HandleFunc("POST /api/resources/tags", app.addTagBatch)
 	mux.HandleFunc("GET /api/resources/{id}/tag-suggestions", app.tagSuggestions)
 	mux.HandleFunc("GET /api/tag-batch-suggestions", app.tagBatchSuggestions)
@@ -438,6 +444,74 @@ func findOrCreateVersion(db *sql.DB, resourceID string, size int64, modifiedAt s
 	return versionID, err
 }
 
+func (s *server) getResource(w http.ResponseWriter, r *http.Request) {
+	var item resource
+	err := s.db.QueryRow(`SELECT id,name,path,size,modified_at,kind,available,current_version_id FROM resources WHERE id=?`, r.PathValue("id")).Scan(
+		&item.ID, &item.Name, &item.Path, &item.Size, &item.Modified, &item.Kind, &item.Available, &item.VersionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "资源不存在")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法读取资源信息")
+		return
+	}
+	item.Tags = []string{}
+	rows, err := s.db.Query(`SELECT t.name FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id WHERE rt.resource_id=? ORDER BY t.name COLLATE NOCASE`, item.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法读取标签")
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			writeError(w, http.StatusInternalServerError, "无法读取标签")
+			return
+		}
+		item.Tags = append(item.Tags, name)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法读取标签")
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *server) videoInfo(w http.ResponseWriter, r *http.Request) {
+	var path, kind string
+	if err := s.db.QueryRow(`SELECT path,kind FROM resources WHERE id=?`, r.PathValue("id")).Scan(&path, &kind); err != nil {
+		writeError(w, http.StatusNotFound, "资源不存在")
+		return
+	}
+	if kind != "video" {
+		writeError(w, http.StatusUnsupportedMediaType, "该资源不是视频")
+		return
+	}
+	if s.ffprobePath == "" {
+		writeError(w, http.StatusNotImplemented, "读取视频时长需要 FFprobe")
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		writeError(w, http.StatusGone, "文件当前不可用")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, s.ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path).Output()
+	if err != nil {
+		writeError(w, http.StatusUnsupportedMediaType, "无法读取视频时长")
+		return
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
+	if err != nil || duration <= 0 || duration > 86400 {
+		writeError(w, http.StatusUnsupportedMediaType, "视频时长不可用")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]float64{"duration": duration})
+}
+
 func (s *server) serveFile(w http.ResponseWriter, r *http.Request) {
 	var path string
 	if err := s.db.QueryRow(`SELECT path FROM resources WHERE id=?`, r.PathValue("id")).Scan(&path); err != nil {
@@ -670,7 +744,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

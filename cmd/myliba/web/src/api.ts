@@ -206,3 +206,27 @@ export function getResourceThumbnail(resource: Pick<Resource, "id" | "size" | "m
 export function createThumbnail(id: string) {
   return request<void>(`/api/resources/${id}/thumbnail`, { method: "POST" });
 }
+export function getResource(id: string) {
+  return request<Resource>(`/api/resources/${encodeURIComponent(id)}`);
+}
+
+export function getVideoInfo(id: string) {
+  return request<{ duration: number }>(`/api/resources/${encodeURIComponent(id)}/video-info`);
+}
+
+export function removeResourceTag(id: string, tagID: string) {
+  return request<{ ok: boolean }>(`/api/resources/${encodeURIComponent(id)}/tags/${encodeURIComponent(tagID)}`, { method: "DELETE" });
+}
+
+export function getResourceThumbnailVariant(resource: Pick<Resource, "id" | "size" | "modified">, size: "small" | "medium" | "large", at = 0, revision = 0) {
+  const url = new URL(thumbnailURL(resource, revision), window.location.origin);
+  url.searchParams.set("size", size);
+  if (at > 0) url.searchParams.set("at", at.toFixed(3));
+  return apiFetch(url.pathname + url.search);
+}
+
+export function createThumbnailVariant(id: string, size: "small" | "medium" | "large", at = 0) {
+  const search = new URLSearchParams({ size });
+  if (at > 0) search.set("at", at.toFixed(3));
+  return request<void>(`/api/resources/${encodeURIComponent(id)}/thumbnail?${search}`, { method: "POST" });
+}

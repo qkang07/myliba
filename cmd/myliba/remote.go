@@ -487,14 +487,16 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodPost
 	case len(parts) == 2 && parts[1] == "resources":
 		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "resources" && parts[2] != "tags":
+		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "resources" && parts[2] == "tags":
 		return method == http.MethodPost
-	case len(parts) == 4 && parts[1] == "resources" && (parts[3] == "file" || parts[3] == "thumbnail" || parts[3] == "tag-suggestions"):
+	case len(parts) == 4 && parts[1] == "resources" && (parts[3] == "file" || parts[3] == "tag-suggestions" || parts[3] == "video-info"):
 		return method == http.MethodGet
 	case len(parts) == 4 && parts[1] == "resources" && parts[3] == "tags":
 		return method == http.MethodPost
 	case len(parts) == 4 && parts[1] == "resources" && parts[3] == "thumbnail":
-		return method == http.MethodPost
+		return method == http.MethodGet || method == http.MethodPost
 	case len(parts) == 5 && parts[1] == "resources" && parts[3] == "tags":
 		return method == http.MethodDelete
 	case len(parts) == 2 && (parts[1] == "tags" || parts[1] == "tag-batch-suggestions"):

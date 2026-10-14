@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { closeWebRTC, connectWebRTC } from "./webrtc";
+import ResourceDetail from "./ResourceDetail.vue";
 import {
   Check,
   ChevronDown,
@@ -37,7 +38,7 @@ import {
   addResourceTag,
   addRoot,
   ApiError,
-  getResourceFile,
+  fileURL,
   getResourceThumbnail,
   createThumbnail,
   getBatchTagSuggestions,
@@ -82,6 +83,8 @@ const tags = ref<TagSummary[]>([]);
 const total = ref(0);
 const query = ref("");
 const selectedTag = ref("");
+const tagFilterOpen = ref(false);
+const tagFilterQuery = ref("");
 const unorganizedOnly = ref(false);
 const pageOffset = ref(0);
 const pageSize = 48;
@@ -110,8 +113,10 @@ const loginError = ref("");
 const toastMessage = ref("");
 const toastVisible = ref(false);
 const listMode = ref<"grid" | "list">("grid");
-const openingResourceID = ref("");
-const downloadingResourceID = ref("");
+const detailResourceID = ref(new URLSearchParams(window.location.search).get("resource") || "");
+const previewResource = ref<Resource | null>(null);
+const previewMimeType = ref("");
+const previewError = ref("");
 
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -122,8 +127,17 @@ let retryingWebRTC = false;
 let authGeneration = 0;
 
 const onShortcut = (event: KeyboardEvent) => {
+  if (event.key === "Escape" && previewResource.value) {
+    closeResourcePreview();
+    return;
+  }
+  if (event.key === "Escape" && tagFilterOpen.value) {
+    tagFilterOpen.value = false;
+    return;
+  }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
+    tagFilterOpen.value = false;
     document.querySelector<HTMLInputElement>("#resource-search")?.focus();
   }
 };
@@ -133,6 +147,12 @@ const onTagEditorOutside = (event: MouseEvent) => {
   const target = event.target;
   if (target instanceof Element && target.closest(".tag-editor-wrap")) return;
   closeTagEditor();
+};
+
+const onTagFilterOutside = (event: MouseEvent) => {
+  if (tagFilterOpen.value && event.target instanceof Element && !event.target.closest(".tag-filter")) {
+    tagFilterOpen.value = false;
+  }
 };
 
 const pageTitle = computed(() => selectedTag.value
@@ -147,6 +167,10 @@ const selectedMediaCount = computed(() => resources.value.filter((resource) => s
 const totalIndexed = computed(() => roots.value.reduce((sum, root) => sum + root.count, 0));
 const hasMore = computed(() => resources.value.length < total.value);
 const isFiltered = computed(() => Boolean(query.value.trim() || selectedTag.value || unorganizedOnly.value));
+const matchingTags = computed(() => {
+  const needle = tagFilterQuery.value.trim().toLocaleLowerCase();
+  return tags.value.filter((tag) => tag.count > 0 && tag.name.toLocaleLowerCase().includes(needle));
+});
 
 function formatRate(value: number): string {
   if (value < 1024) return `${value} B/s`;
@@ -287,57 +311,36 @@ function showError(error: unknown) {
   errorMessage.value = error instanceof Error ? error.message : "发生了意外错误";
 }
 
-async function openResource(resource: Resource) {
-  const popup = window.open("about:blank", "_blank");
-  if (!popup) {
-    notify("浏览器阻止了新窗口，请允许此站点打开文件预览");
-    return;
-  }
-  popup.opener = null;
-
-  if (!remoteMode.value || resource.kind === "video" || resource.size > maxDirectFileSize) {
-    if (remoteMode.value && (resource.kind === "video" || resource.size > maxDirectFileSize)) {
-      notify(resource.kind === "video" ? "视频预览暂通过服务器中继" : "文件较大，改用服务器中继打开");
-    }
-    popup.location.replace(fileURL(resource.id));
-    return;
-  }
-
-  const generation = authGeneration;
-  openingResourceID.value = resource.id;
-  try {
-    const transferred = await transferFileDirectly(resource.id);
-    if (generation !== authGeneration || !authenticated.value) {
-      popup.close();
-      return;
-    }
-    if (!canPreviewInline(transferred.blob.type)) {
-      saveBlob(transferred);
-      popup.close();
-      notify("此文件已安全下载");
-      return;
-    }
-    const objectURL = URL.createObjectURL(transferred.blob);
-    popup.location.replace(objectURL);
-    window.setTimeout(() => URL.revokeObjectURL(objectURL), 10 * 60_000);
-    notify("已建立设备直连");
-  } catch {
-    if (generation !== authGeneration || !authenticated.value) {
-      popup.close();
-      return;
-    }
-    notify("设备直连不可用，正在通过服务器中继");
-    popup.location.replace(fileURL(resource.id));
-  } finally {
-    openingResourceID.value = "";
-  }
-}
-
 function canPreviewInline(contentType: string) {
   const type = contentType.split(";")[0].trim().toLowerCase();
   return type === "application/pdf" || type === "text/plain" ||
     (type.startsWith("image/") && type !== "image/svg+xml") ||
     type.startsWith("video/") || type.startsWith("audio/");
+}
+
+function getPreviewMimeType(resource: Resource) {
+  const extension = resource.name.split(".").pop()?.toLowerCase() || "";
+  const types: Record<string, string> = {
+    avif: "image/avif", bmp: "image/bmp", gif: "image/gif", heic: "image/heic", heif: "image/heif",
+    jpeg: "image/jpeg", jpg: "image/jpeg", png: "image/png", tif: "image/tiff", tiff: "image/tiff", webp: "image/webp",
+    mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", webm: "video/webm", ogv: "video/ogg",
+    mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", oga: "audio/ogg", ogg: "audio/ogg", wav: "audio/wav", flac: "audio/flac",
+    pdf: "application/pdf", txt: "text/plain",
+  };
+  const type = types[extension] || "";
+  return canPreviewInline(type) ? type : "";
+}
+
+function openResourcePreview(resource: Resource) {
+  previewResource.value = resource;
+  previewMimeType.value = getPreviewMimeType(resource);
+  previewError.value = "";
+}
+
+function closeResourcePreview() {
+  previewResource.value = null;
+  previewMimeType.value = "";
+  previewError.value = "";
 }
 
 function startRelayDownload(resource: Resource) {
@@ -347,40 +350,6 @@ function startRelayDownload(resource: Resource) {
   document.body.append(link);
   link.click();
   link.remove();
-}
-
-function saveBlob(transferred: { blob: Blob; name: string }) {
-  const objectURL = URL.createObjectURL(transferred.blob);
-  const link = document.createElement("a");
-  link.href = objectURL;
-  link.download = transferred.name;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(objectURL), 60_000);
-}
-
-async function downloadResource(resource: Resource) {
-  if (!remoteMode.value || resource.size > maxDirectFileSize) {
-    if (remoteMode.value) notify("文件较大，使用服务器中继下载");
-    startRelayDownload(resource);
-    return;
-  }
-
-  const generation = authGeneration;
-  downloadingResourceID.value = resource.id;
-  try {
-    const transferred = await transferFileDirectly(resource.id);
-    if (generation !== authGeneration || !authenticated.value) return;
-    saveBlob(transferred);
-    notify("已通过设备直连下载");
-  } catch {
-    if (generation !== authGeneration || !authenticated.value) return;
-    notify("设备直连不可用，正在通过服务器中继");
-    startRelayDownload(resource);
-  } finally {
-    downloadingResourceID.value = "";
-  }
 }
 
 async function loadResources(append = false) {
@@ -429,7 +398,29 @@ async function loadWorkspace() {
   await Promise.all([loadRoots(), loadTags(), loadResources()]);
 }
 
+function setDetailRoute(id: string) {
+  detailResourceID.value = id;
+  const url = new URL(window.location.href);
+  if (id) url.searchParams.set("resource", id);
+  else url.searchParams.delete("resource");
+  window.history.pushState({}, "", url.pathname + url.search + url.hash);
+}
+
+function openDetail(resource: Resource) {
+  setDetailRoute(resource.id);
+  window.scrollTo(0, 0);
+}
+
+function closeDetail() {
+  setDetailRoute("");
+}
+
+function syncDetailRoute() {
+  detailResourceID.value = new URLSearchParams(window.location.search).get("resource") || "";
+}
+
 function chooseAll() {
+  if (detailResourceID.value) closeDetail();
   selectedTag.value = "";
   unorganizedOnly.value = false;
   query.value = "";
@@ -437,15 +428,26 @@ function chooseAll() {
 }
 
 function chooseUnorganized() {
+  if (detailResourceID.value) closeDetail();
   selectedTag.value = "";
   unorganizedOnly.value = true;
   void loadResources();
 }
 
 function chooseTag(name: string) {
+  if (detailResourceID.value) closeDetail();
   selectedTag.value = selectedTag.value === name ? "" : name;
   unorganizedOnly.value = false;
+  tagFilterOpen.value = false;
   void loadResources();
+}
+
+async function toggleTagFilter() {
+  tagFilterOpen.value = !tagFilterOpen.value;
+  if (!tagFilterOpen.value) return;
+  tagFilterQuery.value = "";
+  await nextTick();
+  document.querySelector<HTMLInputElement>("#tag-filter-search")?.focus();
 }
 
 function toggleSelection(id: string) {
@@ -608,33 +610,12 @@ async function establishWebRTC(iceServers: RTCIceServer[] = []) {
   await connectWebRTC(iceServers, applyTransportState, (rate) => { nodeTraffic.value = rate; });
 }
 
-async function openResourceFile(resource: Resource, download: boolean) {
-  const popup = download ? null : window.open("about:blank", "_blank");
-  if (!download && !popup) {
-    notify("Allow pop-ups to open this resource");
+function openResourceFile(resource: Resource, download: boolean) {
+  if (!download) {
+    openDetail(resource);
     return;
   }
-  try {
-    const response = await getResourceFile(resource.id, download);
-    if (!response.ok) {
-      const body = await response.json().catch(() => undefined);
-      throw new Error(body?.error || "Unable to read this file");
-    }
-    const url = URL.createObjectURL(await response.blob());
-    if (download) {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = resource.name;
-      link.click();
-    } else if (popup) {
-      popup.opener = null;
-      popup.location.href = url;
-    }
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  } catch (error) {
-    popup?.close();
-    showError(error);
-  }
+  startRelayDownload(resource);
 }
 
 async function submitLogin() {
@@ -670,6 +651,9 @@ function clearRemoteSession() {
   total.value = 0;
   selectedIDs.value = new Set();
   selectedTag.value = "";
+  tagFilterOpen.value = false;
+  closeResourcePreview();
+  detailResourceID.value = "";
   editingTagID.value = "";
   errorMessage.value = "";
   toastMessage.value = "";
@@ -748,7 +732,9 @@ watch(query, () => {
 onMounted(async () => {
   window.addEventListener("myliba:unauthorized", handleUnauthorized);
   window.addEventListener("keydown", onShortcut);
+  window.addEventListener("popstate", syncDetailRoute);
   document.addEventListener("click", onTagEditorOutside, true);
+  document.addEventListener("click", onTagFilterOutside, true);
   try {
     const session = await getSession();
     if (!session) {
@@ -774,7 +760,9 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener("myliba:unauthorized", handleUnauthorized);
   window.removeEventListener("keydown", onShortcut);
+  window.removeEventListener("popstate", syncDetailRoute);
   document.removeEventListener("click", onTagEditorOutside, true);
+  document.removeEventListener("click", onTagFilterOutside, true);
   stopStatusPolling();
   closeWebRTC();
   for (const url of thumbnailURLs.value.values()) URL.revokeObjectURL(url);
@@ -825,7 +813,7 @@ onBeforeUnmount(() => {
 
     <div class="main-column">
       <header class="topbar">
-        <div class="breadcrumbs"><span>我的资源</span><span class="breadcrumb-divider">/</span><strong>{{ pageTitle }}</strong></div>
+        <div class="breadcrumbs"><span>我的资源</span><span class="breadcrumb-divider">/</span><strong>{{ detailResourceID ? "资源详情" : pageTitle }}</strong></div>
         <div class="topbar-actions">
           <template v-if="remoteMode">
             <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
@@ -841,6 +829,8 @@ onBeforeUnmount(() => {
       </header>
 
       <main class="page-content">
+        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" @back="closeDetail" @tags-changed="loadTags(); loadResources()" />
+        <template v-else>
         <section class="page-intro">
           <div>
             <div class="eyebrow"><Sparkles :size="13" />个人资源空间</div>
@@ -910,6 +900,17 @@ onBeforeUnmount(() => {
               <kbd>⌘ K</kbd>
               <button v-if="query" class="search-clear" type="button" aria-label="清除搜索" @click="query = ''"><X :size="14" /></button>
             </label>
+            <div class="tag-filter">
+              <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: Boolean(selectedTag) }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>{{ selectedTag || "按标签筛选" }}</span><ChevronDown :size="14" /></button>
+              <div v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-popover">
+                <label class="tag-filter-search" for="tag-filter-search"><Search :size="14" /><input id="tag-filter-search" v-model="tagFilterQuery" type="search" placeholder="查找标签" autocomplete="off" /></label>
+                <div class="tag-filter-list">
+                  <button class="tag-filter-option" type="button" :class="{ active: !selectedTag }" @click="chooseTag('')"><span>全部标签</span><Check v-if="!selectedTag" :size="14" /></button>
+                  <button v-for="tag in matchingTags" :key="tag.id" class="tag-filter-option" type="button" :class="{ active: selectedTag === tag.name }" @click="chooseTag(tag.name)"><span>{{ tag.name }}</span><small>{{ tag.count }}</small><Check v-if="selectedTag === tag.name" :size="14" /></button>
+                  <p v-if="!matchingTags.length" class="tag-filter-empty">{{ tags.length ? "没有匹配的标签" : "还没有标签" }}</p>
+                </div>
+              </div>
+            </div>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'grid' }" title="网格视图" @click="listMode = 'grid'"><LayoutGrid :size="16" /></button>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'list' }" title="列表视图" @click="listMode = 'list'"><List :size="16" /></button>
           </div>
@@ -968,7 +969,7 @@ onBeforeUnmount(() => {
               <input type="checkbox" :checked="selectedIDs.has(resource.id)" @change="toggleSelection(resource.id)" />
               <span class="check-indicator"><Check :size="13" /></span>
             </label>
-            <div class="resource-preview">
+            <div class="resource-preview" @click="openDetail(resource)">
               <img v-if="thumbnailURLs.has(resource.id) && !failedThumbnailIDs.has(resource.id)" loading="lazy" :src="thumbnailURLs.get(resource.id)" :alt="resource.name" @error="markThumbnailFailed(resource.id)" />
               <div v-if="!resource.available || !['image', 'video'].includes(resource.kind) || failedThumbnailIDs.has(resource.id) || !thumbnailURLs.has(resource.id)" class="preview-placeholder"><component :is="kindIcon(resource.kind)" :size="29" :stroke-width="1.5" /></div>
               <button v-if="resource.available && ['image', 'video'].includes(resource.kind) && failedThumbnailIDs.has(resource.id)" class="thumbnail-generate-button" :disabled="isGeneratingThumbnail(resource.id)" @click.stop="generateThumbnail(resource.id)"><LoaderCircle v-if="isGeneratingThumbnail(resource.id)" class="spin" :size="13" />{{ isGeneratingThumbnail(resource.id) ? '正在生成' : '生成缩略图' }}</button>
@@ -980,8 +981,8 @@ onBeforeUnmount(() => {
               <p class="resource-name" :title="resource.path">{{ resource.name }}</p>
               <div class="resource-meta"><span>{{ formatBytes(resource.size) }}</span><span class="meta-dot"></span><span>{{ formatDate(resource.modified) }}</span></div>
               <div v-if="resource.available" class="resource-file-actions">
-                <a class="resource-file-action" :href="`/api/resources/${resource.id}/file`" target="_blank" rel="noopener noreferrer" @click.prevent="openResourceFile(resource, false)"><ExternalLink :size="13" />打开</a>
-                <a class="resource-file-action" :href="`/api/resources/${resource.id}/file?download=1`" :download="resource.name" @click.prevent="openResourceFile(resource, true)"><Download :size="13" />下载</a>
+                <button class="resource-file-action" type="button" @click="openResourceFile(resource, false)"><ExternalLink :size="13" />详情</button>
+                <button class="resource-file-action" type="button" @click="openResourceFile(resource, true)"><Download :size="13" />下载</button>
               </div>
               <p v-else class="resource-unavailable-note">源文件当前不可用</p>
               <div class="resource-tags">
@@ -1016,6 +1017,7 @@ onBeforeUnmount(() => {
         <div v-if="loading && resources.length" class="loading-more"><LoaderCircle class="spin" :size="16" />正在加载…</div>
 
         <footer class="page-footer"><span>MYLIBA · 个人资源管理器</span><span><span class="footer-dot"></span>{{ remoteMode ? (nodeOnline ? "家中节点在线" : "等待节点连接") : "本机索引已就绪" }}</span></footer>
+        </template>
       </main>
     </div>
 
@@ -1024,6 +1026,29 @@ onBeforeUnmount(() => {
       <button :class="{ active: unorganizedOnly }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
       <label class="mobile-tag-select"><Tag :size="16" /><select :value="selectedTag" aria-label="按标签筛选" @change="chooseTag(($event.target as HTMLSelectElement).value)"><option value="">标签</option><option v-for="tag in tags" :key="tag.id" :value="tag.name">{{ tag.name }} · {{ tag.count }}</option></select><ChevronDown :size="14" /></label>
     </nav>
+
+    <div v-if="previewResource" class="resource-preview-backdrop" @click.self="closeResourcePreview">
+      <section class="resource-preview-dialog" role="dialog" aria-modal="true" :aria-label="'预览 ' + previewResource.name">
+        <header class="resource-preview-header">
+          <div class="resource-preview-heading">
+            <h2>{{ previewResource.name }}</h2>
+            <p>{{ formatBytes(previewResource.size) }} · {{ kindLabel(previewResource.kind) }}</p>
+          </div>
+          <button class="resource-preview-download" type="button" @click="openResourceFile(previewResource, true)"><Download :size="14" />下载</button>
+          <button class="quiet-button directory-close" aria-label="关闭预览" @click="closeResourcePreview"><X :size="18" /></button>
+        </header>
+        <div class="resource-preview-stage">
+          <template v-if="previewMimeType && !previewError">
+            <img v-if="previewMimeType.startsWith('image/')" :src="fileURL(previewResource.id)" :alt="previewResource.name" @error="previewError = '无法加载此图片。请检查文件是否仍可访问。'" />
+            <video v-else-if="previewMimeType.startsWith('video/')" :src="fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此视频格式。你可以下载后打开。'"></video>
+            <audio v-else-if="previewMimeType.startsWith('audio/')" :src="fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式。你可以下载后打开。'"></audio>
+            <iframe v-else :src="fileURL(previewResource.id)" :title="'预览 ' + previewResource.name"></iframe>
+          </template>
+          <div v-else-if="previewError" class="resource-preview-message" role="alert"><CircleAlert :size="22" /><p>{{ previewError }}</p><button class="button button-secondary" @click="openResourceFile(previewResource, true)"><Download :size="14" />下载文件</button></div>
+          <div v-else class="resource-preview-message"><File :size="24" /><p>此文件格式暂不支持网页预览，可以下载后用本地应用打开。</p><button class="button button-primary" @click="openResourceFile(previewResource, true)"><Download :size="14" />下载文件</button></div>
+        </div>
+      </section>
+    </div>
 
     <div v-if="directoryPickerOpen" class="directory-picker-backdrop" @click.self="directoryPickerOpen = false">
       <section class="directory-picker" role="dialog" aria-modal="true" aria-labelledby="directory-picker-title">
