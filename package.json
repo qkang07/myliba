@@ -5,7 +5,10 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite --config vite.config.ts",
-		"build": "vite build --config vite.config.ts",
+		"build:web": "vite build --config vite.config.ts",	
+		"build:svc": "go build -tags sqlite_fts5 -o myliba ./cmd/myliba",	
+		"build": "build:web && build:svc",
+
 		"typecheck": "vue-tsc --noEmit -p tsconfig.json"
 	},
 	"dependencies": {
