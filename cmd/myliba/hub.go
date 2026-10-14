@@ -33,7 +33,11 @@ func runHub() error {
 	if err != nil {
 		return err
 	}
-	hub := &remoteHub{waiters: map[string]*remoteWaiter{}, password: password, secure: os.Getenv("MYLIBA_HUB_COOKIE_SECURE") != "0", sessions: map[string]time.Time{}}
+	iceServers, err := loadICEServers()
+	if err != nil {
+		return err
+	}
+	hub := &remoteHub{waiters: map[string]*remoteWaiter{}, password: password, secure: os.Getenv("MYLIBA_HUB_COOKIE_SECURE") != "0", sessions: map[string]time.Time{}, iceServers: iceServers, signalSessions: map[string]*websocket.Conn{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /node", func(w http.ResponseWriter, r *http.Request) {
 		if !validBearer(r, nodeToken) {
@@ -47,12 +51,13 @@ func runHub() error {
 		conn.SetReadLimit(4 << 20)
 		hub.attach(conn)
 	})
+	mux.HandleFunc("GET /signal", hub.signal)
 	mux.HandleFunc("GET /api/session", hub.sessionStatus)
 	mux.HandleFunc("POST /api/session", hub.login)
 	mux.HandleFunc("DELETE /api/session", hub.logout)
 	mux.Handle("/api/", hub.requireSession(http.HandlerFunc(hub.proxy)))
 	mux.Handle("/", http.FileServer(http.FS(static)))
-	server := &http.Server{Addr: addr, Handler: hubHeaders(mux), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	server := &http.Server{Addr: addr, Handler: hubHeaders(hub.trackWebTraffic(mux)), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	log.Printf("Myliba remote hub listening on %s; put it behind an HTTPS reverse proxy", addr)
 	return server.ListenAndServe()
 }
@@ -73,7 +78,7 @@ func (h *remoteHub) sessionStatus(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	online := h.online
 	h.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online})
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online, "webTraffic": h.webTraffic.rate(), "nodeTraffic": h.nodeTraffic.rate(), "iceServers": h.iceServers})
 }
 
 func (h *remoteHub) login(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +121,10 @@ func (h *remoteHub) login(w http.ResponseWriter, r *http.Request) {
 	h.sessions[token] = time.Now().Add(30 * 24 * time.Hour)
 	h.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: hubSessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteStrictMode, Expires: time.Now().Add(30 * 24 * time.Hour)})
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true})
+	h.mu.Lock()
+	online := h.online
+	h.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online, "iceServers": h.iceServers})
 }
 
 func (h *remoteHub) logout(w http.ResponseWriter, r *http.Request) {

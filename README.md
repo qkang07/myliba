@@ -18,7 +18,7 @@ For frontend development, run the local Go service and `pnpm dev` in separate te
 
 ## Remote web access
 
-The same executable runs in two modes. The home node keeps its local HTTP service bound to `127.0.0.1:4317`; it only makes an outbound WebSocket connection to the hub. The hub hosts the embedded web app and proxies a restricted set of `/api/` requests to the node. File responses, including HTTP range requests for video previews, are forwarded in bounded chunks.
+The same executable runs in two modes. The home node keeps its local HTTP service bound to `127.0.0.1:4317`; it maintains an outbound WebSocket connection to the hub for signaling and fallback relay. After login, the browser negotiates a WebRTC DataChannel with the home node. API requests and resource data use that direct encrypted channel when available; the existing hub proxy remains the fallback.
 
 ### 1. Build on the VPS
 
@@ -68,7 +68,9 @@ The home node still opens its local interface at <http://127.0.0.1:4317>. From a
 
 The hub and node token are shared secrets for this first self-hosted version; they are not yet individual paired device identities. Hub web sessions expire after 30 days and are held in memory, so restarting the hub requires users to sign in again. Use a unique, long web password, restrict VPS access to HTTPS, and keep the node token private. Do not set `MYLIBA_HUB_COOKIE_SECURE=0` outside local HTTP development.
 
-All remote API and file traffic passes through the VPS in this version. TLS protects browser-to-hub and node-to-hub connections; the hub can read the proxied content. Direct device connections, end-to-end encryption from browser to home node, synced offline search, and VPS preview caching are not included.
+After the web session is authenticated, the browser negotiates a WebRTC DataChannel directly with the home node through the hub's signaling WebSocket. API calls, thumbnails, file previews, and downloads use that encrypted channel when it opens; until then, or after it disconnects, requests use the existing WSS hub relay. The page reports which transport is active and its current data rate. The hub still serves the page, authenticates the browser, and relays signaling; it does not receive the content of a working WebRTC DataChannel.
+
+The hub and home node use the same optional `MYLIBA_ICE_SERVERS` JSON array. Without it, Myliba uses `stun:stun.l.google.com:19302`. Configure a TURN server on both processes when either network blocks direct ICE connectivity. For example, set `MYLIBA_ICE_SERVERS='[{"urls":["stun:stun.example.net:3478"]},{"urls":["turn:turn.example.net:3478"],"username":"temporary-user","credential":"temporary-password"}]'`. TURN credentials are sent to authenticated browser sessions, so use short-lived credentials. If ICE cannot establish a DataChannel, the app stays usable through the hub relay.
 
 ## Implemented features
 
@@ -78,7 +80,7 @@ All remote API and file traffic passes through the VPS in this version. TLS prot
 - Search names, paths, and manual tags with SQLite FTS5 plus substring matching.
 - Add tags one at a time or in batches, and use the unorganized queue to find resources without tags.
 - Open resources in the browser and download the original file from each resource card; previews and downloads also work through the remote hub.
-- Preview browser-supported image and video formats from the local file.
+- Generate and cache small image thumbnails on the home node only when requested from a resource card or the bulk selection toolbar. Video thumbnails use the first frame when FFmpeg is installed and available on `PATH`; merely opening the resource list does not process source files. Previews and downloads continue to use the original file.
 - Serve the responsive app remotely through a password-protected hub and an outbound node connection.
 
-Generated thumbnails and transcodes, saved smart collections, cross-device metadata sync, individual device pairing and revocation, conflict resolution, and offline remote access remain future work. Current version change detection uses file size and modification time; BLAKE3 content verification is planned before remote transfer and deduplication.
+Video first-frame thumbnails require FFmpeg on the home node. Users can generate thumbnails individually or select several resources for a controlled two-at-a-time batch. Without FFmpeg, JPEG, PNG, and GIF images still get thumbnails using Go standard image decoders. Generated JPEG thumbnails are cached under the Myliba config directory and refreshed when file size or modification time changes. Transcodes, saved smart collections, cross-device metadata sync, individual device pairing and revocation, conflict resolution, and offline remote access remain future work. Current version change detection uses file size and modification time; BLAKE3 content verification is planned before remote transfer and deduplication.

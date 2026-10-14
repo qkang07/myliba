@@ -13,8 +13,10 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -23,7 +25,13 @@ import (
 //go:embed web/dist
 var assets embed.FS
 
-type server struct{ db *sql.DB }
+type server struct {
+	db             *sql.DB
+	thumbnailDir   string
+	ffmpegPath     string
+	thumbnailMu    sync.Mutex
+	thumbnailLocks map[string]*sync.Mutex
+}
 
 type resource struct {
 	ID        string   `json:"id"`
@@ -64,7 +72,12 @@ func main() {
 	if err := migrate(db); err != nil {
 		log.Fatal(err)
 	}
-	app := &server{db: db}
+	thumbnailDir := filepath.Join(dataDir, "thumbnails")
+	if err := os.MkdirAll(thumbnailDir, 0o700); err != nil {
+		log.Fatal(err)
+	}
+	ffmpegPath, _ := exec.LookPath("ffmpeg")
+	app := &server{db: db, thumbnailDir: thumbnailDir, ffmpegPath: ffmpegPath, thumbnailLocks: map[string]*sync.Mutex{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/session", localSession)
@@ -77,6 +90,8 @@ func main() {
 	mux.HandleFunc("GET /api/resources/{id}/tag-suggestions", app.tagSuggestions)
 	mux.HandleFunc("GET /api/tag-batch-suggestions", app.tagBatchSuggestions)
 	mux.HandleFunc("GET /api/resources/{id}/file", app.serveFile)
+	mux.HandleFunc("GET /api/resources/{id}/thumbnail", app.serveThumbnail)
+	mux.HandleFunc("POST /api/resources/{id}/thumbnail", app.serveThumbnail)
 	mux.HandleFunc("POST /api/resources/{id}/tags", app.addTag)
 	mux.HandleFunc("DELETE /api/resources/{id}/tags/{tagID}", app.removeTag)
 	mux.HandleFunc("GET /api/tags", app.tags)
@@ -95,7 +110,11 @@ func main() {
 		if err := validateHubURL(hubURL); err != nil {
 			log.Fatal(err)
 		}
-		go runNodeAgent(hubURL, nodeToken)
+		iceServers, err := loadICEServers()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go runNodeAgent(hubURL, nodeToken, iceServers)
 		log.Printf("Remote node enabled; connecting to %s", hubURL)
 	}
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { closeWebRTC, connectWebRTC } from "./webrtc";
 import {
   Check,
   ChevronDown,
@@ -22,6 +23,7 @@ import {
   LogOut,
   Music2,
   Plus,
+  Play,
   RefreshCw,
   Search,
   Sparkles,
@@ -35,7 +37,9 @@ import {
   addResourceTag,
   addRoot,
   ApiError,
-  fileURL,
+  getResourceFile,
+  getResourceThumbnail,
+  createThumbnail,
   getBatchTagSuggestions,
   getResources,
   getRoots,
@@ -52,15 +56,27 @@ import {
   type RootSummary,
   type TagSummary,
   type TagSuggestion,
+  type TrafficRate,
 } from "./api";
 
 const remoteMode = ref(false);
 const authenticated = ref(true);
 const nodeOnline = ref(false);
+const nodeTransport = ref<"connecting" | "webrtc" | "turn" | "relay">("relay");
+const webTraffic = ref<TrafficRate>({ downloadBps: 0, uploadBps: 0 });
+const nodeTraffic = ref<TrafficRate>({ downloadBps: 0, uploadBps: 0 });
 const loading = ref(false);
 const initialized = ref(false);
 const errorMessage = ref("");
 const resources = ref<Resource[]>([]);
+const failedThumbnailIDs = ref(new Set<string>());
+const thumbnailURLs = ref(new Map<string, string>());
+const thumbnailVersionSignatures = ref(new Map<string, string>());
+const loadingThumbnailIDs = new Set<string>();
+const generatingThumbnailIDs = ref(new Set<string>());
+const generatingThumbnailBatch = ref(false);
+const thumbnailRefreshTokens = ref(new Map<string, number>());
+const thumbnailBatchProgress = ref({ done: 0, total: 0 });
 const roots = ref<RootSummary[]>([]);
 const tags = ref<TagSummary[]>([]);
 const total = ref(0);
@@ -99,6 +115,8 @@ let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 let statusTimer: ReturnType<typeof setInterval> | undefined;
 let requestGeneration = 0;
+let lastWebRTCAttempt = 0;
+let retryingWebRTC = false;
 
 const onShortcut = (event: KeyboardEvent) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -122,9 +140,16 @@ const pageTitle = computed(() => selectedTag.value
       ? "搜索结果"
       : "全部资源");
 const selectedCount = computed(() => selectedIDs.value.size);
+const selectedMediaCount = computed(() => resources.value.filter((resource) => selectedIDs.value.has(resource.id) && resource.available && ["image", "video"].includes(resource.kind)).length);
 const totalIndexed = computed(() => roots.value.reduce((sum, root) => sum + root.count, 0));
 const hasMore = computed(() => resources.value.length < total.value);
 const isFiltered = computed(() => Boolean(query.value.trim() || selectedTag.value || unorganizedOnly.value));
+
+function formatRate(value: number): string {
+  if (value < 1024) return `${value} B/s`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB/s`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB/s`;
+}
 
 function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
@@ -137,6 +162,101 @@ function formatDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "时间未知";
   return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" }).format(date);
+}
+
+function markThumbnailFailed(id: string) {
+  failedThumbnailIDs.value = new Set(failedThumbnailIDs.value).add(id);
+}
+
+async function loadThumbnail(resource: Resource) {
+  if (!resource.available || !["image", "video"].includes(resource.kind) || thumbnailURLs.value.has(resource.id) || loadingThumbnailIDs.has(resource.id)) return;
+  loadingThumbnailIDs.add(resource.id);
+  const requestedRevision = thumbnailRefreshTokens.value.get(resource.id) || 0;
+  const requestedSignature = `${resource.size}-${resource.modified}`;
+  let retryWithCurrentRevision = false;
+  try {
+    const response = await getResourceThumbnail(resource, requestedRevision);
+    if (!response.ok) throw new Error("thumbnail unavailable");
+    const url = URL.createObjectURL(await response.blob());
+    const currentResource = resources.value.find((item) => item.id === resource.id);
+    if ((thumbnailRefreshTokens.value.get(resource.id) || 0) !== requestedRevision || (currentResource && `${currentResource.size}-${currentResource.modified}` !== requestedSignature)) {
+      URL.revokeObjectURL(url);
+      retryWithCurrentRevision = true;
+      return;
+    }
+    const urls = new Map(thumbnailURLs.value);
+    const previous = urls.get(resource.id);
+    if (previous) URL.revokeObjectURL(previous);
+    urls.set(resource.id, url);
+    thumbnailURLs.value = urls;
+    const failed = new Set(failedThumbnailIDs.value);
+    failed.delete(resource.id);
+    failedThumbnailIDs.value = failed;
+  } catch {
+    markThumbnailFailed(resource.id);
+  } finally {
+    loadingThumbnailIDs.delete(resource.id);
+    if (retryWithCurrentRevision) void loadThumbnail(resource);
+  }
+}
+
+function isGeneratingThumbnail(id: string) {
+  return generatingThumbnailIDs.value.has(id);
+}
+
+async function generateThumbnail(id: string, showFailure = true): Promise<boolean> {
+  if (generatingThumbnailIDs.value.has(id)) return false;
+  generatingThumbnailIDs.value = new Set(generatingThumbnailIDs.value).add(id);
+  try {
+    await createThumbnail(id);
+    const revisions = new Map(thumbnailRefreshTokens.value);
+    revisions.set(id, (revisions.get(id) || 0) + 1);
+    thumbnailRefreshTokens.value = revisions;
+    const failed = new Set(failedThumbnailIDs.value);
+    failed.delete(id);
+    failedThumbnailIDs.value = failed;
+    const urls = new Map(thumbnailURLs.value);
+    const previousURL = urls.get(id);
+    if (previousURL) URL.revokeObjectURL(previousURL);
+    urls.delete(id);
+    thumbnailURLs.value = urls;
+    loadingThumbnailIDs.delete(id);
+    const resource = resources.value.find((item) => item.id === id);
+    if (resource) await loadThumbnail(resource);
+    return true;
+  } catch (error) {
+    if (showFailure) notify(error instanceof Error ? error.message : "缩略图生成失败");
+    return false;
+  } finally {
+    const generating = new Set(generatingThumbnailIDs.value);
+    generating.delete(id);
+    generatingThumbnailIDs.value = generating;
+  }
+}
+
+async function generateSelectedThumbnails() {
+  if (generatingThumbnailBatch.value) return;
+  const selected = resources.value.filter((resource) => selectedIDs.value.has(resource.id) && resource.available && ["image", "video"].includes(resource.kind));
+  if (!selected.length) return;
+  generatingThumbnailBatch.value = true;
+  thumbnailBatchProgress.value = { done: 0, total: selected.length };
+  let nextIndex = 0;
+  let succeeded = 0;
+  let failed = 0;
+  const worker = async () => {
+    while (nextIndex < selected.length) {
+      const resource = selected[nextIndex++];
+      if (await generateThumbnail(resource.id, false)) succeeded++;
+      else failed++;
+      thumbnailBatchProgress.value = { ...thumbnailBatchProgress.value, done: thumbnailBatchProgress.value.done + 1 };
+    }
+  };
+  try {
+    await Promise.all([worker(), worker()]);
+    notify(failed ? `完成 ${succeeded} 个，${failed} 个失败` : `已生成 ${succeeded} 个缩略图`);
+  } finally {
+    generatingThumbnailBatch.value = false;
+  }
 }
 
 function kindLabel(kind: string): string {
@@ -371,6 +491,45 @@ async function rescanRoot(root: RootSummary) {
   finally { scanningRootID.value = ""; }
 }
 
+function applyTransportState(state: "connecting" | "webrtc" | "turn" | "relay") {
+  nodeTransport.value = state;
+  if (state === "relay") void refreshNodeStatus();
+}
+
+async function establishWebRTC(iceServers: RTCIceServer[] = []) {
+  lastWebRTCAttempt = Date.now();
+  await connectWebRTC(iceServers, applyTransportState, (rate) => { nodeTraffic.value = rate; });
+}
+
+async function openResourceFile(resource: Resource, download: boolean) {
+  const popup = download ? null : window.open("about:blank", "_blank");
+  if (!download && !popup) {
+    notify("Allow pop-ups to open this resource");
+    return;
+  }
+  try {
+    const response = await getResourceFile(resource.id, download);
+    if (!response.ok) {
+      const body = await response.json().catch(() => undefined);
+      throw new Error(body?.error || "Unable to read this file");
+    }
+    const url = URL.createObjectURL(await response.blob());
+    if (download) {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = resource.name;
+      link.click();
+    } else if (popup) {
+      popup.opener = null;
+      popup.location.href = url;
+    }
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch (error) {
+    popup?.close();
+    showError(error);
+  }
+}
+
 async function submitLogin() {
   if (loginBusy.value) return;
   loginBusy.value = true;
@@ -379,7 +538,10 @@ async function submitLogin() {
     const session = await login(password.value);
     authenticated.value = session.authenticated;
     nodeOnline.value = session.nodeOnline;
+    webTraffic.value = session.webTraffic ?? webTraffic.value;
     password.value = "";
+    if (session.nodeOnline) await establishWebRTC(session.iceServers);
+    else nodeTransport.value = "relay";
     await loadWorkspace();
     startStatusPolling();
   } catch (error) { loginError.value = error instanceof Error ? error.message : "登录失败"; }
@@ -392,12 +554,14 @@ async function signOut() {
   authenticated.value = false;
   password.value = "";
   stopStatusPolling();
+  closeWebRTC();
 }
 
 function handleUnauthorized() {
   if (!remoteMode.value) return;
   authenticated.value = false;
   stopStatusPolling();
+  closeWebRTC();
 }
 
 async function refreshNodeStatus() {
@@ -407,21 +571,50 @@ async function refreshNodeStatus() {
       if (!session.authenticated) {
         authenticated.value = false;
         stopStatusPolling();
+        closeWebRTC();
       }
       nodeOnline.value = session.nodeOnline;
+      webTraffic.value = session.webTraffic ?? { downloadBps: 0, uploadBps: 0 };
+      if (nodeTransport.value !== "webrtc" && nodeTransport.value !== "turn") {
+        nodeTraffic.value = { downloadBps: session.nodeTraffic?.uploadBps ?? 0, uploadBps: session.nodeTraffic?.downloadBps ?? 0 };
+      }
+      if (session.nodeOnline && nodeTransport.value === "relay" && !retryingWebRTC && Date.now() - lastWebRTCAttempt >= 30_000) {
+        retryingWebRTC = true;
+        void establishWebRTC(session.iceServers).finally(() => { retryingWebRTC = false; });
+      }
     }
   } catch { nodeOnline.value = false; }
 }
 
 function startStatusPolling() {
   stopStatusPolling();
-  if (remoteMode.value) statusTimer = setInterval(() => void refreshNodeStatus(), 30000);
+  if (remoteMode.value) statusTimer = setInterval(() => void refreshNodeStatus(), 2000);
 }
 
 function stopStatusPolling() {
   if (statusTimer) clearInterval(statusTimer);
   statusTimer = undefined;
 }
+
+watch(resources, (items) => {
+  const activeVersions = new Map(items.map((item) => [item.id, `${item.size}-${item.modified}`]));
+  const urls = new Map(thumbnailURLs.value);
+  const signatures = new Map(thumbnailVersionSignatures.value);
+  for (const [id, url] of urls) {
+    const resource = items.find((item) => item.id === id);
+    const nextSignature = activeVersions.get(id);
+    const priorSignature = signatures.get(id);
+    if (!resource || (priorSignature !== undefined && priorSignature !== nextSignature)) {
+      URL.revokeObjectURL(url);
+      urls.delete(id);
+    }
+  }
+  thumbnailURLs.value = urls;
+  for (const resource of items) signatures.set(resource.id, `${resource.size}-${resource.modified}`);
+  for (const id of signatures.keys()) if (!activeVersions.has(id)) signatures.delete(id);
+  thumbnailVersionSignatures.value = signatures;
+  for (const resource of items) void loadThumbnail(resource);
+}, { flush: "post" });
 
 watch(query, () => {
   if (debounceTimer) clearTimeout(debounceTimer);
@@ -441,8 +634,11 @@ onMounted(async () => {
       remoteMode.value = true;
       authenticated.value = session.authenticated;
       nodeOnline.value = session.nodeOnline;
+      webTraffic.value = session.webTraffic ?? webTraffic.value;
+      nodeTraffic.value = session.nodeTraffic ?? nodeTraffic.value;
     }
     if (authenticated.value) {
+      if (session?.nodeOnline) await establishWebRTC(session.iceServers);
       await loadWorkspace();
       startStatusPolling();
     }
@@ -456,6 +652,8 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onShortcut);
   document.removeEventListener("click", onTagEditorOutside, true);
   stopStatusPolling();
+  closeWebRTC();
+  for (const url of thumbnailURLs.value.values()) URL.revokeObjectURL(url);
   if (debounceTimer) clearTimeout(debounceTimer);
   if (toastTimer) clearTimeout(toastTimer);
 });
@@ -505,9 +703,15 @@ onBeforeUnmount(() => {
       <header class="topbar">
         <div class="breadcrumbs"><span>我的资源</span><span class="breadcrumb-divider">/</span><strong>{{ pageTitle }}</strong></div>
         <div class="topbar-actions">
-          <span class="connection-badge" :class="{ offline: remoteMode && !nodeOnline }">
-            <span class="connection-dot"></span>{{ remoteMode ? (nodeOnline ? "家中节点在线" : "家中节点离线") : "本机模式" }}
-          </span>
+          <template v-if="remoteMode">
+            <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
+              <span class="connection-dot"></span><span>Web · HTTPS 接入</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small>
+            </span>
+            <span class="connection-badge traffic-badge" :class="{ offline: !nodeOnline }" :title="nodeTransport === 'webrtc' ? 'WebRTC DataChannel 直连；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'turn' ? 'WebRTC DataChannel 通过 TURN 中继；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'connecting' ? '正在协商 WebRTC；直连建立前 API 经 WSS 服务端转发。' : 'WebRTC 不可用，API 经 WSS 服务端转发；↓ 节点发往网页，↑ 网页发往节点。'">
+              <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · WebRTC / TURN' : nodeTransport === 'connecting' ? '节点 · WebRTC 连接中' : '节点 · WSS 转发' }}</span><small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small>
+            </span>
+          </template>
+          <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>
           <button v-if="remoteMode && authenticated" class="quiet-button signout-button" title="退出登录" @click="signOut"><LogOut :size="15" /><span>退出</span></button>
         </div>
       </header>
@@ -621,6 +825,7 @@ onBeforeUnmount(() => {
 
         <div v-if="selectedCount" class="bulk-toolbar">
           <div class="selection-summary"><span class="selection-check"><Check :size="14" /></span><strong>{{ selectedCount }}</strong><span>项已选</span></div>
+          <button v-if="selectedMediaCount" class="button button-secondary thumbnail-batch-button" :disabled="generatingThumbnailBatch" @click="generateSelectedThumbnails"><LoaderCircle v-if="generatingThumbnailBatch" class="spin" :size="14" /><Image v-else :size="14" />{{ generatingThumbnailBatch ? `正在生成 ${thumbnailBatchProgress.done}/${thumbnailBatchProgress.total}` : `生成缩略图（${selectedMediaCount}）` }}</button>
           <span class="bulk-divider"></span>
           <input v-model="bulkTagName" maxlength="40" type="text" placeholder="输入要添加的标签" @keydown.enter.prevent="applyBatchTag" />
           <button class="button button-primary" :disabled="!bulkTagName.trim()" @click="applyBatchTag"><Plus :size="15" />批量添加标签</button>
@@ -640,9 +845,10 @@ onBeforeUnmount(() => {
               <span class="check-indicator"><Check :size="13" /></span>
             </label>
             <div class="resource-preview">
-              <img v-if="resource.available && resource.kind === 'image'" loading="lazy" :src="fileURL(resource.id)" :alt="resource.name" />
-              <video v-else-if="resource.available && resource.kind === 'video'" preload="metadata" muted :src="`${fileURL(resource.id)}#t=0.1`"></video>
-              <div v-else class="preview-placeholder"><component :is="kindIcon(resource.kind)" :size="29" :stroke-width="1.5" /></div>
+              <img v-if="thumbnailURLs.has(resource.id) && !failedThumbnailIDs.has(resource.id)" loading="lazy" :src="thumbnailURLs.get(resource.id)" :alt="resource.name" @error="markThumbnailFailed(resource.id)" />
+              <div v-if="!resource.available || !['image', 'video'].includes(resource.kind) || failedThumbnailIDs.has(resource.id) || !thumbnailURLs.has(resource.id)" class="preview-placeholder"><component :is="kindIcon(resource.kind)" :size="29" :stroke-width="1.5" /></div>
+              <button v-if="resource.available && ['image', 'video'].includes(resource.kind) && failedThumbnailIDs.has(resource.id)" class="thumbnail-generate-button" :disabled="isGeneratingThumbnail(resource.id)" @click.stop="generateThumbnail(resource.id)"><LoaderCircle v-if="isGeneratingThumbnail(resource.id)" class="spin" :size="13" />{{ isGeneratingThumbnail(resource.id) ? '正在生成' : '生成缩略图' }}</button>
+              <span v-if="resource.available && resource.kind === 'video' && thumbnailURLs.has(resource.id) && !failedThumbnailIDs.has(resource.id)" class="video-preview-play" aria-hidden="true"><Play :size="17" fill="currentColor" /></span>
               <span class="type-pill">{{ kindLabel(resource.kind) }}</span>
               <span v-if="!resource.available" class="unavailable-pill">来源暂不可用</span>
             </div>
@@ -650,8 +856,8 @@ onBeforeUnmount(() => {
               <p class="resource-name" :title="resource.path">{{ resource.name }}</p>
               <div class="resource-meta"><span>{{ formatBytes(resource.size) }}</span><span class="meta-dot"></span><span>{{ formatDate(resource.modified) }}</span></div>
               <div v-if="resource.available" class="resource-file-actions">
-                <a class="resource-file-action" :href="fileURL(resource.id)" target="_blank" rel="noopener noreferrer"><ExternalLink :size="13" />打开</a>
-                <a class="resource-file-action" :href="fileURL(resource.id, true)" :download="resource.name"><Download :size="13" />下载</a>
+                <a class="resource-file-action" :href="`/api/resources/${resource.id}/file`" target="_blank" rel="noopener noreferrer" @click.prevent="openResourceFile(resource, false)"><ExternalLink :size="13" />打开</a>
+                <a class="resource-file-action" :href="`/api/resources/${resource.id}/file?download=1`" :download="resource.name" @click.prevent="openResourceFile(resource, true)"><Download :size="13" />下载</a>
               </div>
               <p v-else class="resource-unavailable-note">源文件当前不可用</p>
               <div class="resource-tags">

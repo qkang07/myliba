@@ -1,3 +1,5 @@
+import { webRTCConnected, webRTCFetch } from "./webrtc";
+
 export interface Resource {
   id: string;
   name: string;
@@ -56,10 +58,18 @@ export interface DirectoryListing {
   directories: DirectoryItem[];
 }
 
+export interface TrafficRate {
+  downloadBps: number;
+  uploadBps: number;
+}
+
 export interface SessionInfo {
   local?: boolean;
   authenticated: boolean;
   nodeOnline: boolean;
+  webTraffic?: TrafficRate;
+  nodeTraffic?: TrafficRate;
+  iceServers?: RTCIceServer[];
 }
 
 export class ApiError extends Error {
@@ -71,8 +81,15 @@ export class ApiError extends Error {
   }
 }
 
+async function apiFetch(url: string, init?: RequestInit) {
+  if (url.startsWith("/api/") && url !== "/api/session" && webRTCConnected()) {
+    return webRTCFetch(url, init);
+  }
+  return fetch(url, init);
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
+  const response = await apiFetch(url, {
     credentials: "same-origin",
     ...init,
     headers: {
@@ -96,7 +113,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 export async function getSession(): Promise<SessionInfo | null> {
   const response = await fetch("/api/session", { credentials: "same-origin" });
   if (response.status === 404) return null;
-  if (response.status === 401) return { authenticated: false, nodeOnline: false };
+  if (response.status === 401) return { authenticated: false, nodeOnline: false, webTraffic: { downloadBps: 0, uploadBps: 0 }, nodeTraffic: { downloadBps: 0, uploadBps: 0 } };
   if (!response.ok) throw new ApiError(response.status, "无法读取登录状态");
   const session = await response.json() as SessionInfo;
   return session.local ? null : session;
@@ -172,4 +189,20 @@ export function addBatchTag(ids: string[], name: string) {
 
 export function fileURL(id: string, download = false) {
 	return `/api/resources/${id}/file${download ? "?download=1" : ""}`;
+}
+
+export function thumbnailURL(resource: Pick<Resource, "id" | "size" | "modified">, revision = 0) {
+  const version = encodeURIComponent(`${resource.size}-${resource.modified}`);
+  return `/api/resources/${resource.id}/thumbnail?v=${version}&r=${revision}`;
+}
+
+export function getResourceFile(id: string, download = false) {
+  return apiFetch(fileURL(id, download));
+}
+
+export function getResourceThumbnail(resource: Pick<Resource, "id" | "size" | "modified">, revision = 0) {
+  return apiFetch(thumbnailURL(resource, revision));
+}
+export function createThumbnail(id: string) {
+  return request<void>(`/api/resources/${id}/thumbnail`, { method: "POST" });
 }

@@ -22,14 +22,16 @@ import (
 const remoteChunkSize = 32 << 10
 
 type wireMessage struct {
-	Type    string      `json:"type"`
-	ID      string      `json:"id,omitempty"`
-	Method  string      `json:"method,omitempty"`
-	Path    string      `json:"path,omitempty"`
-	Headers http.Header `json:"headers,omitempty"`
-	Body    []byte      `json:"body,omitempty"`
-	Status  int         `json:"status,omitempty"`
-	Data    []byte      `json:"data,omitempty"`
+	Type      string          `json:"type"`
+	ID        string          `json:"id,omitempty"`
+	Method    string          `json:"method,omitempty"`
+	Path      string          `json:"path,omitempty"`
+	Headers   http.Header     `json:"headers,omitempty"`
+	Body      []byte          `json:"body,omitempty"`
+	Status    int             `json:"status,omitempty"`
+	Data      []byte          `json:"data,omitempty"`
+	SessionID string          `json:"sessionId,omitempty"`
+	Signal    json.RawMessage `json:"signal,omitempty"`
 }
 
 type remoteHub struct {
@@ -43,6 +45,101 @@ type remoteHub struct {
 	sessions          map[string]time.Time
 	loginTries        int
 	loginBlockedUntil time.Time
+	webTraffic        trafficMeter
+	nodeTraffic       trafficMeter
+	iceServers        []iceServerConfig
+	signalMu          sync.Mutex
+	signalSessions    map[string]*websocket.Conn
+}
+
+type trafficSlot struct {
+	second int64
+	in     uint64
+	out    uint64
+}
+
+type trafficRate struct {
+	DownloadBps uint64 `json:"downloadBps"`
+	UploadBps   uint64 `json:"uploadBps"`
+}
+
+// trafficMeter keeps a five-second rolling application-payload rate.
+type trafficMeter struct {
+	mu    sync.Mutex
+	slots [5]trafficSlot
+}
+
+func (m *trafficMeter) add(inbound bool, count int) {
+	if count <= 0 {
+		return
+	}
+	second := time.Now().Unix()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	slot := &m.slots[second%int64(len(m.slots))]
+	if slot.second != second {
+		*slot = trafficSlot{second: second}
+	}
+	if inbound {
+		slot.in += uint64(count)
+	} else {
+		slot.out += uint64(count)
+	}
+}
+
+func (m *trafficMeter) rate() trafficRate {
+	now := time.Now().Unix()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var inbound, outbound uint64
+	for _, slot := range m.slots {
+		if slot.second >= now-4 && slot.second <= now {
+			inbound += slot.in
+			outbound += slot.out
+		}
+	}
+	return trafficRate{DownloadBps: outbound / 5, UploadBps: inbound / 5}
+}
+
+type trafficBody struct {
+	io.ReadCloser
+	meter *trafficMeter
+}
+
+func (b trafficBody) Read(buffer []byte) (int, error) {
+	count, err := b.ReadCloser.Read(buffer)
+	b.meter.add(true, count)
+	return count, err
+}
+
+type trafficResponseWriter struct {
+	http.ResponseWriter
+	meter *trafficMeter
+}
+
+func (w trafficResponseWriter) Write(data []byte) (int, error) {
+	count, err := w.ResponseWriter.Write(data)
+	w.meter.add(false, count)
+	return count, err
+}
+
+func (w trafficResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (h *remoteHub) trackWebTraffic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/node" || r.URL.Path == "/signal" || r.URL.Path == "/api/session" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Body != nil {
+			r.Body = trafficBody{ReadCloser: r.Body, meter: &h.webTraffic}
+		}
+		next.ServeHTTP(trafficResponseWriter{ResponseWriter: w, meter: &h.webTraffic}, r)
+	})
 }
 
 type remoteWaiter struct {
@@ -55,9 +152,9 @@ func (w *remoteWaiter) finish() {
 	w.once.Do(func() { close(w.done) })
 }
 
-func runNodeAgent(hubURL, token string) {
+func runNodeAgent(hubURL, token string, iceServers []iceServerConfig) {
 	for {
-		if err := connectNode(hubURL, token); err != nil {
+		if err := connectNode(hubURL, token, iceServers); err != nil {
 			log.Printf("Remote hub connection ended: %v", err)
 		}
 		time.Sleep(3 * time.Second)
@@ -72,7 +169,7 @@ func validateHubURL(hubURL string) error {
 	return nil
 }
 
-func connectNode(hubURL, token string) error {
+func connectNode(hubURL, token string, iceServers []iceServerConfig) error {
 	parsed, err := url.Parse(hubURL)
 	if err != nil || parsed.Scheme != "wss" || parsed.Host == "" {
 		return errors.New("MYLIBA_HUB_URL must be a wss:// URL")
@@ -91,6 +188,8 @@ func connectNode(hubURL, token string) error {
 	conn.SetReadLimit(2 << 20)
 	log.Printf("Connected to remote hub %s", parsed.Host)
 	writeMu := &sync.Mutex{}
+	rtc := newNodeRTCManager(conn, writeMu, iceServers)
+	defer rtc.closeAll()
 	go func() {
 		ticker := time.NewTicker(25 * time.Second)
 		defer ticker.Stop()
@@ -116,10 +215,17 @@ func connectNode(hubURL, token string) error {
 			return err
 		}
 		var request wireMessage
-		if err := json.Unmarshal(payload, &request); err != nil || request.Type != "request" || request.ID == "" {
+		if err := json.Unmarshal(payload, &request); err != nil {
 			continue
 		}
-		go handleNodeRequest(ctx, conn, writeMu, &request)
+		switch request.Type {
+		case "request":
+			if request.ID != "" {
+				go handleNodeRequest(ctx, conn, writeMu, &request)
+			}
+		case "rtc-signal":
+			rtc.handle(request.SessionID, request.Signal)
+		}
 	}
 }
 
@@ -207,8 +313,16 @@ func (h *remoteHub) readNode(conn *websocket.Conn) {
 		if err != nil {
 			return
 		}
+		h.nodeTraffic.add(true, len(payload))
 		var message wireMessage
-		if json.Unmarshal(payload, &message) != nil || message.ID == "" {
+		if json.Unmarshal(payload, &message) != nil {
+			continue
+		}
+		if message.Type == "rtc-signal" {
+			h.forwardRTCSignal(message.SessionID, message.Signal)
+			continue
+		}
+		if message.ID == "" {
 			continue
 		}
 		h.mu.Lock()
@@ -311,7 +425,11 @@ func (h *remoteHub) send(conn *websocket.Conn, message wireMessage) error {
 	}
 	h.sendMu.Lock()
 	defer h.sendMu.Unlock()
-	return conn.Write(context.Background(), websocket.MessageText, data)
+	err = conn.Write(context.Background(), websocket.MessageText, data)
+	if err == nil {
+		h.nodeTraffic.add(false, len(data))
+	}
+	return err
 }
 
 func filteredHeaders(headers http.Header, response bool) http.Header {
