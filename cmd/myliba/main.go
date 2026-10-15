@@ -101,6 +101,10 @@ func main() {
 	mux.HandleFunc("POST /api/resources/{id}/tags", app.addTag)
 	mux.HandleFunc("DELETE /api/resources/{id}/tags/{tagID}", app.removeTag)
 	mux.HandleFunc("GET /api/tags", app.tags)
+	mux.HandleFunc("GET /api/collections", app.listCollections)
+	mux.HandleFunc("POST /api/collections", app.createCollection)
+	mux.HandleFunc("PUT /api/collections/{id}", app.updateCollection)
+	mux.HandleFunc("DELETE /api/collections/{id}", app.deleteCollection)
 	static, err := fs.Sub(assets, "web/dist")
 	if err != nil {
 		log.Fatal(err)
@@ -171,6 +175,12 @@ CREATE TABLE IF NOT EXISTS resource_tags (
 	tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
 	created_at TEXT NOT NULL,
 	PRIMARY KEY(resource_id, tag_id)
+);
+CREATE TABLE IF NOT EXISTS smart_collections (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+	filters_json TEXT NOT NULL,
+	created_at TEXT NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS resource_fts USING fts5(resource_id UNINDEXED, name, path);
 CREATE INDEX IF NOT EXISTS resources_root_idx ON resources(root_id);
@@ -355,8 +365,15 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
+	tags := r.URL.Query()["tag"]
 	unorganized := r.URL.Query().Get("unorganized") == "1"
+	kind := r.URL.Query().Get("kind")
+	rootID := r.URL.Query().Get("rootId")
+	sort := r.URL.Query().Get("sort")
+	if !validCollectionKind(kind) || !validCollectionSort(sort) {
+		writeError(w, http.StatusBadRequest, "筛选条件无效")
+		return
+	}
 	limit := 48
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		if _, err := fmt.Sscanf(raw, "%d", &limit); err != nil || limit < 1 || limit > 100 {
@@ -375,16 +392,39 @@ func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
 		where = append(where, `(r.id IN (SELECT resource_id FROM resource_fts WHERE resource_fts MATCH ?) OR r.name LIKE ? OR r.path LIKE ? OR r.id IN (SELECT rt.resource_id FROM resource_tags rt JOIN tags t ON t.id=rt.tag_id WHERE t.name LIKE ?))`)
 		args = append(args, match, "%"+query+"%", "%"+query+"%", "%"+query+"%")
 	}
-	if tag != "" {
-		where = append(where, `r.id IN (SELECT rt.resource_id FROM resource_tags rt JOIN tags t ON t.id=rt.tag_id WHERE t.name=?)`)
+	for _, rawTag := range tags {
+		tag := strings.TrimSpace(rawTag)
+		if tag == "" {
+			continue
+		}
+		where = append(where, `EXISTS (SELECT 1 FROM resource_tags rt JOIN tags t ON t.id=rt.tag_id WHERE rt.resource_id=r.id AND t.name=?)`)
 		args = append(args, tag)
 	}
 	if unorganized {
 		where = append(where, `NOT EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id=r.id)`)
 	}
+	if kind != "" {
+		where = append(where, `r.kind=?`)
+		args = append(args, kind)
+	}
+	if rootID != "" {
+		where = append(where, `r.root_id=?`)
+		args = append(args, rootID)
+	}
+	orderBy := `r.modified_at DESC, r.id DESC`
+	switch sort {
+	case "modified_asc":
+		orderBy = `r.modified_at ASC, r.id ASC`
+	case "name_asc":
+		orderBy = `r.name COLLATE NOCASE ASC, r.id ASC`
+	case "name_desc":
+		orderBy = `r.name COLLATE NOCASE DESC, r.id DESC`
+	case "size_desc":
+		orderBy = `r.size DESC, r.id DESC`
+	}
 	args = append(args, limit, offset)
 	rows, err := s.db.Query(`SELECT r.id,r.name,r.path,r.size,r.modified_at,r.kind,r.available,r.current_version_id
-		FROM resources r WHERE `+strings.Join(where, " AND ")+` ORDER BY r.modified_at DESC LIMIT ? OFFSET ?`, args...)
+		FROM resources r WHERE `+strings.Join(where, " AND ")+` ORDER BY `+orderBy+` LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

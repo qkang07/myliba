@@ -1,0 +1,263 @@
+package com.myliba.android;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.graphics.pdf.PdfRenderer;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.ParcelFileDescriptor;
+import android.view.Gravity;
+import android.view.WindowInsets;
+import android.widget.Button;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.MediaController;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.VideoView;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public final class PreviewActivity extends Activity {
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private Uri fileUri;
+    private String mime;
+    private LinearLayout content;
+    private PdfRenderer pdf;
+    private ParcelFileDescriptor pdfFile;
+    private VideoView video;
+    private Bitmap currentBitmap;
+    private int pdfPage;
+    private boolean closing;
+
+    @Override public void onCreate(Bundle state) {
+        super.onCreate(state);
+        String value = getIntent().getStringExtra("uri");
+        if (value == null) { finish(); return; }
+        fileUri = Uri.parse(value);
+        mime = getIntent().getStringExtra("mime");
+        if (mime == null) mime = "application/octet-stream";
+        String name = getIntent().getStringExtra("name");
+        if (name == null) name = "文件预览";
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setBackgroundColor(Color.rgb(250, 251, 253));
+        setContentView(layout);
+        if (Build.VERSION.SDK_INT >= 35) {
+            getWindow().setDecorFitsSystemWindows(false);
+            layout.setOnApplyWindowInsetsListener((view, insets) -> {
+                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
+                layout.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+                return insets;
+            });
+        }
+        LinearLayout toolbar = new LinearLayout(this);
+        toolbar.setGravity(Gravity.CENTER_VERTICAL);
+        toolbar.setPadding(dp(8), dp(4), dp(8), dp(4));
+        toolbar.setBackgroundColor(Color.WHITE);
+        toolbar.addView(button("返回", this::finish));
+        TextView title = new TextView(this);
+        title.setText(name);
+        title.setTextSize(17);
+        title.setSingleLine(true);
+        title.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        toolbar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        toolbar.addView(button("其他应用", this::openExternal));
+        layout.addView(toolbar);
+        content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        layout.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
+        showMessage("正在打开…");
+
+        if (mime.startsWith("image/")) loadImage();
+        else if (mime.equals("application/pdf")) loadPdf();
+        else if (mime.startsWith("text/") || mime.equals("application/json") || mime.endsWith("+xml")) loadText();
+        else if (mime.startsWith("video/")) showVideo();
+        else showMessage("此格式没有内置预览，可用其他应用打开。");
+    }
+
+    private void loadImage() {
+        worker.execute(() -> {
+            try {
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                try (InputStream stream = getContentResolver().openInputStream(fileUri)) {
+                    if (stream == null) throw new IOException("无法读取图片");
+                    BitmapFactory.decodeStream(stream, null, bounds);
+                }
+                BitmapFactory.Options options = new BitmapFactory.Options();
+                options.inPreferredConfig = Bitmap.Config.RGB_565;
+                options.inSampleSize = 1;
+                while (bounds.outWidth / options.inSampleSize > 2048 || bounds.outHeight / options.inSampleSize > 2048) {
+                    options.inSampleSize *= 2;
+                }
+                Bitmap bitmap;
+                try (InputStream stream = getContentResolver().openInputStream(fileUri)) {
+                    if (stream == null) throw new IOException("无法读取图片");
+                    bitmap = BitmapFactory.decodeStream(stream, null, options);
+                }
+                if (bitmap == null) throw new IOException("图片格式不受支持");
+                runOnUiThread(() -> {
+                    if (closing) { bitmap.recycle(); return; }
+                    clearContent();
+                    ImageView image = new ImageView(this);
+                    image.setImageBitmap(bitmap);
+                    currentBitmap = bitmap;
+                    image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                    content.addView(image, new LinearLayout.LayoutParams(-1, -1));
+                });
+            } catch (Exception error) { fail(error); }
+        });
+    }
+
+    private void loadText() {
+        worker.execute(() -> {
+            try (InputStream stream = getContentResolver().openInputStream(fileUri)) {
+                if (stream == null) throw new IOException("无法读取文本");
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                byte[] buffer = new byte[8192];
+                int count;
+                while (bytes.size() < 1024 * 1024 && (count = stream.read(buffer, 0, Math.min(buffer.length, 1024 * 1024 - bytes.size()))) != -1) {
+                    bytes.write(buffer, 0, count);
+                }
+                String text = new String(bytes.toByteArray(), StandardCharsets.UTF_8);
+                if (bytes.size() == 1024 * 1024) text += "\n\n仅显示前 1 MiB";
+                String preview = text;
+                runOnUiThread(() -> {
+                    if (closing) return;
+                    clearContent();
+                    ScrollView scroll = new ScrollView(this);
+                    TextView view = new TextView(this);
+                    view.setText(preview);
+                    view.setTextSize(15);
+                    view.setTextColor(Color.rgb(29, 39, 49));
+                    view.setPadding(dp(16), dp(16), dp(16), dp(24));
+                    scroll.addView(view);
+                    content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+                });
+            } catch (Exception error) { fail(error); }
+        });
+    }
+
+    private void loadPdf() {
+        worker.execute(() -> {
+            try {
+                pdfFile = getContentResolver().openFileDescriptor(fileUri, "r");
+                if (pdfFile == null) throw new IOException("无法读取 PDF");
+                pdf = new PdfRenderer(pdfFile);
+                if (pdf.getPageCount() == 0) throw new IOException("PDF 没有页面");
+                runOnUiThread(() -> { if (!closing) renderPdfPage(0); });
+            } catch (Exception error) { fail(error); }
+        });
+    }
+
+    private void renderPdfPage(int index) {
+        if (pdf == null || index < 0 || index >= pdf.getPageCount()) return;
+        pdfPage = index;
+        showMessage("正在渲染第 " + (index + 1) + " 页…");
+        worker.execute(() -> {
+            try (PdfRenderer.Page page = pdf.openPage(index)) {
+                float scale = Math.min(1f, Math.min(1600f / page.getWidth(), 2048f / page.getHeight()));
+                int width = Math.max(1, Math.round(page.getWidth() * scale));
+                int height = Math.max(1, Math.round(page.getHeight() * scale));
+                Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                bitmap.eraseColor(Color.WHITE);
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                runOnUiThread(() -> {
+                    if (closing || index != pdfPage) { bitmap.recycle(); return; }
+                    clearContent();
+                    LinearLayout pager = new LinearLayout(this);
+                    pager.setGravity(Gravity.CENTER);
+                    Button previous = button("上一页", () -> renderPdfPage(index - 1));
+                    previous.setEnabled(index > 0);
+                    pager.addView(previous);
+                    TextView count = new TextView(this);
+                    count.setText((index + 1) + " / " + pdf.getPageCount());
+                    pager.addView(count);
+                    Button next = button("下一页", () -> renderPdfPage(index + 1));
+                    next.setEnabled(index + 1 < pdf.getPageCount());
+                    pager.addView(next);
+                    content.addView(pager);
+                    ScrollView scroll = new ScrollView(this);
+                    ImageView image = new ImageView(this);
+                    image.setImageBitmap(bitmap);
+                    currentBitmap = bitmap;
+                    image.setAdjustViewBounds(true);
+                    scroll.addView(image);
+                    content.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+                });
+            } catch (Exception error) { fail(error); }
+        });
+    }
+
+    private void showVideo() {
+        clearContent();
+        video = new VideoView(this);
+        MediaController controls = new MediaController(this);
+        controls.setAnchorView(video);
+        video.setMediaController(controls);
+        video.setVideoURI(fileUri);
+        content.addView(video, new LinearLayout.LayoutParams(-1, -1));
+        video.setOnErrorListener((player, what, extra) -> { showMessage("视频无法播放，可用其他应用打开。"); return true; });
+        video.start();
+    }
+
+    private void openExternal() {
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(fileUri, mime);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try { startActivity(Intent.createChooser(intent, "打开文件")); }
+        catch (RuntimeException error) { showMessage("没有可打开此文件的应用，或目录授权已失效。"); }
+    }
+
+    private void fail(Exception error) { runOnUiThread(() -> { if (!closing) showMessage("预览失败：" + error.getMessage()); }); }
+
+    private void showMessage(String message) {
+        clearContent();
+        TextView view = new TextView(this);
+        view.setText(message);
+        view.setTextSize(15);
+        view.setPadding(dp(20), dp(24), dp(20), dp(20));
+        content.addView(view);
+    }
+
+    private void clearContent() {
+        content.removeAllViews();
+        if (currentBitmap != null) {
+            currentBitmap.recycle();
+            currentBitmap = null;
+        }
+    }
+
+    private Button button(String title, Runnable action) {
+        Button button = new Button(this);
+        button.setText(title);
+        button.setAllCaps(false);
+        button.setOnClickListener(view -> action.run());
+        return button;
+    }
+
+    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+
+    @Override protected void onDestroy() {
+        closing = true;
+        if (video != null) video.stopPlayback();
+        clearContent();
+        worker.execute(() -> {
+            if (pdf != null) pdf.close();
+            if (pdfFile != null) try { pdfFile.close(); } catch (IOException ignored) {}
+        });
+        worker.shutdown();
+        super.onDestroy();
+    }
+}

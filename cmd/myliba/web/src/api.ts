@@ -12,6 +12,24 @@ export interface Resource {
   tags: string[];
 }
 
+export type ResourceSort = "modified_desc" | "modified_asc" | "name_asc" | "name_desc" | "size_desc";
+
+export interface CollectionFilters {
+  query: string;
+  tags: string[];
+  kind: string;
+  rootId: string;
+  unorganized: boolean;
+  sort: ResourceSort;
+}
+
+export interface SmartCollection {
+  id: string;
+  name: string;
+  filters: CollectionFilters;
+  createdAt: string;
+}
+
 export interface ResourcePage {
   items: Resource[];
   total: number;
@@ -127,15 +145,34 @@ export function logout() {
   return request<{ authenticated: boolean }>("/api/session", { method: "DELETE" });
 }
 
-export function getResources(params: { query: string; tag: string; unorganized: boolean; limit: number; offset: number }) {
+export function getResources(params: CollectionFilters & { limit: number; offset: number }) {
   const search = new URLSearchParams({
     q: params.query,
-    tag: params.tag,
     unorganized: params.unorganized ? "1" : "",
+    kind: params.kind,
+    rootId: params.rootId,
+    sort: params.sort,
     limit: String(params.limit),
     offset: String(params.offset),
   });
+  for (const tag of params.tags) search.append("tag", tag);
   return request<ResourcePage>(`/api/resources?${search}`);
+}
+
+export function getCollections() {
+  return request<SmartCollection[]>("/api/collections");
+}
+
+export function createCollection(name: string, filters: CollectionFilters) {
+  return request<SmartCollection>("/api/collections", { method: "POST", body: JSON.stringify({ name, filters }) });
+}
+
+export function updateCollection(id: string, name: string, filters: CollectionFilters) {
+  return request<SmartCollection>(`/api/collections/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ name, filters }) });
+}
+
+export function deleteCollection(id: string) {
+  return request<{ ok: boolean }>(`/api/collections/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export function getRoots() {

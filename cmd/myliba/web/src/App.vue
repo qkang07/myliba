@@ -7,6 +7,10 @@ import {
   ChevronDown,
   CircleAlert,
   Clock3,
+  Bookmark,
+  BookmarkPlus,
+  Pencil,
+  Trash2,
   Download,
   ExternalLink,
   File,
@@ -37,12 +41,15 @@ import {
   addBatchTag,
   addResourceTag,
   addRoot,
+  createCollection,
+  deleteCollection,
   ApiError,
   fileURL,
   getResourceThumbnail,
   createThumbnail,
   getBatchTagSuggestions,
   getResources,
+  getCollections,
   getRoots,
   getDirectories,
   getSession,
@@ -51,8 +58,12 @@ import {
   login,
   logout,
   scanRoot,
+  updateCollection,
   type DirectoryListing,
   type BatchTagSuggestion,
+  type CollectionFilters,
+  type SmartCollection,
+  type ResourceSort,
   type Resource,
   type RootSummary,
   type TagSummary,
@@ -82,7 +93,16 @@ const roots = ref<RootSummary[]>([]);
 const tags = ref<TagSummary[]>([]);
 const total = ref(0);
 const query = ref("");
-const selectedTag = ref("");
+const selectedTags = ref<string[]>([]);
+const selectedKind = ref("");
+const selectedRootID = ref("");
+const sortOrder = ref<ResourceSort>("modified_desc");
+const collections = ref<SmartCollection[]>([]);
+const selectedCollectionID = ref("");
+const collectionEditorOpen = ref(false);
+const editingCollectionID = ref("");
+const collectionName = ref("");
+const collectionBusy = ref(false);
 const tagFilterOpen = ref(false);
 const tagFilterQuery = ref("");
 const unorganizedOnly = ref(false);
@@ -125,6 +145,7 @@ let requestGeneration = 0;
 let lastWebRTCAttempt = 0;
 let retryingWebRTC = false;
 let authGeneration = 0;
+let suppressQueryWatch = false;
 
 const onShortcut = (event: KeyboardEvent) => {
   if (event.key === "Escape" && previewResource.value) {
@@ -133,6 +154,10 @@ const onShortcut = (event: KeyboardEvent) => {
   }
   if (event.key === "Escape" && tagFilterOpen.value) {
     tagFilterOpen.value = false;
+    return;
+  }
+  if (event.key === "Escape" && collectionEditorOpen.value) {
+    closeCollectionEditor();
     return;
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -155,18 +180,33 @@ const onTagFilterOutside = (event: MouseEvent) => {
   }
 };
 
-const pageTitle = computed(() => selectedTag.value
-  ? `标签：${selectedTag.value}`
-  : unorganizedOnly.value
-    ? "待整理"
-    : query.value.trim()
-      ? "搜索结果"
-      : "全部资源");
+function currentFilters(): CollectionFilters {
+  return {
+    query: query.value.trim(), tags: [...selectedTags.value], kind: selectedKind.value,
+    rootId: selectedRootID.value, unorganized: unorganizedOnly.value, sort: sortOrder.value,
+  };
+}
+
+function sameFilters(left: CollectionFilters, right: CollectionFilters) {
+  return left.query === right.query && left.kind === right.kind && left.rootId === right.rootId &&
+    left.unorganized === right.unorganized && left.sort === right.sort &&
+    left.tags.length === right.tags.length && left.tags.every((tag) => right.tags.includes(tag));
+}
+
+const selectedCollection = computed(() => collections.value.find((item) => item.id === selectedCollectionID.value));
+const activeCollection = computed(() => selectedCollection.value && sameFilters(selectedCollection.value.filters, currentFilters()) ? selectedCollection.value : undefined);
+const pageTitle = computed(() => {
+  if (activeCollection.value) return activeCollection.value.name;
+  if (selectedTags.value.length > 1) return `标签筛选（${selectedTags.value.length}）`;
+  if (selectedTags.value.length === 1) return `标签：${selectedTags.value[0]}`;
+  if (unorganizedOnly.value) return "待整理";
+  return query.value.trim() || selectedKind.value || selectedRootID.value ? "筛选结果" : "全部资源";
+});
 const selectedCount = computed(() => selectedIDs.value.size);
 const selectedMediaCount = computed(() => resources.value.filter((resource) => selectedIDs.value.has(resource.id) && resource.available && ["image", "video"].includes(resource.kind)).length);
 const totalIndexed = computed(() => roots.value.reduce((sum, root) => sum + root.count, 0));
 const hasMore = computed(() => resources.value.length < total.value);
-const isFiltered = computed(() => Boolean(query.value.trim() || selectedTag.value || unorganizedOnly.value));
+const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || selectedKind.value || selectedRootID.value || sortOrder.value !== "modified_desc"));
 const matchingTags = computed(() => {
   const needle = tagFilterQuery.value.trim().toLocaleLowerCase();
   return tags.value.filter((tag) => tag.count > 0 && tag.name.toLocaleLowerCase().includes(needle));
@@ -362,8 +402,11 @@ async function loadResources(append = false) {
   try {
     const result = await getResources({
       query: query.value.trim(),
-      tag: selectedTag.value,
+      tags: selectedTags.value,
       unorganized: unorganizedOnly.value,
+      kind: selectedKind.value,
+      rootId: selectedRootID.value,
+      sort: sortOrder.value,
       limit: pageSize,
       offset: append ? pageOffset.value : 0,
     });
@@ -394,8 +437,16 @@ async function loadTags() {
   } catch (error) { if (generation === authGeneration) showError(error); }
 }
 
+async function loadCollections() {
+  const generation = authGeneration;
+  try {
+    const result = await getCollections();
+    if (generation === authGeneration) collections.value = result;
+  } catch (error) { if (generation === authGeneration) showError(error); }
+}
+
 async function loadWorkspace() {
-  await Promise.all([loadRoots(), loadTags(), loadResources()]);
+  await Promise.all([loadRoots(), loadTags(), loadCollections(), loadResources()]);
 }
 
 function setDetailRoute(id: string) {
@@ -421,7 +472,11 @@ function syncDetailRoute() {
 
 function chooseAll() {
   if (detailResourceID.value) closeDetail();
-  selectedTag.value = "";
+  selectedCollectionID.value = "";
+  selectedTags.value = [];
+  selectedKind.value = "";
+  selectedRootID.value = "";
+  sortOrder.value = "modified_desc";
   unorganizedOnly.value = false;
   query.value = "";
   void loadResources();
@@ -429,16 +484,28 @@ function chooseAll() {
 
 function chooseUnorganized() {
   if (detailResourceID.value) closeDetail();
-  selectedTag.value = "";
+  selectedCollectionID.value = "";
+  selectedTags.value = [];
+  selectedKind.value = "";
+  selectedRootID.value = "";
+  sortOrder.value = "modified_desc";
+  query.value = "";
   unorganizedOnly.value = true;
   void loadResources();
 }
 
-function chooseTag(name: string) {
+function toggleTag(name: string) {
   if (detailResourceID.value) closeDetail();
-  selectedTag.value = selectedTag.value === name ? "" : name;
+  selectedTags.value = selectedTags.value.includes(name)
+    ? selectedTags.value.filter((tag) => tag !== name)
+    : [...selectedTags.value, name];
   unorganizedOnly.value = false;
-  tagFilterOpen.value = false;
+  void loadResources();
+}
+
+function clearSelectedTags() {
+  if (!selectedTags.value.length) return;
+  selectedTags.value = [];
   void loadResources();
 }
 
@@ -448,6 +515,81 @@ async function toggleTagFilter() {
   tagFilterQuery.value = "";
   await nextTick();
   document.querySelector<HTMLInputElement>("#tag-filter-search")?.focus();
+}
+
+async function openTagFilterFromMobile() {
+  if (detailResourceID.value) closeDetail();
+  tagFilterOpen.value = true;
+  await nextTick();
+  document.querySelector(".tag-filter")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  document.querySelector<HTMLInputElement>("#tag-filter-search")?.focus({ preventScroll: true });
+}
+
+async function chooseCollection(item: SmartCollection) {
+  if (detailResourceID.value) closeDetail();
+  closeCollectionEditor();
+  if (debounceTimer) clearTimeout(debounceTimer);
+  suppressQueryWatch = true;
+  selectedCollectionID.value = item.id;
+  query.value = item.filters.query;
+  selectedTags.value = [...item.filters.tags];
+  selectedKind.value = item.filters.kind;
+  selectedRootID.value = item.filters.rootId;
+  unorganizedOnly.value = item.filters.unorganized;
+  sortOrder.value = item.filters.sort;
+  await nextTick();
+  suppressQueryWatch = false;
+  void loadResources();
+}
+
+function openCollectionEditor(item?: SmartCollection, restoreFilters = false) {
+  if (detailResourceID.value) closeDetail();
+  if (item) {
+    if (restoreFilters) void chooseCollection(item);
+    editingCollectionID.value = item.id;
+    collectionName.value = item.name;
+  } else {
+    editingCollectionID.value = "";
+    collectionName.value = "";
+  }
+  collectionEditorOpen.value = true;
+  void nextTick(() => document.querySelector<HTMLInputElement>("#collection-name")?.focus());
+}
+
+function closeCollectionEditor() {
+  collectionEditorOpen.value = false;
+  editingCollectionID.value = "";
+  collectionName.value = "";
+}
+
+async function saveCollection() {
+  const name = collectionName.value.trim();
+  if (!name || collectionBusy.value) return;
+  collectionBusy.value = true;
+  try {
+    const item = editingCollectionID.value
+      ? await updateCollection(editingCollectionID.value, name, currentFilters())
+      : await createCollection(name, currentFilters());
+    await loadCollections();
+    selectedCollectionID.value = item.id;
+    closeCollectionEditor();
+    notify(`已保存智能集合「${item.name}」`);
+  } catch (error) { showError(error); }
+  finally { collectionBusy.value = false; }
+}
+
+async function removeCollection() {
+  const id = editingCollectionID.value;
+  if (!id || collectionBusy.value || !window.confirm(`删除智能集合「${collectionName.value}」？`)) return;
+  collectionBusy.value = true;
+  try {
+    await deleteCollection(id);
+    if (selectedCollectionID.value === id) selectedCollectionID.value = "";
+    await loadCollections();
+    closeCollectionEditor();
+    notify("智能集合已删除");
+  } catch (error) { showError(error); }
+  finally { collectionBusy.value = false; }
 }
 
 function toggleSelection(id: string) {
@@ -646,11 +788,20 @@ function clearRemoteSession() {
   resources.value = [];
   roots.value = [];
   tags.value = [];
+  collections.value = [];
+  selectedCollectionID.value = "";
+  collectionEditorOpen.value = false;
+  editingCollectionID.value = "";
+  selectedKind.value = "";
+  selectedRootID.value = "";
+  sortOrder.value = "modified_desc";
+  query.value = "";
+  unorganizedOnly.value = false;
   batchSuggestions.value = [];
   tagSuggestions.value = [];
   total.value = 0;
   selectedIDs.value = new Set();
-  selectedTag.value = "";
+  selectedTags.value = [];
   tagFilterOpen.value = false;
   closeResourcePreview();
   detailResourceID.value = "";
@@ -723,6 +874,7 @@ watch(resources, (items) => {
 }, { flush: "post" });
 
 watch(query, () => {
+  if (suppressQueryWatch) return;
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     if (!remoteMode.value || authenticated.value) void loadResources();
@@ -781,20 +933,31 @@ onBeforeUnmount(() => {
 
       <div class="sidebar-section-label">资源空间</div>
       <nav class="primary-nav" aria-label="资源空间">
-        <button class="nav-link" :class="{ active: !selectedTag && !unorganizedOnly }" @click="chooseAll">
+        <button class="nav-link" :class="{ active: !isFiltered && !activeCollection }" @click="chooseAll">
           <House :size="17" /><span>全部资源</span><span class="nav-count">{{ totalIndexed }}</span>
         </button>
-        <button class="nav-link" :class="{ active: unorganizedOnly }" @click="chooseUnorganized">
+        <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized">
           <Clock3 :size="17" /><span>待整理</span>
         </button>
+      </nav>
+
+      <div class="sidebar-section-label collection-section-title">
+        <span>智能集合</span><button class="sidebar-add" type="button" title="保存当前筛选为集合" aria-label="新建智能集合" @click="openCollectionEditor()"><Plus :size="14" /></button>
+      </div>
+      <nav class="collection-nav" aria-label="智能集合">
+        <div v-for="item in collections" :key="item.id" class="collection-nav-row" :class="{ active: activeCollection?.id === item.id }">
+          <button type="button" class="collection-nav-open" @click="chooseCollection(item)"><Bookmark :size="14" /><span>{{ item.name }}</span></button>
+          <button type="button" class="collection-nav-edit" :aria-label="`编辑集合 ${item.name}`" @click="openCollectionEditor(item, true)"><Pencil :size="13" /></button>
+        </div>
+        <p v-if="!collections.length" class="sidebar-empty">保存常用筛选，快速回到这里。</p>
       </nav>
 
       <div class="sidebar-section-label tag-section-title">
         <span>标签</span><span class="label-count">{{ tags.length }}</span>
       </div>
       <nav class="tag-nav" aria-label="按标签筛选">
-        <button v-for="tag in tags" :key="tag.id" class="tag-nav-link" :class="{ active: selectedTag === tag.name }" @click="chooseTag(tag.name)">
-          <Tag :size="15" /><span class="tag-nav-name">{{ tag.name }}</span><span class="tag-count">{{ tag.count }}</span>
+        <button v-for="tag in tags" :key="tag.id" class="tag-nav-link" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)">
+          <Tag :size="15" /><span class="tag-nav-name">{{ tag.name }}</span><span class="tag-count">{{ tag.count }}</span><Check v-if="selectedTags.includes(tag.name)" :size="13" />
         </button>
         <p v-if="!tags.length" class="sidebar-empty">给资源添加标签后，会显示在这里。</p>
       </nav>
@@ -888,10 +1051,15 @@ onBeforeUnmount(() => {
           <div v-else class="remote-roots-empty"><WifiOff :size="15" />家中节点离线时无法读取目录列表。</div>
         </section>
 
+        <div v-if="collections.length" class="mobile-collections" aria-label="智能集合">
+          <span>智能集合</span>
+          <button v-for="item in collections" :key="item.id" type="button" :class="{ active: activeCollection?.id === item.id }" @click="chooseCollection(item)"><Bookmark :size="13" />{{ item.name }}</button>
+        </div>
+
         <section class="collection-toolbar">
           <div class="collection-heading">
-            <span class="collection-symbol"><LayoutGrid :size="17" /></span>
-            <div><h2>{{ pageTitle }}</h2><p>{{ selectedTag ? "按标签筛选资源" : unorganizedOnly ? "还没有添加标签的资源" : "按最近修改时间排序" }}</p></div>
+            <span class="collection-symbol"><Bookmark v-if="activeCollection" :size="17" /><LayoutGrid v-else :size="17" /></span>
+            <div><h2>{{ pageTitle }}</h2><p>{{ activeCollection ? "按保存的条件动态更新" : selectedTags.length ? "同时包含所选标签的资源" : unorganizedOnly ? "还没有添加标签的资源" : "搜索和筛选你的资源" }}</p></div>
           </div>
           <div class="collection-actions">
             <label class="search-field" for="resource-search">
@@ -901,14 +1069,15 @@ onBeforeUnmount(() => {
               <button v-if="query" class="search-clear" type="button" aria-label="清除搜索" @click="query = ''"><X :size="14" /></button>
             </label>
             <div class="tag-filter">
-              <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: Boolean(selectedTag) }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>{{ selectedTag || "按标签筛选" }}</span><ChevronDown :size="14" /></button>
+              <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: selectedTags.length > 0 }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>{{ selectedTags.length ? `已选 ${selectedTags.length} 个标签` : "按标签筛选" }}</span><ChevronDown :size="14" /></button>
               <div v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-popover">
                 <label class="tag-filter-search" for="tag-filter-search"><Search :size="14" /><input id="tag-filter-search" v-model="tagFilterQuery" type="search" placeholder="查找标签" autocomplete="off" /></label>
+                <p class="tag-filter-hint">可多选 · 结果同时包含所选标签</p>
                 <div class="tag-filter-list">
-                  <button class="tag-filter-option" type="button" :class="{ active: !selectedTag }" @click="chooseTag('')"><span>全部标签</span><Check v-if="!selectedTag" :size="14" /></button>
-                  <button v-for="tag in matchingTags" :key="tag.id" class="tag-filter-option" type="button" :class="{ active: selectedTag === tag.name }" @click="chooseTag(tag.name)"><span>{{ tag.name }}</span><small>{{ tag.count }}</small><Check v-if="selectedTag === tag.name" :size="14" /></button>
+                  <button v-for="tag in matchingTags" :key="tag.id" class="tag-filter-option" type="button" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)"><span>{{ tag.name }}</span><small>{{ tag.count }}</small><Check v-if="selectedTags.includes(tag.name)" :size="14" /></button>
                   <p v-if="!matchingTags.length" class="tag-filter-empty">{{ tags.length ? "没有匹配的标签" : "还没有标签" }}</p>
                 </div>
+                <button v-if="selectedTags.length" class="tag-filter-clear" type="button" @click="clearSelectedTags">清除已选标签</button>
               </div>
             </div>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'grid' }" title="网格视图" @click="listMode = 'grid'"><LayoutGrid :size="16" /></button>
@@ -916,10 +1085,32 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
+        <div class="resource-filter-controls" aria-label="更多筛选和排序">
+          <label>类型<select v-model="selectedKind" @change="loadResources()"><option value="">全部类型</option><option value="image">图片</option><option value="video">视频</option><option value="audio">音频</option><option value="document">文档</option><option value="file">其他文件</option></select></label>
+          <label>来源<select v-model="selectedRootID" @change="loadResources()"><option value="">全部目录</option><option v-for="root in roots" :key="root.id" :value="root.id">{{ root.path }}</option></select></label>
+          <label>排序<select v-model="sortOrder" @change="loadResources()"><option value="modified_desc">最近修改</option><option value="modified_asc">最早修改</option><option value="name_asc">名称 A-Z</option><option value="name_desc">名称 Z-A</option><option value="size_desc">文件最大</option></select></label>
+        </div>
+
+        <form v-if="collectionEditorOpen" class="collection-editor" @submit.prevent="saveCollection">
+          <div><strong>{{ editingCollectionID ? "编辑智能集合" : "保存当前筛选" }}</strong><p>集合记录当前搜索、标签、类型、目录和排序条件，资源会随索引变化自动更新。</p></div>
+          <label class="sr-only" for="collection-name">集合名称</label>
+          <input id="collection-name" v-model="collectionName" maxlength="80" placeholder="给集合起个名字" autocomplete="off" />
+          <button class="button button-primary" type="submit" :disabled="collectionBusy || !collectionName.trim()">{{ editingCollectionID ? "保存更改" : "创建集合" }}</button>
+          <button class="button button-secondary" type="button" @click="closeCollectionEditor">取消</button>
+          <button v-if="editingCollectionID" class="quiet-button collection-delete" type="button" :disabled="collectionBusy" @click="removeCollection"><Trash2 :size="14" />删除</button>
+        </form>
+
+        <div v-if="selectedTags.length" class="selected-tag-filters" aria-label="已选标签">
+          <span>同时包含</span>
+          <button v-for="name in selectedTags" :key="name" type="button" :aria-label="`移除标签 ${name}`" @click="toggleTag(name)"><Tag :size="12" />{{ name }}<X :size="12" /></button>
+        </div>
+
         <div class="results-toolbar">
           <div class="results-count"><span>{{ isFiltered ? "筛选结果" : "所有资源" }}</span><strong>{{ total.toLocaleString("zh-CN") }}</strong></div>
           <div class="results-toolbar-actions">
             <button class="quiet-button batch-suggestion-toggle" :aria-expanded="batchSuggestionsOpen" title="按目录和文件名特征分析整个资源库" @click="toggleBatchSuggestions"><Sparkles :size="14" />批量建议</button>
+            <button class="quiet-button save-collection-toggle" @click="openCollectionEditor()"><BookmarkPlus :size="14" />保存集合</button>
+            <button v-if="selectedCollection" class="quiet-button save-collection-toggle" @click="openCollectionEditor(selectedCollection)"><Pencil :size="14" />{{ activeCollection ? "编辑集合" : "更新集合" }}</button>
             <button v-if="isFiltered" class="quiet-button clear-filters" @click="chooseAll"><X :size="14" />清除筛选</button>
             <span v-else class="sort-label"><Clock3 :size="14" />最近修改</span>
           </div>
@@ -986,7 +1177,7 @@ onBeforeUnmount(() => {
               </div>
               <p v-else class="resource-unavailable-note">源文件当前不可用</p>
               <div class="resource-tags">
-                <button v-for="tagName in resource.tags" :key="tagName" class="tag-chip" @click="chooseTag(tagName)"><Tag :size="11" />{{ tagName }}</button>
+                <button v-for="tagName in resource.tags" :key="tagName" class="tag-chip" :aria-pressed="selectedTags.includes(tagName)" @click="toggleTag(tagName)"><Tag :size="11" />{{ tagName }}</button>
                 <span v-if="!resource.tags.length && editingTagID !== resource.id" class="no-tags">未添加标签</span>
                 <div v-if="editingTagID === resource.id" class="tag-editor-wrap">
                   <div class="tag-editor">
@@ -1022,9 +1213,9 @@ onBeforeUnmount(() => {
     </div>
 
     <nav class="mobile-nav" aria-label="资源导航">
-      <button :class="{ active: !selectedTag && !unorganizedOnly }" @click="chooseAll"><House :size="17" /><span>全部</span></button>
-      <button :class="{ active: unorganizedOnly }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
-      <label class="mobile-tag-select"><Tag :size="16" /><select :value="selectedTag" aria-label="按标签筛选" @change="chooseTag(($event.target as HTMLSelectElement).value)"><option value="">标签</option><option v-for="tag in tags" :key="tag.id" :value="tag.name">{{ tag.name }} · {{ tag.count }}</option></select><ChevronDown :size="14" /></label>
+      <button :class="{ active: !isFiltered && !activeCollection }" @click="chooseAll"><House :size="17" /><span>全部</span></button>
+      <button :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
+      <button :class="{ active: selectedTags.length > 0 }" @click="openTagFilterFromMobile"><Tag :size="17" /><span>标签{{ selectedTags.length ? ` ${selectedTags.length}` : "" }}</span></button>
     </nav>
 
     <div v-if="previewResource" class="resource-preview-backdrop" @click.self="closeResourcePreview">

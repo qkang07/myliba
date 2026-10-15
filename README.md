@@ -2,6 +2,8 @@
 
 Myliba is a local-first personal resource library. Local mode indexes files in place, keeping originals where they are. Remote mode serves the same responsive web app from a self-hosted VPS and forwards authenticated API requests through an outbound connection from the home node.
 
+An Android first version lives in [`android/`](android/README.md). It indexes folders chosen on the phone and connects to an existing HTTPS Hub.
+
 ## Local use
 
 Build the Vue web app before starting the Go service. The production files are embedded into the executable.
@@ -81,6 +83,7 @@ The hub and home node use the same optional `MYLIBA_ICE_SERVERS` JSON array. Wit
 - Track local versions when size or modification time changes.
 - Search names, paths, and manual tags with SQLite FTS5 plus substring matching.
 - Add tags one at a time or in batches, and use the unorganized queue to find resources without tags.
+- Save smart collections from a search and filters (multiple tags, file type, indexed folder, unorganized state, and sort order). Collections are stored on the home node and update as its index and tags change; the same collections appear through local and remote web access.
 - Open a resource detail page from its card or a direct `?resource=<id>` link. The page shows file metadata, a type-specific preview, original-file download, and add/remove/suggested tags; it also works through the remote hub.
 - Generate and cache image thumbnails in small (240 × 160), medium (480 × 320), and large (1280 × 960) sizes from the detail page. The resource list still uses the medium thumbnail and does not generate thumbnails merely by loading the list.
 - For videos, the detail page divides the duration into six segments and can extract a screenshot at each segment midpoint. The screenshots are cached on the home node. FFmpeg and FFprobe on the node's `PATH` support extraction and duration detection; browsers that can read the video can also supply the duration.
