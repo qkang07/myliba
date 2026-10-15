@@ -15,8 +15,10 @@ import (
 type collectionFilters struct {
 	Query       string   `json:"query"`
 	Tags        []string `json:"tags"`
+	Attributes  []string `json:"attributes"`
 	Kind        string   `json:"kind"`
 	RootID      string   `json:"rootId"`
+	FolderID    string   `json:"folderId"`
 	Unorganized bool     `json:"unorganized"`
 	Sort        string   `json:"sort"`
 }
@@ -67,6 +69,7 @@ func (s *server) readCollectionInput(w http.ResponseWriter, r *http.Request) (co
 	input.Name = strings.TrimSpace(input.Name)
 	input.Filters.Query = strings.TrimSpace(input.Filters.Query)
 	input.Filters.RootID = strings.TrimSpace(input.Filters.RootID)
+	input.Filters.FolderID = strings.TrimSpace(input.Filters.FolderID)
 	if input.Name == "" || utf8.RuneCountInString(input.Name) > 80 || utf8.RuneCountInString(input.Filters.Query) > 200 ||
 		!validCollectionKind(input.Filters.Kind) || !validCollectionSort(input.Filters.Sort) || len(input.Filters.Tags) > 20 {
 		writeError(w, http.StatusBadRequest, "集合名称或筛选条件无效")
@@ -90,6 +93,12 @@ func (s *server) readCollectionInput(w http.ResponseWriter, r *http.Request) (co
 		}
 	}
 	input.Filters.Tags = tags
+	attributes, err := normalizeAttributeKeys(input.Filters.Attributes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return input, false
+	}
+	input.Filters.Attributes = attributes
 	if input.Filters.Unorganized && len(tags) > 0 {
 		writeError(w, http.StatusBadRequest, "待整理条件不能同时包含标签")
 		return input, false
@@ -103,6 +112,18 @@ func (s *server) readCollectionInput(w http.ResponseWriter, r *http.Request) (co
 		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "无法读取索引目录")
+			return input, false
+		}
+	}
+	if input.Filters.FolderID != "" && input.Filters.FolderID != "all" && input.Filters.FolderID != "unfiled" {
+		var id string
+		err := s.db.QueryRow(`SELECT id FROM folders WHERE id=?`, input.Filters.FolderID).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusBadRequest, "文件夹不存在")
+			return input, false
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "无法读取文件夹")
 			return input, false
 		}
 	}

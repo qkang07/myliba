@@ -37,15 +37,17 @@ type server struct {
 }
 
 type resource struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Path      string   `json:"path"`
-	Size      int64    `json:"size"`
-	Modified  string   `json:"modified"`
-	Kind      string   `json:"kind"`
-	Available bool     `json:"available"`
-	VersionID string   `json:"versionId"`
-	Tags      []string `json:"tags"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Path          string         `json:"path"`
+	Size          int64          `json:"size"`
+	Modified      string         `json:"modified"`
+	Kind          string         `json:"kind"`
+	Available     bool           `json:"available"`
+	VersionID     string         `json:"versionId"`
+	FolderID      string         `json:"folderId"`
+	Tags          []string       `json:"tags"`
+	AttributeTags []attributeTag `json:"attributeTags"`
 }
 
 func main() {
@@ -90,6 +92,7 @@ func main() {
 	mux.HandleFunc("PUT /api/roots", app.addRoot)
 	mux.HandleFunc("POST /api/roots/{id}/scan", app.scanRoot)
 	mux.HandleFunc("GET /api/resources", app.listResources)
+	mux.HandleFunc("GET /api/resources/selection", app.listResourceSelection)
 	mux.HandleFunc("GET /api/resources/{id}", app.getResource)
 	mux.HandleFunc("GET /api/resources/{id}/video-info", app.videoInfo)
 	mux.HandleFunc("POST /api/resources/tags", app.addTagBatch)
@@ -101,6 +104,12 @@ func main() {
 	mux.HandleFunc("POST /api/resources/{id}/tags", app.addTag)
 	mux.HandleFunc("DELETE /api/resources/{id}/tags/{tagID}", app.removeTag)
 	mux.HandleFunc("GET /api/tags", app.tags)
+	mux.HandleFunc("GET /api/attribute-tags", app.attributeTags)
+	mux.HandleFunc("GET /api/folders", app.listFolders)
+	mux.HandleFunc("POST /api/folders", app.createFolder)
+	mux.HandleFunc("PUT /api/folders/{id}", app.renameFolder)
+	mux.HandleFunc("DELETE /api/folders/{id}", app.deleteFolder)
+	mux.HandleFunc("PUT /api/resources/folder", app.moveResourcesToFolder)
 	mux.HandleFunc("GET /api/collections", app.listCollections)
 	mux.HandleFunc("POST /api/collections", app.createCollection)
 	mux.HandleFunc("PUT /api/collections/{id}", app.updateCollection)
@@ -176,6 +185,15 @@ CREATE TABLE IF NOT EXISTS resource_tags (
 	created_at TEXT NOT NULL,
 	PRIMARY KEY(resource_id, tag_id)
 );
+CREATE TABLE IF NOT EXISTS folders (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+	created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS resource_folders (
+	resource_id TEXT PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE,
+	folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS smart_collections (
 	id TEXT PRIMARY KEY,
 	name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -187,6 +205,7 @@ CREATE INDEX IF NOT EXISTS resources_root_idx ON resources(root_id);
 CREATE INDEX IF NOT EXISTS resources_file_id_idx ON resources(file_id);
 CREATE INDEX IF NOT EXISTS versions_resource_idx ON versions(resource_id, discovered_at);
 CREATE INDEX IF NOT EXISTS resource_tags_tag_idx ON resource_tags(tag_id);
+CREATE INDEX IF NOT EXISTS resource_folders_folder_idx ON resource_folders(folder_id);
 `)
 	return err
 }
@@ -363,27 +382,19 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"indexed": count})
 }
 
-func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
+func resourceWhere(r *http.Request) ([]string, []any, error) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	tags := r.URL.Query()["tag"]
+	attributes, err := normalizeAttributeKeys(r.URL.Query()["attribute"])
+	if err != nil {
+		return nil, nil, err
+	}
 	unorganized := r.URL.Query().Get("unorganized") == "1"
 	kind := r.URL.Query().Get("kind")
 	rootID := r.URL.Query().Get("rootId")
-	sort := r.URL.Query().Get("sort")
-	if !validCollectionKind(kind) || !validCollectionSort(sort) {
-		writeError(w, http.StatusBadRequest, "筛选条件无效")
-		return
-	}
-	limit := 48
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if _, err := fmt.Sscanf(raw, "%d", &limit); err != nil || limit < 1 || limit > 100 {
-			limit = 48
-		}
-	}
-	offset := 0
-	_, _ = fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
-	if offset < 0 {
-		offset = 0
+	folderID := r.URL.Query().Get("folderId")
+	if !validCollectionKind(kind) {
+		return nil, nil, fmt.Errorf("筛选条件无效")
 	}
 	args := []any{}
 	where := []string{"1=1"}
@@ -407,9 +418,101 @@ func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
 		where = append(where, `r.kind=?`)
 		args = append(args, kind)
 	}
+	attributeClauses, attributeArgs := attributeFilterSQL(attributes)
+	where = append(where, attributeClauses...)
+	args = append(args, attributeArgs...)
 	if rootID != "" {
 		where = append(where, `r.root_id=?`)
 		args = append(args, rootID)
+	}
+	if clause, folderArgs := folderScopeSQL(folderID, "r"); clause != "" {
+		where = append(where, clause)
+		args = append(args, folderArgs...)
+	}
+	return where, args, nil
+}
+
+func (s *server) listResourceSelection(w http.ResponseWriter, r *http.Request) {
+	where, args, err := resourceWhere(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit := 1000
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 1000 {
+			writeError(w, http.StatusBadRequest, "分页大小无效")
+			return
+		}
+		limit = parsed
+	}
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "分页位置无效")
+			return
+		}
+		offset = parsed
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM resources r WHERE `+strings.Join(where, " AND "), args...).Scan(&total); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	pageArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := s.db.Query(`SELECT r.id,r.kind,r.available FROM resources r WHERE `+strings.Join(where, " AND ")+` ORDER BY r.id ASC LIMIT ? OFFSET ?`, pageArgs...)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+	items := []struct {
+		ID        string `json:"id"`
+		Kind      string `json:"kind"`
+		Available bool   `json:"available"`
+	}{}
+	for rows.Next() {
+		var item struct {
+			ID        string `json:"id"`
+			Kind      string `json:"kind"`
+			Available bool   `json:"available"`
+		}
+		if err := rows.Scan(&item.ID, &item.Kind, &item.Available); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
+	where, args, err := resourceWhere(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sort := r.URL.Query().Get("sort")
+	if !validCollectionSort(sort) {
+		writeError(w, http.StatusBadRequest, "筛选条件无效")
+		return
+	}
+	limit := 48
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if _, err := fmt.Sscanf(raw, "%d", &limit); err != nil || limit < 1 || limit > 100 {
+			limit = 48
+		}
+	}
+	offset := 0
+	_, _ = fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
+	if offset < 0 {
+		offset = 0
 	}
 	orderBy := `r.modified_at DESC, r.id DESC`
 	switch sort {
@@ -423,7 +526,7 @@ func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
 		orderBy = `r.size DESC, r.id DESC`
 	}
 	args = append(args, limit, offset)
-	rows, err := s.db.Query(`SELECT r.id,r.name,r.path,r.size,r.modified_at,r.kind,r.available,r.current_version_id
+	rows, err := s.db.Query(`SELECT r.id,r.name,r.path,r.size,r.modified_at,r.kind,r.available,r.current_version_id,COALESCE((SELECT rf.folder_id FROM resource_folders rf WHERE rf.resource_id=r.id),'')
 		FROM resources r WHERE `+strings.Join(where, " AND ")+` ORDER BY `+orderBy+` LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -433,11 +536,12 @@ func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
 	items := []resource{}
 	for rows.Next() {
 		var item resource
-		if err := rows.Scan(&item.ID, &item.Name, &item.Path, &item.Size, &item.Modified, &item.Kind, &item.Available, &item.VersionID); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Path, &item.Size, &item.Modified, &item.Kind, &item.Available, &item.VersionID, &item.FolderID); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		item.Tags = []string{}
+		item.AttributeTags = resourceAttributeTags(item.Name, item.Kind, item.Size)
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -486,8 +590,8 @@ func findOrCreateVersion(db *sql.DB, resourceID string, size int64, modifiedAt s
 
 func (s *server) getResource(w http.ResponseWriter, r *http.Request) {
 	var item resource
-	err := s.db.QueryRow(`SELECT id,name,path,size,modified_at,kind,available,current_version_id FROM resources WHERE id=?`, r.PathValue("id")).Scan(
-		&item.ID, &item.Name, &item.Path, &item.Size, &item.Modified, &item.Kind, &item.Available, &item.VersionID)
+	err := s.db.QueryRow(`SELECT r.id,r.name,r.path,r.size,r.modified_at,r.kind,r.available,r.current_version_id,COALESCE((SELECT rf.folder_id FROM resource_folders rf WHERE rf.resource_id=r.id),'') FROM resources r WHERE r.id=?`, r.PathValue("id")).Scan(
+		&item.ID, &item.Name, &item.Path, &item.Size, &item.Modified, &item.Kind, &item.Available, &item.VersionID, &item.FolderID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "资源不存在")
 		return
@@ -497,6 +601,7 @@ func (s *server) getResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	item.Tags = []string{}
+	item.AttributeTags = resourceAttributeTags(item.Name, item.Kind, item.Size)
 	rows, err := s.db.Query(`SELECT t.name FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id WHERE rt.resource_id=? ORDER BY t.name COLLATE NOCASE`, item.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "无法读取标签")
@@ -688,8 +793,16 @@ func (s *server) removeTag(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *server) tags(w http.ResponseWriter, _ *http.Request) {
-	rows, err := s.db.Query(`SELECT t.id,t.name,COUNT(rt.resource_id) FROM tags t LEFT JOIN resource_tags rt ON rt.tag_id=t.id GROUP BY t.id ORDER BY t.name COLLATE NOCASE`)
+func (s *server) tags(w http.ResponseWriter, r *http.Request) {
+	folderID := r.URL.Query().Get("folderId")
+	query := `SELECT t.id,t.name,COUNT(rt.resource_id) FROM tags t LEFT JOIN resource_tags rt ON rt.tag_id=t.id`
+	args := []any{}
+	if clause, folderArgs := folderScopeSQL(folderID, "res"); clause != "" {
+		query = `SELECT t.id,t.name,COUNT(rt.resource_id) FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id JOIN resources res ON res.id=rt.resource_id WHERE ` + clause
+		args = append(args, folderArgs...)
+	}
+	query += ` GROUP BY t.id ORDER BY t.name COLLATE NOCASE`
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

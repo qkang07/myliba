@@ -49,12 +49,19 @@ import {
   createThumbnail,
   getBatchTagSuggestions,
   getResources,
+  getResourceSelection,
   getCollections,
+  getFolders,
+  createFolder,
+  renameFolder,
+  deleteFolder,
+  moveResourcesToFolder,
   getRoots,
   getDirectories,
   getSession,
   getTagSuggestions,
   getTags,
+  getAttributeTags,
   login,
   logout,
   scanRoot,
@@ -67,7 +74,9 @@ import {
   type Resource,
   type RootSummary,
   type TagSummary,
+  type AttributeTag,
   type TagSuggestion,
+  type VirtualFolder,
   type TrafficRate,
 } from "./api";
 
@@ -91,6 +100,17 @@ const thumbnailRefreshTokens = ref(new Map<string, number>());
 const thumbnailBatchProgress = ref({ done: 0, total: 0 });
 const roots = ref<RootSummary[]>([]);
 const tags = ref<TagSummary[]>([]);
+const attributeCatalog = ref<AttributeTag[]>([]);
+const selectedAttributes = ref<string[]>([]);
+const attributeFormatQuery = ref("");
+const folders = ref<VirtualFolder[]>([]);
+const unfiledCount = ref(0);
+const activeFolderID = ref<string | null>(new URLSearchParams(window.location.search).get("folder"));
+const newFolderName = ref("");
+const folderBusy = ref(false);
+const bulkFolderID = ref("");
+const folderEditorOpen = ref(false);
+const editingFolderName = ref("");
 const total = ref(0);
 const query = ref("");
 const selectedTags = ref<string[]>([]);
@@ -109,6 +129,11 @@ const unorganizedOnly = ref(false);
 const pageOffset = ref(0);
 const pageSize = 48;
 const selectedIDs = ref(new Set<string>());
+const selectedResources = ref(new Map<string, Pick<Resource, "id" | "kind" | "available">>());
+const selectingAll = ref(false);
+const selectionProgress = ref({ loaded: 0, total: 0 });
+const bulkBusy = ref<"" | "tag" | "folder">("");
+const bulkProgress = ref({ done: 0, total: 0 });
 const bulkTagName = ref("");
 const batchSuggestions = ref<BatchTagSuggestion[]>([]);
 const batchSuggestionsOpen = ref(false);
@@ -142,6 +167,8 @@ let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 let statusTimer: ReturnType<typeof setInterval> | undefined;
 let requestGeneration = 0;
+let selectionGeneration = 0;
+let selectionScopeKey = "";
 let lastWebRTCAttempt = 0;
 let retryingWebRTC = false;
 let authGeneration = 0;
@@ -163,7 +190,8 @@ const onShortcut = (event: KeyboardEvent) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     tagFilterOpen.value = false;
-    document.querySelector<HTMLInputElement>("#resource-search")?.focus();
+    if (activeFolderID.value === null) openFolder("all");
+    void nextTick(() => document.querySelector<HTMLInputElement>("#resource-search")?.focus());
   }
 };
 
@@ -182,31 +210,46 @@ const onTagFilterOutside = (event: MouseEvent) => {
 
 function currentFilters(): CollectionFilters {
   return {
-    query: query.value.trim(), tags: [...selectedTags.value], kind: selectedKind.value,
-    rootId: selectedRootID.value, unorganized: unorganizedOnly.value, sort: sortOrder.value,
+    query: query.value.trim(), tags: [...selectedTags.value], attributes: [...selectedAttributes.value], kind: selectedKind.value,
+    rootId: selectedRootID.value, folderId: activeFolderID.value || "all", unorganized: unorganizedOnly.value, sort: sortOrder.value,
   };
 }
 
+function effectiveAttributes(filters: CollectionFilters): string[] {
+  const attributes = [...(filters.attributes || [])];
+  if (filters.kind && !attributes.includes("type:" + filters.kind)) attributes.push("type:" + filters.kind);
+  return attributes;
+}
+
 function sameFilters(left: CollectionFilters, right: CollectionFilters) {
-  return left.query === right.query && left.kind === right.kind && left.rootId === right.rootId &&
-    left.unorganized === right.unorganized && left.sort === right.sort &&
-    left.tags.length === right.tags.length && left.tags.every((tag) => right.tags.includes(tag));
+  const leftAttributes = effectiveAttributes(left);
+  const rightAttributes = effectiveAttributes(right);
+  return left.query === right.query && left.rootId === right.rootId &&
+    left.unorganized === right.unorganized && left.sort === right.sort && (left.folderId || "all") === (right.folderId || "all") &&
+    left.tags.length === right.tags.length && left.tags.every((tag) => right.tags.includes(tag)) &&
+    leftAttributes.length === rightAttributes.length && leftAttributes.every((key) => rightAttributes.includes(key));
 }
 
 const selectedCollection = computed(() => collections.value.find((item) => item.id === selectedCollectionID.value));
+const activeAttributeKeys = computed(() => effectiveAttributes(currentFilters()));
+const attributeTypes = computed(() => attributeCatalog.value.filter((tag) => tag.category === "type"));
+const attributeSizes = computed(() => attributeCatalog.value.filter((tag) => tag.category === "size"));
+const attributeFormats = computed(() => attributeCatalog.value.filter((tag) => tag.category === "extension" && tag.label.toLocaleLowerCase().includes(attributeFormatQuery.value.trim().toLocaleLowerCase())));
+const visibleCollections = computed(() => collections.value.filter((item) => (item.filters.folderId || "all") === (activeFolderID.value || "all")));
+const folderTitle = computed(() => activeFolderID.value === "all" ? "全部资源" : activeFolderID.value === "unfiled" ? "未归组" : folders.value.find((item) => item.id === activeFolderID.value)?.name || "文件夹");
 const activeCollection = computed(() => selectedCollection.value && sameFilters(selectedCollection.value.filters, currentFilters()) ? selectedCollection.value : undefined);
 const pageTitle = computed(() => {
   if (activeCollection.value) return activeCollection.value.name;
   if (selectedTags.value.length > 1) return `标签筛选（${selectedTags.value.length}）`;
   if (selectedTags.value.length === 1) return `标签：${selectedTags.value[0]}`;
   if (unorganizedOnly.value) return "待整理";
-  return query.value.trim() || selectedKind.value || selectedRootID.value ? "筛选结果" : "全部资源";
+  return query.value.trim() || activeAttributeKeys.value.length || selectedRootID.value ? "筛选结果" : activeFolderID.value === null ? "文件夹" : folderTitle.value;
 });
 const selectedCount = computed(() => selectedIDs.value.size);
-const selectedMediaCount = computed(() => resources.value.filter((resource) => selectedIDs.value.has(resource.id) && resource.available && ["image", "video"].includes(resource.kind)).length);
+const selectedMediaCount = computed(() => [...selectedResources.value.values()].filter((resource) => resource.available && ["image", "video"].includes(resource.kind)).length);
 const totalIndexed = computed(() => roots.value.reduce((sum, root) => sum + root.count, 0));
 const hasMore = computed(() => resources.value.length < total.value);
-const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || selectedKind.value || selectedRootID.value || sortOrder.value !== "modified_desc"));
+const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || activeAttributeKeys.value.length || selectedRootID.value || sortOrder.value !== "modified_desc"));
 const matchingTags = computed(() => {
   const needle = tagFilterQuery.value.trim().toLocaleLowerCase();
   return tags.value.filter((tag) => tag.count > 0 && tag.name.toLocaleLowerCase().includes(needle));
@@ -303,7 +346,7 @@ async function generateThumbnail(id: string, showFailure = true): Promise<boolea
 
 async function generateSelectedThumbnails() {
   if (generatingThumbnailBatch.value) return;
-  const selected = resources.value.filter((resource) => selectedIDs.value.has(resource.id) && resource.available && ["image", "video"].includes(resource.kind));
+  const selected = [...selectedResources.value.values()].filter((resource) => resource.available && ["image", "video"].includes(resource.kind));
   if (!selected.length) return;
   generatingThumbnailBatch.value = true;
   thumbnailBatchProgress.value = { done: 0, total: selected.length };
@@ -394,6 +437,17 @@ function startRelayDownload(resource: Resource) {
 
 async function loadResources(append = false) {
   const generation = ++requestGeneration;
+  const scopeKey = JSON.stringify(currentFilters());
+  if (scopeKey !== selectionScopeKey || activeFolderID.value === null) {
+    clearSelection();
+    selectionScopeKey = scopeKey;
+  }
+  if (activeFolderID.value === null) {
+    resources.value = [];
+    total.value = 0;
+    loading.value = false;
+    return;
+  }
   if (!append) {
     pageOffset.value = 0;
     loading.value = true;
@@ -403,9 +457,11 @@ async function loadResources(append = false) {
     const result = await getResources({
       query: query.value.trim(),
       tags: selectedTags.value,
+      attributes: selectedAttributes.value,
       unorganized: unorganizedOnly.value,
       kind: selectedKind.value,
       rootId: selectedRootID.value,
+      folderId: activeFolderID.value,
       sort: sortOrder.value,
       limit: pageSize,
       offset: append ? pageOffset.value : 0,
@@ -413,7 +469,6 @@ async function loadResources(append = false) {
     if (generation !== requestGeneration) return;
     resources.value = append ? [...resources.value, ...result.items] : result.items;
     total.value = result.total;
-    selectedIDs.value = new Set();
   } catch (error) {
     if (generation === requestGeneration) showError(error);
   } finally {
@@ -431,10 +486,36 @@ async function loadRoots() {
 
 async function loadTags() {
   const generation = authGeneration;
+  const folderID = activeFolderID.value;
+  if (folderID === null) { tags.value = []; return; }
   try {
-    const result = await getTags();
-    if (generation === authGeneration) tags.value = result;
+    const result = await getTags(folderID);
+    if (generation === authGeneration && folderID === activeFolderID.value) tags.value = result;
+  } catch (error) { if (generation === authGeneration && folderID === activeFolderID.value) showError(error); }
+}
+
+async function loadFolders() {
+  const generation = authGeneration;
+  try {
+    const result = await getFolders();
+    if (generation === authGeneration) {
+      folders.value = result.items;
+      unfiledCount.value = result.unfiledCount;
+      if (activeFolderID.value && !["all", "unfiled"].includes(activeFolderID.value) && !result.items.some((item) => item.id === activeFolderID.value)) {
+        openFolder(null);
+      }
+    }
   } catch (error) { if (generation === authGeneration) showError(error); }
+}
+
+async function loadAttributeCatalog() {
+  const generation = authGeneration;
+  const folderID = activeFolderID.value;
+  if (folderID === null) { attributeCatalog.value = []; return; }
+  try {
+    const result = await getAttributeTags(folderID);
+    if (generation === authGeneration && folderID === activeFolderID.value) attributeCatalog.value = result;
+  } catch (error) { if (generation === authGeneration && folderID === activeFolderID.value) showError(error); }
 }
 
 async function loadCollections() {
@@ -446,7 +527,7 @@ async function loadCollections() {
 }
 
 async function loadWorkspace() {
-  await Promise.all([loadRoots(), loadTags(), loadCollections(), loadResources()]);
+  await Promise.all([loadRoots(), loadFolders(), loadTags(), loadAttributeCatalog(), loadCollections(), loadResources()]);
 }
 
 function setDetailRoute(id: string) {
@@ -467,13 +548,125 @@ function closeDetail() {
 }
 
 function syncDetailRoute() {
-  detailResourceID.value = new URLSearchParams(window.location.search).get("resource") || "";
+  const params = new URLSearchParams(window.location.search);
+  detailResourceID.value = params.get("resource") || "";
+  const nextFolder = params.get("folder");
+  if (nextFolder !== activeFolderID.value) {
+    activeFolderID.value = nextFolder;
+    resetFolderFilters();
+    void Promise.all([loadTags(), loadAttributeCatalog(), loadResources()]);
+  }
+}
+
+function resetFolderFilters() {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  suppressQueryWatch = true;
+  selectedCollectionID.value = "";
+  selectedTags.value = [];
+  selectedAttributes.value = [];
+  selectedKind.value = "";
+  selectedRootID.value = "";
+  sortOrder.value = "modified_desc";
+  unorganizedOnly.value = false;
+  query.value = "";
+  void nextTick(() => { suppressQueryWatch = false; });
+  tagFilterOpen.value = false;
+  batchSuggestionsOpen.value = false;
+  batchSuggestions.value = [];
+  attributeFormatQuery.value = "";
+  folderEditorOpen.value = false;
+  bulkFolderID.value = "";
+  clearSelection();
+}
+
+function openFolder(id: string | null) {
+  if (detailResourceID.value) detailResourceID.value = "";
+  activeFolderID.value = id;
+  resetFolderFilters();
+  const url = new URL(window.location.href);
+  url.searchParams.delete("resource");
+  if (id === null) url.searchParams.delete("folder");
+  else url.searchParams.set("folder", id);
+  window.history.pushState({}, "", url.pathname + url.search + url.hash);
+  void Promise.all([loadTags(), loadAttributeCatalog(), loadResources()]);
+  window.scrollTo(0, 0);
+}
+
+async function submitFolder() {
+  const name = newFolderName.value.trim();
+  if (!name || folderBusy.value) return;
+  folderBusy.value = true;
+  try {
+    const item = await createFolder(name);
+    newFolderName.value = "";
+    await loadFolders();
+    openFolder(item.id);
+    notify("文件夹已创建");
+  } catch (error) { showError(error); }
+  finally { folderBusy.value = false; }
+}
+
+async function saveFolderName() {
+  const id = activeFolderID.value;
+  const name = editingFolderName.value.trim();
+  if (!id || ["all", "unfiled"].includes(id) || !name || folderBusy.value) return;
+  folderBusy.value = true;
+  try {
+    await renameFolder(id, name);
+    await loadFolders();
+    folderEditorOpen.value = false;
+    notify("文件夹已重命名");
+  } catch (error) { showError(error); }
+  finally { folderBusy.value = false; }
+}
+
+async function removeFolder() {
+  const id = activeFolderID.value;
+  if (!id || ["all", "unfiled"].includes(id) || folderBusy.value) return;
+  if (!window.confirm("删除文件夹？其中的文件会移至未归组，原文件和标签不会删除。")) return;
+  folderBusy.value = true;
+  try {
+    await deleteFolder(id);
+    folderEditorOpen.value = false;
+    openFolder(null);
+    await Promise.all([loadFolders(), loadCollections()]);
+    notify("文件夹已删除，文件已移至未归组");
+  } catch (error) { showError(error); }
+  finally { folderBusy.value = false; }
+}
+
+async function moveSelectedToFolder() {
+  if (!selectedIDs.value.size || bulkBusy.value || selectingAll.value) return;
+  const ids = [...selectedIDs.value];
+  bulkBusy.value = "folder";
+  bulkProgress.value = { done: 0, total: ids.length };
+  try {
+    for (let offset = 0; offset < ids.length; offset += 1000) {
+      const batch = ids.slice(offset, offset + 1000);
+      await moveResourcesToFolder(batch, bulkFolderID.value);
+      removeSelected(batch);
+      bulkProgress.value = { done: offset + batch.length, total: ids.length };
+    }
+    await Promise.all([loadFolders(), loadTags(), loadAttributeCatalog(), loadResources()]);
+    notify("已移动 " + ids.length + " 项资源");
+  } catch (error) {
+    await Promise.all([loadFolders(), loadTags(), loadAttributeCatalog(), loadResources()]);
+    showError(error);
+    if (bulkProgress.value.done && errorMessage.value) errorMessage.value += `；已移动 ${bulkProgress.value.done} 项，剩余 ${selectedCount.value} 项仍已选`;
+  } finally { bulkBusy.value = ""; }
+}
+
+async function onDetailFolderChanged() {
+  closeDetail();
+  await Promise.all([loadFolders(), loadTags(), loadAttributeCatalog(), loadResources()]);
+  notify("文件夹归属已更新");
 }
 
 function chooseAll() {
   if (detailResourceID.value) closeDetail();
   selectedCollectionID.value = "";
   selectedTags.value = [];
+  selectedAttributes.value = [];
   selectedKind.value = "";
   selectedRootID.value = "";
   sortOrder.value = "modified_desc";
@@ -486,6 +679,7 @@ function chooseUnorganized() {
   if (detailResourceID.value) closeDetail();
   selectedCollectionID.value = "";
   selectedTags.value = [];
+  selectedAttributes.value = [];
   selectedKind.value = "";
   selectedRootID.value = "";
   sortOrder.value = "modified_desc";
@@ -506,6 +700,32 @@ function toggleTag(name: string) {
 function clearSelectedTags() {
   if (!selectedTags.value.length) return;
   selectedTags.value = [];
+  void loadResources();
+}
+
+function attributeLabel(key: string): string {
+  const found = attributeCatalog.value.find((item) => item.key === key);
+  if (found) return found.label;
+  const [category, value] = key.split(":");
+  if (category === "type") return { image: "图片", video: "视频", audio: "音频", document: "文档", file: "其他文件" }[value] || value;
+  if (category === "size") return { lt1m: "小于 1 MB", "1to10m": "1–10 MB", "10to100m": "10–100 MB", gte100m: "100 MB 以上" }[value] || value;
+  return category === "extension" ? value.toUpperCase() : value;
+}
+
+function toggleAttribute(key: string) {
+  if (detailResourceID.value) closeDetail();
+  const selected = new Set(activeAttributeKeys.value);
+  if (selected.has(key)) selected.delete(key);
+  else selected.add(key);
+  selectedKind.value = "";
+  selectedAttributes.value = [...selected];
+  void loadResources();
+}
+
+function clearAttributes() {
+  if (!activeAttributeKeys.value.length) return;
+  selectedKind.value = "";
+  selectedAttributes.value = [];
   void loadResources();
 }
 
@@ -534,10 +754,16 @@ async function chooseCollection(item: SmartCollection) {
   query.value = item.filters.query;
   selectedTags.value = [...item.filters.tags];
   selectedKind.value = item.filters.kind;
+  selectedAttributes.value = [...(item.filters.attributes || [])];
   selectedRootID.value = item.filters.rootId;
   unorganizedOnly.value = item.filters.unorganized;
   sortOrder.value = item.filters.sort;
+  activeFolderID.value = item.filters.folderId || "all";
+  const url = new URL(window.location.href);
+  url.searchParams.set("folder", activeFolderID.value);
+  window.history.pushState({}, "", url.pathname + url.search + url.hash);
   await nextTick();
+  void Promise.all([loadTags(), loadAttributeCatalog()]);
   suppressQueryWatch = false;
   void loadResources();
 }
@@ -592,11 +818,65 @@ async function removeCollection() {
   finally { collectionBusy.value = false; }
 }
 
+function clearSelection() {
+  selectionGeneration++;
+  selectingAll.value = false;
+  selectionProgress.value = { loaded: 0, total: 0 };
+  selectedIDs.value = new Set();
+  selectedResources.value = new Map();
+}
+
+function removeSelected(ids: string[]) {
+  const nextIDs = new Set(selectedIDs.value);
+  const nextResources = new Map(selectedResources.value);
+  for (const id of ids) {
+    nextIDs.delete(id);
+    nextResources.delete(id);
+  }
+  selectedIDs.value = nextIDs;
+  selectedResources.value = nextResources;
+}
+
 function toggleSelection(id: string) {
-  const next = new Set(selectedIDs.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
-  selectedIDs.value = next;
+  if (selectingAll.value || bulkBusy.value) return;
+  const nextIDs = new Set(selectedIDs.value);
+  const nextResources = new Map(selectedResources.value);
+  if (nextIDs.has(id)) {
+    nextIDs.delete(id);
+    nextResources.delete(id);
+  } else {
+    const resource = resources.value.find((item) => item.id === id);
+    if (!resource) return;
+    nextIDs.add(id);
+    nextResources.set(id, { id, kind: resource.kind, available: resource.available });
+  }
+  selectedIDs.value = nextIDs;
+  selectedResources.value = nextResources;
+}
+
+async function selectAllMatching() {
+  if (activeFolderID.value === null || selectingAll.value || bulkBusy.value || !total.value) return;
+  const filters = currentFilters();
+  const scopeKey = JSON.stringify(filters);
+  const generation = ++selectionGeneration;
+  selectingAll.value = true;
+  selectionProgress.value = { loaded: 0, total: total.value };
+  const matches = new Map<string, Pick<Resource, "id" | "kind" | "available">>();
+  try {
+    for (let offset = 0; ; offset += 1000) {
+      const result = await getResourceSelection({ ...filters, limit: 1000, offset });
+      if (generation !== selectionGeneration || scopeKey !== JSON.stringify(currentFilters())) return;
+      for (const item of result.items) matches.set(item.id, { id: item.id, kind: item.kind, available: item.available });
+      selectionProgress.value = { loaded: matches.size, total: result.total };
+      if (!result.items.length || offset + result.items.length >= result.total) break;
+    }
+    selectedResources.value = matches;
+    selectedIDs.value = new Set(matches.keys());
+  } catch (error) {
+    if (generation === selectionGeneration) showError(error);
+  } finally {
+    if (generation === selectionGeneration) selectingAll.value = false;
+  }
 }
 
 async function addTagToResource(id: string, suggestedName = "") {
@@ -643,16 +923,25 @@ async function refreshTagSuggestions(resourceID: string) {
 
 async function applyBatchTag() {
   const name = bulkTagName.value.trim();
-  if (!name || !selectedIDs.value.size) {
-    notify("先选择资源并输入标签");
-    return;
-  }
+  if (!name || !selectedIDs.value.size || bulkBusy.value || selectingAll.value) return;
+  const ids = [...selectedIDs.value];
+  bulkBusy.value = "tag";
+  bulkProgress.value = { done: 0, total: ids.length };
   try {
-    const result = await addBatchTag([...selectedIDs.value], name);
+    for (let offset = 0; offset < ids.length; offset += 1000) {
+      const batch = ids.slice(offset, offset + 1000);
+      await addBatchTag(batch, name);
+      removeSelected(batch);
+      bulkProgress.value = { done: offset + batch.length, total: ids.length };
+    }
     bulkTagName.value = "";
-    await Promise.all([loadResources(), loadTags()]);
-    notify(`已为 ${result.updated} 项添加「${result.tag}」`);
-  } catch (error) { showError(error); }
+    await Promise.all([loadResources(), loadTags(), loadAttributeCatalog()]);
+    notify(`已为 ${ids.length} 项添加「${name}」`);
+  } catch (error) {
+    await Promise.all([loadResources(), loadTags(), loadAttributeCatalog()]);
+    showError(error);
+    if (bulkProgress.value.done && errorMessage.value) errorMessage.value += `；已处理 ${bulkProgress.value.done} 项，剩余 ${selectedCount.value} 项仍已选`;
+  } finally { bulkBusy.value = ""; }
 }
 
 async function toggleBatchSuggestions() {
@@ -666,10 +955,11 @@ async function toggleBatchSuggestions() {
 
 async function loadBatchSuggestions() {
   const generation = authGeneration;
+  const folderID = activeFolderID.value || "all";
   loadingBatchSuggestions.value = true;
   try {
-    const result = await getBatchTagSuggestions();
-    if (generation !== authGeneration) return;
+    const result = await getBatchTagSuggestions(folderID);
+    if (generation !== authGeneration || folderID !== (activeFolderID.value || "all")) return;
     batchSuggestions.value = result.suggestions;
     batchSuggestionsScanned.value = result.scanned;
   } catch (error) { if (generation === authGeneration) showError(error); }
@@ -788,7 +1078,12 @@ function clearRemoteSession() {
   resources.value = [];
   roots.value = [];
   tags.value = [];
+  attributeCatalog.value = [];
+  selectedAttributes.value = [];
   collections.value = [];
+  folders.value = [];
+  unfiledCount.value = 0;
+  activeFolderID.value = null;
   selectedCollectionID.value = "";
   collectionEditorOpen.value = false;
   editingCollectionID.value = "";
@@ -800,7 +1095,7 @@ function clearRemoteSession() {
   batchSuggestions.value = [];
   tagSuggestions.value = [];
   total.value = 0;
-  selectedIDs.value = new Set();
+  clearSelection();
   selectedTags.value = [];
   tagFilterOpen.value = false;
   closeResourcePreview();
@@ -933,29 +1228,37 @@ onBeforeUnmount(() => {
 
       <div class="sidebar-section-label">资源空间</div>
       <nav class="primary-nav" aria-label="资源空间">
-        <button class="nav-link" :class="{ active: !isFiltered && !activeCollection }" @click="chooseAll">
-          <House :size="17" /><span>全部资源</span><span class="nav-count">{{ totalIndexed }}</span>
+        <button class="nav-link" :class="{ active: activeFolderID === null }" @click="openFolder(null)">
+          <House :size="17" /><span>文件夹首页</span>
         </button>
-        <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized">
-          <Clock3 :size="17" /><span>待整理</span>
+        <button class="nav-link" :class="{ active: activeFolderID === 'all' && !isFiltered && !activeCollection }" @click="openFolder('all')">
+          <LibraryBig :size="17" /><span>全部资源</span><span class="nav-count">{{ totalIndexed }}</span>
         </button>
       </nav>
+      <div class="sidebar-section-label folder-section-title"><span>文件夹</span><span class="label-count">{{ folders.length }}</span></div>
+      <nav class="folder-nav" aria-label="文件夹">
+        <button v-for="folder in folders" :key="folder.id" class="nav-link" :class="{ active: activeFolderID === folder.id && !isFiltered }" @click="openFolder(folder.id)"><FolderOpen :size="16" /><span>{{ folder.name }}</span><span class="nav-count">{{ folder.count }}</span></button>
+        <button class="nav-link" :class="{ active: activeFolderID === 'unfiled' && !isFiltered }" @click="openFolder('unfiled')"><FolderOpen :size="16" /><span>未归组</span><span class="nav-count">{{ unfiledCount }}</span></button>
+      </nav>
+      <nav v-if="activeFolderID !== null" class="primary-nav" aria-label="当前文件夹">
+        <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
+      </nav>
 
-      <div class="sidebar-section-label collection-section-title">
+      <div v-if="activeFolderID !== null" class="sidebar-section-label collection-section-title">
         <span>智能集合</span><button class="sidebar-add" type="button" title="保存当前筛选为集合" aria-label="新建智能集合" @click="openCollectionEditor()"><Plus :size="14" /></button>
       </div>
-      <nav class="collection-nav" aria-label="智能集合">
-        <div v-for="item in collections" :key="item.id" class="collection-nav-row" :class="{ active: activeCollection?.id === item.id }">
+      <nav v-if="activeFolderID !== null" class="collection-nav" aria-label="智能集合">
+        <div v-for="item in visibleCollections" :key="item.id" class="collection-nav-row" :class="{ active: activeCollection?.id === item.id }">
           <button type="button" class="collection-nav-open" @click="chooseCollection(item)"><Bookmark :size="14" /><span>{{ item.name }}</span></button>
           <button type="button" class="collection-nav-edit" :aria-label="`编辑集合 ${item.name}`" @click="openCollectionEditor(item, true)"><Pencil :size="13" /></button>
         </div>
-        <p v-if="!collections.length" class="sidebar-empty">保存常用筛选，快速回到这里。</p>
+        <p v-if="!visibleCollections.length" class="sidebar-empty">保存当前文件夹的常用筛选。</p>
       </nav>
 
-      <div class="sidebar-section-label tag-section-title">
-        <span>标签</span><span class="label-count">{{ tags.length }}</span>
+      <div v-if="activeFolderID !== null && activeFolderID !== 'all'" class="sidebar-section-label tag-section-title">
+        <span>手动标签</span><span class="label-count">{{ tags.length }}</span>
       </div>
-      <nav class="tag-nav" aria-label="按标签筛选">
+      <nav v-if="activeFolderID !== null && activeFolderID !== 'all'" class="tag-nav" aria-label="按标签筛选">
         <button v-for="tag in tags" :key="tag.id" class="tag-nav-link" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)">
           <Tag :size="15" /><span class="tag-nav-name">{{ tag.name }}</span><span class="tag-count">{{ tag.count }}</span><Check v-if="selectedTags.includes(tag.name)" :size="13" />
         </button>
@@ -976,7 +1279,7 @@ onBeforeUnmount(() => {
 
     <div class="main-column">
       <header class="topbar">
-        <div class="breadcrumbs"><span>我的资源</span><span class="breadcrumb-divider">/</span><strong>{{ detailResourceID ? "资源详情" : pageTitle }}</strong></div>
+        <div class="breadcrumbs"><button type="button" class="breadcrumb-home" @click="openFolder(null)">我的资源</button><span class="breadcrumb-divider">/</span><strong>{{ detailResourceID ? "资源详情" : activeFolderID === null ? "文件夹" : pageTitle }}</strong></div>
         <div class="topbar-actions">
           <template v-if="remoteMode">
             <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
@@ -992,9 +1295,9 @@ onBeforeUnmount(() => {
       </header>
 
       <main class="page-content">
-        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" @back="closeDetail" @tags-changed="loadTags(); loadResources()" />
+        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
         <template v-else>
-        <section class="page-intro">
+        <section v-if="activeFolderID === null" class="page-intro">
           <div>
             <div class="eyebrow"><Sparkles :size="13" />个人资源空间</div>
             <h1>让每份资源，都有迹可循。</h1>
@@ -1006,7 +1309,17 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <section v-if="!remoteMode" class="roots-panel">
+        <section v-if="activeFolderID === null" class="virtual-folders-panel" aria-label="文件夹">
+          <div class="virtual-folders-heading"><div><p class="eyebrow">顶层分组</p><h2>我的文件夹</h2><p>先按文件夹整理资源，进入后再用标签细分。文件保留在原位置。</p></div></div>
+          <form class="virtual-folder-create" @submit.prevent="submitFolder"><label class="sr-only" for="new-folder-name">文件夹名称</label><input id="new-folder-name" v-model="newFolderName" maxlength="80" placeholder="新文件夹名称" /><button class="button button-primary" type="submit" :disabled="folderBusy || !newFolderName.trim()"><Plus :size="15" />新建文件夹</button></form>
+          <div class="virtual-folder-grid">
+            <button v-for="folder in folders" :key="folder.id" class="virtual-folder-card" type="button" @click="openFolder(folder.id)"><span class="virtual-folder-icon"><FolderOpen :size="22" /></span><strong>{{ folder.name }}</strong><small>{{ folder.count }} 项资源</small></button>
+            <button class="virtual-folder-card virtual-folder-unfiled" type="button" @click="openFolder('unfiled')"><span class="virtual-folder-icon"><FolderOpen :size="22" /></span><strong>未归组</strong><small>{{ unfiledCount }} 项资源</small></button>
+          </div>
+          <p v-if="!folders.length" class="virtual-folder-hint">已有资源都在“未归组”。新建文件夹后，可批量选择文件并移动。</p>
+        </section>
+
+        <section v-if="activeFolderID === null && !remoteMode" class="roots-panel">
           <div class="panel-heading">
             <span class="panel-icon"><FolderOpen :size="18" /></span>
             <span class="panel-heading-copy"><strong>索引目录</strong><small>选择要纳入资源库的文件夹，不会移动或修改原文件。</small></span>
@@ -1031,7 +1344,7 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <section v-else class="roots-panel remote-roots-panel">
+        <section v-else-if="activeFolderID === null" class="roots-panel remote-roots-panel">
           <div class="panel-heading">
             <span class="panel-icon"><HardDrive :size="18" /></span>
             <span class="panel-heading-copy"><strong>家中索引目录</strong><small>目录保存在家中节点。远程访问时可以更新索引。</small></span>
@@ -1051,24 +1364,27 @@ onBeforeUnmount(() => {
           <div v-else class="remote-roots-empty"><WifiOff :size="15" />家中节点离线时无法读取目录列表。</div>
         </section>
 
-        <div v-if="collections.length" class="mobile-collections" aria-label="智能集合">
+        <template v-else>
+        <div class="folder-context-bar"><button class="quiet-button" @click="openFolder(null)"><House :size="14" />文件夹首页</button><span>/</span><strong>{{ folderTitle }}</strong><div v-if="activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-context-actions"><button class="quiet-button" @click="editingFolderName = folderTitle; folderEditorOpen = !folderEditorOpen"><Pencil :size="14" />重命名</button><button class="quiet-button" @click="removeFolder"><Trash2 :size="14" />删除</button></div></div>
+        <form v-if="folderEditorOpen && activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-rename-form" @submit.prevent="saveFolderName"><input v-model="editingFolderName" maxlength="80" aria-label="文件夹名称" /><button class="button button-primary" :disabled="folderBusy || !editingFolderName.trim()">保存</button><button type="button" class="button button-secondary" @click="folderEditorOpen = false">取消</button></form>
+        <div v-if="visibleCollections.length" class="mobile-collections" aria-label="智能集合">
           <span>智能集合</span>
-          <button v-for="item in collections" :key="item.id" type="button" :class="{ active: activeCollection?.id === item.id }" @click="chooseCollection(item)"><Bookmark :size="13" />{{ item.name }}</button>
+          <button v-for="item in visibleCollections" :key="item.id" type="button" :class="{ active: activeCollection?.id === item.id }" @click="chooseCollection(item)"><Bookmark :size="13" />{{ item.name }}</button>
         </div>
 
         <section class="collection-toolbar">
           <div class="collection-heading">
             <span class="collection-symbol"><Bookmark v-if="activeCollection" :size="17" /><LayoutGrid v-else :size="17" /></span>
-            <div><h2>{{ pageTitle }}</h2><p>{{ activeCollection ? "按保存的条件动态更新" : selectedTags.length ? "同时包含所选标签的资源" : unorganizedOnly ? "还没有添加标签的资源" : "搜索和筛选你的资源" }}</p></div>
+            <div><h2>{{ pageTitle }}</h2><p>{{ activeCollection ? "按保存的条件动态更新" : selectedTags.length ? "同时包含所选标签的资源" : unorganizedOnly ? "还没有添加手动标签的资源" : "搜索和筛选你的资源" }}</p></div>
           </div>
           <div class="collection-actions">
             <label class="search-field" for="resource-search">
               <Search :size="17" />
-              <input id="resource-search" v-model="query" type="search" placeholder="搜索文件名、路径或标签" autocomplete="off" />
+              <input id="resource-search" v-model="query" type="search" placeholder="搜索文件名、路径或手动标签" autocomplete="off" />
               <kbd>⌘ K</kbd>
               <button v-if="query" class="search-clear" type="button" aria-label="清除搜索" @click="query = ''"><X :size="14" /></button>
             </label>
-            <div class="tag-filter">
+            <div v-if="activeFolderID !== 'all'" class="tag-filter">
               <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: selectedTags.length > 0 }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>{{ selectedTags.length ? `已选 ${selectedTags.length} 个标签` : "按标签筛选" }}</span><ChevronDown :size="14" /></button>
               <div v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-popover">
                 <label class="tag-filter-search" for="tag-filter-search"><Search :size="14" /><input id="tag-filter-search" v-model="tagFilterQuery" type="search" placeholder="查找标签" autocomplete="off" /></label>
@@ -1085,14 +1401,20 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
+        <section v-if="attributeCatalog.length" class="attribute-filter-panel" aria-label="属性标签筛选">
+          <div class="attribute-filter-heading"><strong>属性标签</strong><span>按文件当前属性生成 · 同组任选，不同组叠加</span></div>
+          <div v-if="attributeTypes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件类型</span><div class="attribute-filter-chips"><button v-for="tag in attributeTypes" :key="tag.key" type="button" class="attribute-filter-chip" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ tag.count }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
+          <div v-if="attributeSizes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件大小</span><div class="attribute-filter-chips"><button v-for="tag in attributeSizes" :key="tag.key" type="button" class="attribute-filter-chip" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ tag.count }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
+          <div v-if="attributeCatalog.some((tag) => tag.category === 'extension')" class="attribute-filter-row"><span class="attribute-filter-label">文件格式</span><div class="attribute-format-area"><input v-if="attributeCatalog.filter((tag) => tag.category === 'extension').length > 12" v-model="attributeFormatQuery" type="search" placeholder="查找格式，如 PDF" aria-label="查找文件格式" /><div class="attribute-filter-chips attribute-format-chips"><button v-for="tag in attributeFormats" :key="tag.key" type="button" class="attribute-filter-chip" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ tag.count }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button><span v-if="!attributeFormats.length" class="attribute-format-empty">没有匹配的格式</span></div></div></div>
+        </section>
+
         <div class="resource-filter-controls" aria-label="更多筛选和排序">
-          <label>类型<select v-model="selectedKind" @change="loadResources()"><option value="">全部类型</option><option value="image">图片</option><option value="video">视频</option><option value="audio">音频</option><option value="document">文档</option><option value="file">其他文件</option></select></label>
           <label>来源<select v-model="selectedRootID" @change="loadResources()"><option value="">全部目录</option><option v-for="root in roots" :key="root.id" :value="root.id">{{ root.path }}</option></select></label>
           <label>排序<select v-model="sortOrder" @change="loadResources()"><option value="modified_desc">最近修改</option><option value="modified_asc">最早修改</option><option value="name_asc">名称 A-Z</option><option value="name_desc">名称 Z-A</option><option value="size_desc">文件最大</option></select></label>
         </div>
 
         <form v-if="collectionEditorOpen" class="collection-editor" @submit.prevent="saveCollection">
-          <div><strong>{{ editingCollectionID ? "编辑智能集合" : "保存当前筛选" }}</strong><p>集合记录当前搜索、标签、类型、目录和排序条件，资源会随索引变化自动更新。</p></div>
+          <div><strong>{{ editingCollectionID ? "编辑智能集合" : "保存当前筛选" }}</strong><p>集合记录当前搜索、手动标签、属性标签、目录和排序条件，资源会随索引变化自动更新。</p></div>
           <label class="sr-only" for="collection-name">集合名称</label>
           <input id="collection-name" v-model="collectionName" maxlength="80" placeholder="给集合起个名字" autocomplete="off" />
           <button class="button button-primary" type="submit" :disabled="collectionBusy || !collectionName.trim()">{{ editingCollectionID ? "保存更改" : "创建集合" }}</button>
@@ -1105,10 +1427,17 @@ onBeforeUnmount(() => {
           <button v-for="name in selectedTags" :key="name" type="button" :aria-label="`移除标签 ${name}`" @click="toggleTag(name)"><Tag :size="12" />{{ name }}<X :size="12" /></button>
         </div>
 
+        <div v-if="activeAttributeKeys.length" class="selected-tag-filters selected-attribute-filters" aria-label="已选属性标签">
+          <span>属性条件</span>
+          <button v-for="key in activeAttributeKeys" :key="key" type="button" :aria-label="'移除属性 ' + attributeLabel(key)" @click="toggleAttribute(key)">{{ attributeLabel(key) }}<X :size="12" /></button>
+          <button type="button" class="clear-attribute-filters" @click="clearAttributes">清除属性</button>
+        </div>
+
         <div class="results-toolbar">
           <div class="results-count"><span>{{ isFiltered ? "筛选结果" : "所有资源" }}</span><strong>{{ total.toLocaleString("zh-CN") }}</strong></div>
           <div class="results-toolbar-actions">
-            <button class="quiet-button batch-suggestion-toggle" :aria-expanded="batchSuggestionsOpen" title="按目录和文件名特征分析整个资源库" @click="toggleBatchSuggestions"><Sparkles :size="14" />批量建议</button>
+            <button v-if="total" class="button button-secondary select-all-results" :disabled="selectingAll || !!bulkBusy || (selectedCount === total && !loading)" @click="selectAllMatching"><LoaderCircle v-if="selectingAll" class="spin" :size="14" /><Check v-else :size="14" />{{ selectingAll ? `选择中 ${selectionProgress.loaded}/${selectionProgress.total}` : selectedCount === total && !loading ? `已全选 ${total} 项` : `全选结果（${total}）` }}</button>
+            <button class="quiet-button batch-suggestion-toggle" :aria-expanded="batchSuggestionsOpen" title="按目录和文件名特征分析当前文件夹" @click="toggleBatchSuggestions"><Sparkles :size="14" />批量建议</button>
             <button class="quiet-button save-collection-toggle" @click="openCollectionEditor()"><BookmarkPlus :size="14" />保存集合</button>
             <button v-if="selectedCollection" class="quiet-button save-collection-toggle" @click="openCollectionEditor(selectedCollection)"><Pencil :size="14" />{{ activeCollection ? "编辑集合" : "更新集合" }}</button>
             <button v-if="isFiltered" class="quiet-button clear-filters" @click="chooseAll"><X :size="14" />清除筛选</button>
@@ -1118,10 +1447,10 @@ onBeforeUnmount(() => {
 
         <section v-if="batchSuggestionsOpen" class="batch-suggestions-panel" aria-label="批量标签建议">
           <header class="batch-suggestions-header">
-            <div><strong>批量整理建议</strong><p>{{ loadingBatchSuggestions ? `正在扫描全库 ${totalIndexed} 项资源` : `已扫描 ${batchSuggestionsScanned} 项资源` }}；建议根据文件夹和文件名特征生成。</p></div>
+            <div><strong>批量整理建议</strong><p>{{ loadingBatchSuggestions ? `正在扫描当前分组资源` : `已扫描 ${batchSuggestionsScanned} 项资源` }}；建议根据文件夹和文件名特征生成。</p></div>
             <button class="quiet-button batch-suggestions-close" aria-label="收起批量建议" title="收起" @click="batchSuggestionsOpen = false"><X :size="16" /></button>
           </header>
-          <div v-if="loadingBatchSuggestions" class="batch-suggestions-state"><LoaderCircle class="spin" :size="16" />正在分析 {{ batchSuggestionsScanned || totalIndexed }} 项资源…</div>
+          <div v-if="loadingBatchSuggestions" class="batch-suggestions-state"><LoaderCircle class="spin" :size="16" />正在分析当前分组资源…</div>
           <div v-else-if="batchSuggestions.length" class="batch-suggestion-list">
             <article v-for="suggestion in batchSuggestions" :key="suggestion.name" class="batch-suggestion-card">
               <div class="batch-suggestion-copy">
@@ -1139,13 +1468,16 @@ onBeforeUnmount(() => {
           <div v-else class="batch-suggestions-state">已扫描 {{ batchSuggestionsScanned }} 项资源，暂时没有足够集中的标签建议。</div>
         </section>
 
-        <div v-if="selectedCount" class="bulk-toolbar">
-          <div class="selection-summary"><span class="selection-check"><Check :size="14" /></span><strong>{{ selectedCount }}</strong><span>项已选</span></div>
-          <button v-if="selectedMediaCount" class="button button-secondary thumbnail-batch-button" :disabled="generatingThumbnailBatch" @click="generateSelectedThumbnails"><LoaderCircle v-if="generatingThumbnailBatch" class="spin" :size="14" /><Image v-else :size="14" />{{ generatingThumbnailBatch ? `正在生成 ${thumbnailBatchProgress.done}/${thumbnailBatchProgress.total}` : `生成缩略图（${selectedMediaCount}）` }}</button>
+        <div v-if="selectedCount || selectingAll" class="bulk-toolbar">
+          <div class="selection-summary"><span class="selection-check"><Check :size="14" /></span><strong>{{ selectingAll ? selectionProgress.loaded : selectedCount }}</strong><span>{{ selectingAll ? `/${selectionProgress.total} 项选择中` : '项已选' }}</span></div>
+          <button v-if="selectedMediaCount" class="button button-secondary thumbnail-batch-button" :disabled="generatingThumbnailBatch || !!bulkBusy || selectingAll" @click="generateSelectedThumbnails"><LoaderCircle v-if="generatingThumbnailBatch" class="spin" :size="14" /><Image v-else :size="14" />{{ generatingThumbnailBatch ? `正在生成 ${thumbnailBatchProgress.done}/${thumbnailBatchProgress.total}` : `生成缩略图（${selectedMediaCount}）` }}</button>
           <span class="bulk-divider"></span>
-          <input v-model="bulkTagName" maxlength="40" type="text" placeholder="输入要添加的标签" @keydown.enter.prevent="applyBatchTag" />
-          <button class="button button-primary" :disabled="!bulkTagName.trim()" @click="applyBatchTag"><Plus :size="15" />批量添加标签</button>
-          <button class="quiet-button cancel-selection" @click="selectedIDs = new Set()">取消选择</button>
+          <input v-model="bulkTagName" maxlength="40" type="text" placeholder="输入要添加的标签" :disabled="!!bulkBusy || selectingAll" @keydown.enter.prevent="applyBatchTag" />
+          <button class="button button-primary" :disabled="!bulkTagName.trim() || !!bulkBusy || selectingAll" @click="applyBatchTag"><LoaderCircle v-if="bulkBusy === 'tag'" class="spin" :size="15" /><Plus v-else :size="15" />{{ bulkBusy === 'tag' ? `添加中 ${bulkProgress.done}/${bulkProgress.total}` : '批量添加标签' }}</button>
+          <span class="bulk-divider"></span>
+          <label class="bulk-folder-picker">移动到<select v-model="bulkFolderID" :disabled="!!bulkBusy || selectingAll"><option value="">未归组</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
+          <button class="button button-secondary" :disabled="!!bulkBusy || selectingAll" @click="moveSelectedToFolder"><LoaderCircle v-if="bulkBusy === 'folder'" class="spin" :size="15" /><FolderOpen v-else :size="15" />{{ bulkBusy === 'folder' ? `移动中 ${bulkProgress.done}/${bulkProgress.total}` : '移动' }}</button>
+          <button class="quiet-button cancel-selection" :disabled="!!bulkBusy" @click="clearSelection">取消选择</button>
         </div>
 
         <div v-if="errorMessage" class="notice notice-error" role="alert"><CircleAlert :size="17" /><span>{{ errorMessage }}</span><button class="notice-close" aria-label="关闭提示" @click="errorMessage = ''"><X :size="15" /></button></div>
@@ -1157,7 +1489,7 @@ onBeforeUnmount(() => {
         <section v-else-if="resources.length" class="resource-grid" :class="{ 'list-mode': listMode === 'list' }" aria-label="资源列表">
           <article v-for="resource in resources" :key="resource.id" class="resource-card" :class="{ unavailable: !resource.available, selected: selectedIDs.has(resource.id) }">
             <label class="resource-select" :aria-label="`选择${resource.name}`">
-              <input type="checkbox" :checked="selectedIDs.has(resource.id)" @change="toggleSelection(resource.id)" />
+              <input type="checkbox" :checked="selectedIDs.has(resource.id)" :disabled="selectingAll || !!bulkBusy" @change="toggleSelection(resource.id)" />
               <span class="check-indicator"><Check :size="13" /></span>
             </label>
             <div class="resource-preview" @click="openDetail(resource)">
@@ -1178,7 +1510,7 @@ onBeforeUnmount(() => {
               <p v-else class="resource-unavailable-note">源文件当前不可用</p>
               <div class="resource-tags">
                 <button v-for="tagName in resource.tags" :key="tagName" class="tag-chip" :aria-pressed="selectedTags.includes(tagName)" @click="toggleTag(tagName)"><Tag :size="11" />{{ tagName }}</button>
-                <span v-if="!resource.tags.length && editingTagID !== resource.id" class="no-tags">未添加标签</span>
+                <span v-if="!resource.tags.length && editingTagID !== resource.id" class="no-tags">未添加手动标签</span>
                 <div v-if="editingTagID === resource.id" class="tag-editor-wrap">
                   <div class="tag-editor">
                     <input v-model="editingTagName" type="text" maxlength="40" placeholder="输入标签后回车，可连续添加" :disabled="addingTagID === resource.id" @keydown.enter.prevent="addTagToResource(resource.id)" @keydown.esc="closeTagEditor" />
@@ -1192,20 +1524,22 @@ onBeforeUnmount(() => {
                 </div>
                 <button v-else class="add-tag-button" :aria-label="`给${resource.name}添加标签`" title="添加标签" @click="openTagEditor(resource)"><Plus :size="15" /></button>
               </div>
+              <div v-if="resource.attributeTags?.length" class="resource-attributes" aria-label="文件属性标签"><button v-for="attribute in resource.attributeTags" :key="attribute.key" type="button" class="resource-attribute-chip" :class="{ active: activeAttributeKeys.includes(attribute.key) }" :aria-pressed="activeAttributeKeys.includes(attribute.key)" @click="toggleAttribute(attribute.key)">{{ attribute.category === 'type' ? '类型' : attribute.category === 'size' ? '大小' : '格式' }}：{{ attribute.label }}</button></div>
             </div>
           </article>
         </section>
 
         <section v-else-if="initialized && !loading" class="empty-state">
           <span class="empty-icon"><FolderOpen :size="25" /></span>
-          <h2>{{ isFiltered ? "没有找到匹配资源" : unorganizedOnly ? "整理完成" : "资源库还是空的" }}</h2>
-          <p>{{ isFiltered ? "试试其他关键词，或清除筛选条件。" : unorganizedOnly ? "当前没有未添加标签的资源。" : "选择一个文件夹，Myliba 就会为其中的文件建立索引。" }}</p>
-          <button v-if="!remoteMode && !isFiltered && !unorganizedOnly" class="button button-primary" @click="openFolderPicker"><FolderOpen :size="16" />选择第一个文件夹</button>
+          <h2>{{ isFiltered ? "没有找到匹配资源" : unorganizedOnly ? "整理完成" : "这里还没有资源" }}</h2>
+          <p>{{ isFiltered ? "试试其他关键词，或清除筛选条件。" : unorganizedOnly ? "当前没有未添加手动标签的资源。" : activeFolderID === "unfiled" ? "新索引的文件会先出现在这里。" : "从未归组选择资源，再移动到这个文件夹。" }}</p>
+          <button v-if="!isFiltered && !unorganizedOnly && activeFolderID !== 'unfiled'" class="button button-primary" @click="openFolder('unfiled')"><FolderOpen :size="16" />前往未归组</button>
           <button v-else-if="isFiltered" class="button button-secondary" @click="chooseAll">清除筛选</button>
         </section>
 
         <div v-if="hasMore && !loading" class="load-more-wrap"><button class="button button-secondary" @click="pageOffset += pageSize; loadResources(true)">加载更多</button></div>
         <div v-if="loading && resources.length" class="loading-more"><LoaderCircle class="spin" :size="16" />正在加载…</div>
+        </template>
 
         <footer class="page-footer"><span>MYLIBA · 个人资源管理器</span><span><span class="footer-dot"></span>{{ remoteMode ? (nodeOnline ? "家中节点在线" : "等待节点连接") : "本机索引已就绪" }}</span></footer>
         </template>
@@ -1213,9 +1547,9 @@ onBeforeUnmount(() => {
     </div>
 
     <nav class="mobile-nav" aria-label="资源导航">
-      <button :class="{ active: !isFiltered && !activeCollection }" @click="chooseAll"><House :size="17" /><span>全部</span></button>
-      <button :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
-      <button :class="{ active: selectedTags.length > 0 }" @click="openTagFilterFromMobile"><Tag :size="17" /><span>标签{{ selectedTags.length ? ` ${selectedTags.length}` : "" }}</span></button>
+      <button :class="{ active: activeFolderID === null }" @click="openFolder(null)"><House :size="17" /><span>文件夹</span></button>
+      <button :class="{ active: activeFolderID === 'unfiled' }" @click="openFolder('unfiled')"><FolderOpen :size="17" /><span>未归组</span></button>
+      <button v-if="activeFolderID !== null && activeFolderID !== 'all'" :class="{ active: selectedTags.length > 0 }" @click="openTagFilterFromMobile"><Tag :size="17" /><span>标签{{ selectedTags.length ? ` ${selectedTags.length}` : "" }}</span></button>
     </nav>
 
     <div v-if="previewResource" class="resource-preview-backdrop" @click.self="closeResourcePreview">

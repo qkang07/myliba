@@ -53,8 +53,8 @@ var (
 )
 
 func (s *server) tagSuggestions(w http.ResponseWriter, r *http.Request) {
-	var resourcePath, resourceName, rootID, rootPath string
-	err := s.db.QueryRow(`SELECT r.path,r.name,r.root_id,roots.path FROM resources r JOIN roots ON roots.id=r.root_id WHERE r.id=?`, r.PathValue("id")).Scan(&resourcePath, &resourceName, &rootID, &rootPath)
+	var resourcePath, resourceName, rootID, rootPath, virtualFolderID string
+	err := s.db.QueryRow(`SELECT r.path,r.name,r.root_id,roots.path,COALESCE(rf.folder_id,'') FROM resources r JOIN roots ON roots.id=r.root_id LEFT JOIN resource_folders rf ON rf.resource_id=r.id WHERE r.id=?`, r.PathValue("id")).Scan(&resourcePath, &resourceName, &rootID, &rootPath, &virtualFolderID)
 	if err == sql.ErrNoRows {
 		writeError(w, http.StatusNotFound, "资源不存在")
 		return
@@ -83,7 +83,7 @@ func (s *server) tagSuggestions(w http.ResponseWriter, r *http.Request) {
 		prefix += separator
 	}
 	prefixLength := utf8.RuneCountInString(prefix)
-	rows, err := s.db.Query(`SELECT id,path,name FROM resources WHERE root_id=? AND substr(path,1,?)=? ORDER BY path LIMIT 1001`, rootID, prefixLength, prefix)
+	rows, err := s.db.Query(`SELECT r.id,r.path,r.name FROM resources r LEFT JOIN resource_folders rf ON rf.resource_id=r.id WHERE r.root_id=? AND substr(r.path,1,?)=? AND COALESCE(rf.folder_id,'')=? ORDER BY r.path LIMIT 1001`, rootID, prefixLength, prefix, virtualFolderID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

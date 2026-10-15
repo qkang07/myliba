@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { ArrowLeft, Check, CircleAlert, Download, File, FileText, Image, LoaderCircle, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
+import { ArrowLeft, Check, CircleAlert, Download, Expand, File, FileText, Image, LoaderCircle, Minimize, Minus, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
 import {
   addResourceTag, createThumbnailVariant, fileURL, getResource, getResourceThumbnailVariant,
-  getTagSuggestions, getTags, getVideoInfo, removeResourceTag,
-  type Resource, type TagSuggestion, type TagSummary,
+  getTagSuggestions, getTags, getVideoInfo, moveResourcesToFolder, removeResourceTag,
+  type Resource, type TagSuggestion, type TagSummary, type VirtualFolder,
 } from "./api";
 
-const props = defineProps<{ id: string }>();
-const emit = defineEmits<{ back: []; tagsChanged: [] }>();
+const props = defineProps<{ id: string; folders: VirtualFolder[] }>();
+const emit = defineEmits<{ back: []; tagsChanged: []; folderChanged: [] }>();
 type Size = "small" | "medium" | "large";
 type Capture = { key: string; at: number; label: string };
 const resource = ref<Resource | null>(null);
@@ -17,6 +17,7 @@ const error = ref("");
 const previewError = ref("");
 const tagInput = ref("");
 const tagBusy = ref(false);
+const folderBusy = ref(false);
 const tagSuggestions = ref<TagSuggestion[]>([]);
 const tagCatalog = ref<TagSummary[]>([]);
 const duration = ref(0);
@@ -24,6 +25,8 @@ const durationError = ref("");
 const images = ref(new Map<string, string>());
 const busy = ref(new Set<string>());
 const captureBusy = ref(false);
+const previewZoom = ref(100);
+const expandedPreview = ref(false);
 let generation = 0;
 
 const mimeType = computed(() => {
@@ -114,6 +117,8 @@ async function generateAllCaptures() {
   } finally { captureBusy.value = false; }
 }
 async function refreshResource() {
+  closeExpandedPreview();
+  previewZoom.value = 100;
   const current = ++generation;
   loading.value = true;
   error.value = "";
@@ -182,6 +187,21 @@ async function removeTag(name: string) {
   } catch (cause) { error.value = cause instanceof Error ? cause.message : "移除标签失败"; }
   finally { tagBusy.value = false; }
 }
+async function changeFolder(event: Event) {
+  const id = resource.value?.id;
+  const target = event.target;
+  if (!id || !(target instanceof HTMLSelectElement) || folderBusy.value) return;
+  folderBusy.value = true;
+  error.value = "";
+  try {
+    await moveResourcesToFolder([id], target.value);
+    resource.value = await getResource(id);
+    emit("folderChanged");
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "移动资源失败";
+    target.value = resource.value?.folderId || "";
+  } finally { folderBusy.value = false; }
+}
 function onVideoMetadata(event: Event) {
   const video = event.target;
   if (!(video instanceof HTMLVideoElement) || !Number.isFinite(video.duration) || video.duration <= 0 || duration.value) return;
@@ -199,8 +219,28 @@ function download() {
   link.click();
   link.remove();
 }
+function zoomPreview(change: number) {
+  previewZoom.value = Math.max(100, Math.min(400, previewZoom.value + change));
+}
+function closeExpandedPreview() {
+  expandedPreview.value = false;
+  document.body.classList.remove("detail-preview-open");
+}
+function toggleExpandedPreview() {
+  expandedPreview.value = !expandedPreview.value;
+  document.body.classList.toggle("detail-preview-open", expandedPreview.value);
+}
+function onPreviewKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape" && expandedPreview.value) closeExpandedPreview();
+}
+document.addEventListener("keydown", onPreviewKeydown);
 watch(() => props.id, () => void refreshResource(), { immediate: true });
-onBeforeUnmount(() => { generation++; clearImages(); });
+onBeforeUnmount(() => {
+  generation++;
+  clearImages();
+  closeExpandedPreview();
+  document.removeEventListener("keydown", onPreviewKeydown);
+});
 </script>
 
 <template>
@@ -217,9 +257,9 @@ onBeforeUnmount(() => { generation++; clearImages(); });
       <p v-if="error" class="detail-error" role="alert"><CircleAlert :size="15" />{{ error }}</p>
       <div class="detail-layout">
         <div class="detail-main">
-          <section class="detail-panel">
-            <div class="detail-panel-heading"><h2>文件预览</h2><span>{{ mimeType || "无法在网页中预览" }}</span></div>
-            <div class="detail-preview">
+          <section class="detail-panel detail-preview-panel" :class="{ 'is-preview-expanded': expandedPreview }">
+            <div class="detail-panel-heading detail-preview-heading"><h2>文件预览</h2><div class="detail-preview-tools"><span>{{ mimeType || "无法在网页中预览" }}</span><div v-if="resource.available && mimeType.startsWith('image/') && !previewError" class="detail-zoom-tools"><button aria-label="缩小图片" title="缩小图片" :disabled="previewZoom <= 100" @click="zoomPreview(-25)"><Minus :size="14" /></button><button class="detail-zoom-value" aria-label="重置图片缩放" title="重置图片缩放" @click="previewZoom = 100">{{ previewZoom }}%</button><button aria-label="放大图片" title="放大图片" :disabled="previewZoom >= 400" @click="zoomPreview(25)"><Plus :size="14" /></button></div><button v-if="resource.available && mimeType && !previewError" class="detail-fullscreen-button" :aria-label="expandedPreview ? '退出窗口预览' : '铺满窗口预览'" @click="toggleExpandedPreview"><Minimize v-if="expandedPreview" :size="14" /><Expand v-else :size="14" />{{ expandedPreview ? '退出窗口预览' : '铺满窗口' }}</button></div></div>
+            <div class="detail-preview" :class="{ 'is-zoomed': mimeType.startsWith('image/') && previewZoom > 100 }" :style="{ '--preview-zoom': `${previewZoom}%` }">
               <template v-if="resource.available && mimeType && !previewError">
                 <img v-if="mimeType.startsWith('image/')" :src="fileURL(resource.id)" :alt="resource.name" @error="previewError = '图片无法加载'" />
                 <video v-else-if="mimeType.startsWith('video/')" :src="fileURL(resource.id)" controls preload="metadata" @loadedmetadata="onVideoMetadata" @error="previewError = '浏览器无法播放此视频格式'"></video>
@@ -256,8 +296,17 @@ onBeforeUnmount(() => { generation++; clearImages(); });
             <dl class="detail-facts"><div><dt>名称</dt><dd>{{ resource.name }}</dd></div><div><dt>类型</dt><dd>{{ kindLabel }}</dd></div><div><dt>大小</dt><dd>{{ formatBytes(resource.size) }}</dd></div><div><dt>修改时间</dt><dd>{{ new Date(resource.modified).toLocaleString('zh-CN') }}</dd></div><div><dt>原始路径</dt><dd class="detail-path">{{ resource.path }}</dd></div><div><dt>资源 ID</dt><dd class="detail-path">{{ resource.id }}</dd></div></dl>
           </section>
           <section class="detail-panel">
-            <div class="detail-panel-heading"><h2>标签</h2><span>{{ resource.tags.length }} 个</span></div>
-            <div class="detail-tags"><span v-for="name in resource.tags" :key="name" class="detail-tag"><Tag :size="12" />{{ name }}<button :aria-label="'移除标签 ' + name" :disabled="tagBusy" @click="removeTag(name)"><Trash2 :size="12" /></button></span><p v-if="!resource.tags.length">尚未添加标签</p></div>
+            <div class="detail-panel-heading"><h2>所属文件夹</h2></div>
+            <label class="detail-folder-field">文件夹<select :value="resource.folderId" :disabled="folderBusy" @change="changeFolder"><option value="">未归组</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
+            <p class="detail-folder-hint">移动只调整资源分组，不改变原文件位置。</p>
+          </section>
+          <section class="detail-panel">
+            <div class="detail-panel-heading"><h2>属性标签</h2><span>随文件属性自动更新</span></div>
+            <div class="detail-attribute-tags"><span v-for="attribute in resource.attributeTags" :key="attribute.key">{{ attribute.category === 'type' ? '类型' : attribute.category === 'size' ? '大小' : '格式' }}：{{ attribute.label }}</span></div>
+          </section>
+          <section class="detail-panel">
+            <div class="detail-panel-heading"><h2>手动标签</h2><span>{{ resource.tags.length }} 个</span></div>
+            <div class="detail-tags"><span v-for="name in resource.tags" :key="name" class="detail-tag"><Tag :size="12" />{{ name }}<button :aria-label="'移除标签 ' + name" :disabled="tagBusy" @click="removeTag(name)"><Trash2 :size="12" /></button></span><p v-if="!resource.tags.length">尚未添加手动标签</p></div>
             <form class="detail-tag-form" @submit.prevent="addTag()"><input v-model="tagInput" maxlength="40" placeholder="输入新标签" :disabled="tagBusy" /><button class="button button-primary" :disabled="tagBusy || !tagInput.trim()"><LoaderCircle v-if="tagBusy" class="spin" :size="14" /><Check v-else :size="14" />添加</button></form>
             <div v-if="tagSuggestions.length" class="detail-suggestions"><p>建议标签</p><button v-for="suggestion in tagSuggestions.filter((item) => !resource?.tags.some((name) => name.toLocaleLowerCase() === item.name.toLocaleLowerCase())).slice(0, 6)" :key="suggestion.name" :disabled="tagBusy" :title="suggestion.reason" @click="addTag(suggestion.name)"><Plus :size="12" />{{ suggestion.name }}</button></div>
           </section>

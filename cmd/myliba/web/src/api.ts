@@ -9,7 +9,9 @@ export interface Resource {
   kind: string;
   available: boolean;
   versionId: string;
+  folderId: string;
   tags: string[];
+  attributeTags: AttributeTag[];
 }
 
 export type ResourceSort = "modified_desc" | "modified_asc" | "name_asc" | "name_desc" | "size_desc";
@@ -17,8 +19,10 @@ export type ResourceSort = "modified_desc" | "modified_asc" | "name_asc" | "name
 export interface CollectionFilters {
   query: string;
   tags: string[];
+  attributes: string[];
   kind: string;
   rootId: string;
+  folderId: string;
   unorganized: boolean;
   sort: ResourceSort;
 }
@@ -43,6 +47,20 @@ export interface RootSummary {
   addedAt: string;
   lastScanAt: string;
   count: number;
+}
+
+export interface VirtualFolder {
+  id: string;
+  name: string;
+  count: number;
+  createdAt: string;
+}
+
+export interface AttributeTag {
+  key: string;
+  category: "type" | "size" | "extension";
+  label: string;
+  count?: number;
 }
 
 export interface TagSummary {
@@ -145,18 +163,28 @@ export function logout() {
   return request<{ authenticated: boolean }>("/api/session", { method: "DELETE" });
 }
 
-export function getResources(params: CollectionFilters & { limit: number; offset: number }) {
+function resourceSearchParams(params: CollectionFilters & { limit: number; offset: number }) {
   const search = new URLSearchParams({
     q: params.query,
     unorganized: params.unorganized ? "1" : "",
     kind: params.kind,
     rootId: params.rootId,
+    folderId: params.folderId,
     sort: params.sort,
     limit: String(params.limit),
     offset: String(params.offset),
   });
   for (const tag of params.tags) search.append("tag", tag);
-  return request<ResourcePage>(`/api/resources?${search}`);
+  for (const attribute of params.attributes) search.append("attribute", attribute);
+  return search;
+}
+
+export function getResources(params: CollectionFilters & { limit: number; offset: number }) {
+  return request<ResourcePage>(`/api/resources?${resourceSearchParams(params)}`);
+}
+
+export function getResourceSelection(params: CollectionFilters & { limit: number; offset: number }) {
+  return request<{ items: Pick<Resource, "id" | "kind" | "available">[]; total: number; limit: number; offset: number }>(`/api/resources/selection?${resourceSearchParams(params)}`);
 }
 
 export function getCollections() {
@@ -179,8 +207,32 @@ export function getRoots() {
   return request<RootSummary[]>("/api/roots");
 }
 
-export function getTags() {
-  return request<TagSummary[]>("/api/tags");
+export function getTags(folderId = "all") {
+  return request<TagSummary[]>("/api/tags?folderId=" + encodeURIComponent(folderId));
+}
+
+export function getAttributeTags(folderId: string) {
+  return request<AttributeTag[]>("/api/attribute-tags?folderId=" + encodeURIComponent(folderId));
+}
+
+export function getFolders() {
+  return request<{ items: VirtualFolder[]; unfiledCount: number }>("/api/folders");
+}
+
+export function createFolder(name: string) {
+  return request<VirtualFolder>("/api/folders", { method: "POST", body: JSON.stringify({ name }) });
+}
+
+export function renameFolder(id: string, name: string) {
+  return request<VirtualFolder>("/api/folders/" + encodeURIComponent(id), { method: "PUT", body: JSON.stringify({ name }) });
+}
+
+export function deleteFolder(id: string) {
+  return request<{ ok: boolean }>("/api/folders/" + encodeURIComponent(id), { method: "DELETE" });
+}
+
+export function moveResourcesToFolder(ids: string[], folderId: string) {
+  return request<{ ok: boolean; updated: number }>("/api/resources/folder", { method: "PUT", body: JSON.stringify({ ids, folderId }) });
 }
 
 export async function getTagSuggestions(id: string) {
@@ -188,8 +240,8 @@ export async function getTagSuggestions(id: string) {
   return result.suggestions;
 }
 
-export async function getBatchTagSuggestions() {
-  const result = await request<{ suggestions: BatchTagSuggestion[]; scanned: number }>("/api/tag-batch-suggestions");
+export async function getBatchTagSuggestions(folderId = "all") {
+  const result = await request<{ suggestions: BatchTagSuggestion[]; scanned: number }>("/api/tag-batch-suggestions?folderId=" + encodeURIComponent(folderId));
   return result;
 }
 

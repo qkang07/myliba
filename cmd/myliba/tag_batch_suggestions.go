@@ -30,12 +30,16 @@ type batchSuggestionAccumulator struct {
 	Examples   map[string]struct{}
 }
 
-func (s *server) tagBatchSuggestions(w http.ResponseWriter, _ *http.Request) {
+func (s *server) tagBatchSuggestions(w http.ResponseWriter, r *http.Request) {
+	clause, args := folderScopeSQL(r.URL.Query().Get("folderId"), "r")
+	if clause == "" {
+		clause = "1=1"
+	}
 	rows, err := s.db.Query(`SELECT r.id,r.root_id,r.path,r.name,t.name
 		FROM resources r
 		LEFT JOIN resource_tags rt ON rt.resource_id=r.id
 		LEFT JOIN tags t ON t.id=rt.tag_id
-		ORDER BY r.root_id,r.path`)
+		WHERE `+clause+` ORDER BY r.root_id,r.path`, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -485,7 +485,15 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet
 	case len(parts) == 4 && parts[1] == "roots" && parts[3] == "scan":
 		return method == http.MethodPost
+	case len(parts) == 2 && parts[1] == "folders":
+		return method == http.MethodGet || method == http.MethodPost
+	case len(parts) == 3 && parts[1] == "folders":
+		return method == http.MethodPut || method == http.MethodDelete
+	case len(parts) == 3 && parts[1] == "resources" && parts[2] == "folder":
+		return method == http.MethodPut
 	case len(parts) == 2 && parts[1] == "resources":
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "resources" && parts[2] == "selection":
 		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "resources" && parts[2] != "tags":
 		return method == http.MethodGet
@@ -503,7 +511,7 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet || method == http.MethodPost
 	case len(parts) == 3 && parts[1] == "collections":
 		return method == http.MethodPut || method == http.MethodDelete
-	case len(parts) == 2 && (parts[1] == "tags" || parts[1] == "tag-batch-suggestions"):
+	case len(parts) == 2 && (parts[1] == "tags" || parts[1] == "attribute-tags" || parts[1] == "tag-batch-suggestions"):
 		return method == http.MethodGet
 	default:
 		return false
