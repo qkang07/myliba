@@ -3,7 +3,7 @@
 The Android app has two independent libraries:
 
 - **Phone files:** Select folders with Android's system picker. The app indexes files in an app-private SQLite database. Search names, paths, and manual tags; combine manual tags, file type, size, format, source root, and the unorganized queue; sort and page results. Organize indexed files into virtual folders, save dynamic smart collections, select all matching results, and batch add/remove tags or move files between virtual folders. Preview images, text, PDF, and video in the app; other formats can open in a compatible installed app. Original files stay in place. A failed scan leaves the previous index intact.
-- **Server:** Enter the root HTTPS URL of a Myliba Hub. The app opens the existing authenticated web UI in a WebView. The same Hub and home-node authorization rules apply. Regular same-origin downloads use Android Download Manager; the browser button opens the Hub in the system browser when a page needs browser-specific behavior.
+- **Server:** Enter the root HTTPS URL of a Myliba Hub. The Android app uses the Hub's HTTPS API in a native mobile interface for login, search, combined filters, smart collections, virtual folders, resource details, tag editing, batch operations, and downloads. The same Hub and home-node authorization rules apply.
 
 The phone library and the server library are separate. Local virtual folders, tags, and smart collections live only in the app database. This version does not upload phone files, sync tags, or cache server content for offline use. Local search uses SQLite substring matching; the server's FTS5 index and AI-assisted tag suggestions are available through the server tab.
 
@@ -20,4 +20,4 @@ Minimum Android version: 8.0 (API 26). No broad storage permission is requested.
 1. On **手机文件**, choose a folder and wait for the scan. Search indexed names, paths, and tags. Use **筛选** for combined filters, **文件夹** for virtual groups, and **智能集合** to save the current search. Select individual results, the loaded page, or all matching files for batch operations. Tap **打开** to preview; use **标签** to edit one file's tags.
 2. On **连接服务端**, enter the self-hosted Hub's `https://` root URL and log in with the existing web password. The Hub and home node must already be configured as described in the repository root README.
 
-The Android app has no access to the home node's local-only folder-management APIs. It uses the Hub's existing remote interface. Neither the Hub password nor node token is stored by the Android app; the WebView retains the Hub's session cookie.
+The Android app has no access to the home node's local-only folder-management APIs. It uses the Hub's existing remote interface. The Hub password is not stored; the authenticated session cookie is kept in app-private preferences. Phone-local folders and tags remain separate from the server library.

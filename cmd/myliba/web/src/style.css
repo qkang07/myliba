@@ -488,7 +488,7 @@ body.detail-preview-open { overflow: hidden; }
 .detail-preview-panel.is-preview-expanded .detail-preview > img, .detail-preview-panel.is-preview-expanded .detail-preview > video { max-height: 100%; }
 .detail-preview-panel.is-preview-expanded .detail-preview > iframe { height: 100%; }
 .detail-preview { display: grid; min-height: 390px; max-height: 650px; place-items: center; overflow: auto; overscroll-behavior: contain; background: #171a18; }
-.detail-preview.is-zoomed { display: block; }
+.detail-preview.is-zoomed { display: block; place-items: start; }
 .detail-preview.is-zoomed > img { width: var(--preview-zoom); height: auto; max-width: none; max-height: none; }
 .detail-preview-panel.is-preview-expanded .detail-preview.is-zoomed > img { max-height: none; }
 .detail-preview > img, .detail-preview > video { display: block; max-width: 100%; max-height: 650px; object-fit: contain; }

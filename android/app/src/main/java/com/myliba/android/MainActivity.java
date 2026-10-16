@@ -8,6 +8,7 @@ import android.content.UriPermission;
 import android.database.sqlite.SQLiteConstraintException;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -32,9 +33,11 @@ import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
     private static final int PICK_TREE = 1;
-    private static final int INK = Color.rgb(29, 39, 49);
-    private static final int MUTED = Color.rgb(94, 107, 119);
-    private static final int BLUE = Color.rgb(38, 89, 173);
+    private static final int INK = Color.rgb(32, 42, 36);
+    private static final int MUTED = Color.rgb(101, 113, 104);
+    private static final int GREEN = Color.rgb(47, 98, 72);
+    private static final int GREEN_SOFT = Color.rgb(234, 242, 236);
+    private static final int CANVAS = Color.rgb(245, 247, 245);
 
     private final ExecutorService scanner = Executors.newSingleThreadExecutor();
     private LocalLibrary library;
@@ -63,15 +66,15 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().setStatusBarColor(Color.rgb(245, 248, 252));
-        getWindow().setNavigationBarColor(Color.rgb(245, 248, 252));
+        getWindow().setStatusBarColor(CANVAS);
+        getWindow().setNavigationBarColor(CANVAS);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         library = new LocalLibrary(this);
         remote = new RemotePanel(this);
 
         LinearLayout shell = new LinearLayout(this);
         shell.setOrientation(LinearLayout.VERTICAL);
-        shell.setBackgroundColor(Color.rgb(250, 251, 253));
+        shell.setBackgroundColor(CANVAS);
         setContentView(shell);
         if (Build.VERSION.SDK_INT >= 35) {
             getWindow().setDecorFitsSystemWindows(false);
@@ -84,11 +87,12 @@ public final class MainActivity extends Activity {
         }
 
         LinearLayout header = column();
-        header.setPadding(dp(20), dp(20), dp(20), dp(12));
+        header.setPadding(dp(20), dp(17), dp(20), dp(10));
         header.setBackgroundColor(Color.WHITE);
-        TextView title = text("Myliba", 26, INK, true);
+        TextView title = text("myliba", 24, GREEN, true);
         header.addView(title);
-        TextView subtitle = text("你的本地与远程资源库", 13, MUTED, false);
+        TextView subtitle = text("PERSONAL LIBRARY", 9, MUTED, true);
+        subtitle.setLetterSpacing(.12f);
         header.addView(subtitle);
         shell.addView(header);
 
@@ -100,6 +104,8 @@ public final class MainActivity extends Activity {
         tabs.addView(localTab, new LinearLayout.LayoutParams(0, dp(44), 1));
         tabs.addView(serverTab, new LinearLayout.LayoutParams(0, dp(44), 1));
         shell.addView(tabs);
+        styleTab(localTab, true);
+        styleTab(serverTab, false);
 
         page = column();
         shell.addView(page, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -110,24 +116,33 @@ public final class MainActivity extends Activity {
         showingServer = false;
         localTab.setEnabled(false);
         serverTab.setEnabled(true);
+        styleTab(localTab, true);
+        styleTab(serverTab, false);
         page.removeAllViews();
         ScrollView scroll = new ScrollView(this);
         page.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
         LinearLayout body = column();
-        body.setPadding(dp(18), dp(20), dp(18), dp(32));
+        body.setPadding(dp(16), dp(18), dp(16), dp(30));
         scroll.addView(body);
 
-        body.addView(text("本地目录", 21, INK, true));
-        body.addView(text("授权一个或多个目录，原文件留在手机原位。", 13, MUTED, false));
-        Button add = button("＋ 选择目录", this::pickTree);
+        LinearLayout intro = column();
+        intro.setPadding(dp(15), dp(15), dp(15), dp(15));
+        intro.setBackground(rounded(Color.WHITE, dp(11), Color.rgb(231, 235, 231), dp(1)));
+        intro.addView(text("个人资源空间", 10, GREEN, true));
+        intro.addView(text("文件都在原来的位置", 20, INK, true), matchTop(5));
+        intro.addView(text("索引、搜索与整理都在这台手机完成。", 12, MUTED, false), matchTop(5));
+        body.addView(intro);
+
+        addSectionHeading(body, "索引目录", "选择要纳入资源库的文件夹。", 20);
+        Button add = primaryButton("＋ 选择目录", this::pickTree);
         body.addView(add, matchTop(12));
         rootList = column();
         body.addView(rootList, matchTop(12));
         scanStatus = text("", 13, MUTED, false);
         body.addView(scanStatus, matchTop(8));
 
-        TextView heading = text("资源", 21, INK, true);
-        body.addView(heading, matchTop(28));
+        TextView heading = text("资源", 19, INK, true);
+        body.addView(heading, matchTop(26));
         folderButton = button("全部资源", this::chooseFolder);
         body.addView(folderButton, matchTop(8));
         collectionButton = button("智能集合", this::chooseCollection);
@@ -136,7 +151,8 @@ public final class MainActivity extends Activity {
         search.setSingleLine(true);
         search.setTextSize(15);
         search.setHint("搜索文件名、路径或标签");
-        search.setPadding(dp(12), dp(8), dp(12), dp(8));
+        search.setBackground(rounded(Color.WHITE, dp(9), Color.rgb(220, 227, 221), dp(1)));
+        search.setPadding(dp(13), dp(9), dp(13), dp(9));
         body.addView(search, matchTop(8));
         search.setText(filters.query);
         LinearLayout controls = row();
@@ -169,6 +185,8 @@ public final class MainActivity extends Activity {
         showingServer = true;
         localTab.setEnabled(true);
         serverTab.setEnabled(false);
+        styleTab(localTab, false);
+        styleTab(serverTab, true);
         page.removeAllViews();
         remote.attach(page);
     }
@@ -257,7 +275,10 @@ public final class MainActivity extends Activity {
         for (LocalLibrary.Root root : roots) {
             LinearLayout line = row();
             line.setGravity(Gravity.CENTER_VERTICAL);
+            line.setPadding(dp(9), dp(5), dp(5), dp(5));
+            line.setBackground(rounded(Color.WHITE, dp(9), Color.rgb(231, 235, 231), dp(1)));
             TextView label = text(root.name + "  ·  " + root.count + " 个文件", 15, INK, true);
+            label.setPadding(dp(4), 0, 0, 0);
             line.addView(label, new LinearLayout.LayoutParams(0, -2, 1));
             line.addView(button("扫描", () -> scan(Uri.parse(root.uri))));
             line.addView(button("移除", () -> removeRoot(root)));
@@ -333,7 +354,7 @@ public final class MainActivity extends Activity {
             shownUris.add(item.uri);
             LinearLayout card = column();
             card.setPadding(dp(12), dp(10), dp(12), dp(10));
-            card.setBackgroundColor(Color.WHITE);
+            card.setBackground(rounded(Color.WHITE, dp(10), Color.rgb(231, 235, 231), dp(1)));
             TextView name = text(item.name, 16, INK, true);
             name.setMaxLines(2);
             card.addView(name);
@@ -765,9 +786,43 @@ public final class MainActivity extends Activity {
     Button button(String value, Runnable action) {
         Button view = new Button(this);
         view.setText(value);
-        view.setTextColor(BLUE);
+        view.setTextColor(GREEN);
         view.setAllCaps(false);
+        view.setTextSize(12);
+        view.setMinHeight(dp(42));
+        view.setPadding(dp(10), 0, dp(10), 0);
+        view.setBackground(rounded(GREEN_SOFT, dp(8), 0, 0));
+        view.setElevation(0);
         view.setOnClickListener(v -> action.run());
         return view;
+    }
+
+    Button primaryButton(String value, Runnable action) {
+        Button view = button(value, action);
+        view.setTextColor(Color.WHITE);
+        view.setBackground(rounded(GREEN, dp(8), 0, 0));
+        return view;
+    }
+
+    private void styleTab(Button tab, boolean active) {
+        tab.setBackground(rounded(active ? GREEN_SOFT : Color.WHITE, dp(9), active ? 0 : Color.rgb(231, 235, 231), active ? 0 : dp(1)));
+        tab.setTextColor(active ? GREEN : MUTED);
+        tab.setTypeface(Typeface.DEFAULT, active ? Typeface.BOLD : Typeface.NORMAL);
+        tab.setElevation(0);
+    }
+
+    private void addSectionHeading(LinearLayout parent, String title, String subtitle, int top) {
+        LinearLayout section = column();
+        section.addView(text(title, 16, INK, true));
+        section.addView(text(subtitle, 11, MUTED, false), matchTop(3));
+        parent.addView(section, matchTop(top));
+    }
+
+    private GradientDrawable rounded(int fill, int radius, int stroke, int strokeWidth) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(fill);
+        drawable.setCornerRadius(radius);
+        if (strokeWidth > 0) drawable.setStroke(strokeWidth, stroke);
+        return drawable;
     }
 }
