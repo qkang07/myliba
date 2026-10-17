@@ -2,9 +2,12 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { closeWebRTC, connectWebRTC } from "./webrtc";
 import ResourceDetail from "./ResourceDetail.vue";
+import ImagePreview from "./ImagePreview.vue";
 import {
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   Clock3,
   Bookmark,
@@ -46,7 +49,10 @@ import {
   ApiError,
   fileURL,
   getResourceThumbnail,
-  createThumbnail,
+  getPreprocessQueue,
+  prioritizePreprocessJobs,
+  retryPreprocessJob,
+  type PreprocessQueue,
   getBatchTagSuggestions,
   getResources,
   getResourceSelection,
@@ -91,6 +97,8 @@ const initialized = ref(false);
 const errorMessage = ref("");
 const resources = ref<Resource[]>([]);
 const failedThumbnailIDs = ref(new Set<string>());
+const preprocessOpen = ref(false);
+const preprocessQueue = ref<PreprocessQueue>({ counts: { pending: 0, running: 0, done: 0, failed: 0 }, jobs: [], visible: {} });
 const thumbnailURLs = ref(new Map<string, string>());
 const thumbnailVersionSignatures = ref(new Map<string, string>());
 const loadingThumbnailIDs = new Set<string>();
@@ -101,6 +109,7 @@ const thumbnailBatchProgress = ref({ done: 0, total: 0 });
 const roots = ref<RootSummary[]>([]);
 const tags = ref<TagSummary[]>([]);
 const attributeCatalog = ref<AttributeTag[]>([]);
+const attributeCatalogLoading = ref(false);
 const selectedAttributes = ref<string[]>([]);
 const attributeFormatQuery = ref("");
 const folders = ref<VirtualFolder[]>([]);
@@ -162,11 +171,15 @@ const detailResourceID = ref(new URLSearchParams(window.location.search).get("re
 const previewResource = ref<Resource | null>(null);
 const previewMimeType = ref("");
 const previewError = ref("");
+const previewLoadingNext = ref(false);
 
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 let statusTimer: ReturnType<typeof setInterval> | undefined;
+let jobsTimer: ReturnType<typeof setInterval> | undefined;
 let requestGeneration = 0;
+let attributeCatalogGeneration = 0;
+let attributeCatalogScope = "";
 let selectionGeneration = 0;
 let selectionScopeKey = "";
 let lastWebRTCAttempt = 0;
@@ -175,8 +188,17 @@ let authGeneration = 0;
 let suppressQueryWatch = false;
 
 const onShortcut = (event: KeyboardEvent) => {
+  if (event.key === "Escape" && preprocessOpen.value) { preprocessOpen.value = false; return; }
   if (event.key === "Escape" && previewResource.value) {
     closeResourcePreview();
+    return;
+  }
+  if (previewResource.value && !event.altKey && !event.ctrlKey && !event.metaKey &&
+    (event.key === "ArrowLeft" || event.key === "ArrowRight") &&
+    !(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement ||
+      event.target instanceof HTMLVideoElement || event.target instanceof HTMLAudioElement)) {
+    event.preventDefault();
+    void moveResourcePreview(event.key === "ArrowLeft" ? -1 : 1);
     return;
   }
   if (event.key === "Escape" && tagFilterOpen.value) {
@@ -249,6 +271,11 @@ const selectedCount = computed(() => selectedIDs.value.size);
 const selectedMediaCount = computed(() => [...selectedResources.value.values()].filter((resource) => resource.available && ["image", "video"].includes(resource.kind)).length);
 const totalIndexed = computed(() => roots.value.reduce((sum, root) => sum + root.count, 0));
 const hasMore = computed(() => resources.value.length < total.value);
+const previewIndex = computed(() => previewResource.value ? resources.value.findIndex((item) => item.id === previewResource.value?.id) : -1);
+const previewPosition = computed(() => previewIndex.value < 0 ? 1 : previewIndex.value + 1);
+const previewTotal = computed(() => Math.max(total.value, resources.value.length));
+const canPreviewPrevious = computed(() => previewIndex.value > 0);
+const canPreviewNext = computed(() => previewIndex.value >= 0 && (previewIndex.value < resources.value.length - 1 || hasMore.value));
 const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || activeAttributeKeys.value.length || selectedRootID.value || sortOrder.value !== "modified_desc"));
 const matchingTags = computed(() => {
   const needle = tagFilterQuery.value.trim().toLocaleLowerCase();
@@ -314,33 +341,20 @@ function isGeneratingThumbnail(id: string) {
   return generatingThumbnailIDs.value.has(id);
 }
 
-async function generateThumbnail(id: string, showFailure = true): Promise<boolean> {
+async function generateThumbnail(id: string, showFailure = true, refresh = true): Promise<boolean> {
   if (generatingThumbnailIDs.value.has(id)) return false;
   generatingThumbnailIDs.value = new Set(generatingThumbnailIDs.value).add(id);
   try {
-    await createThumbnail(id);
-    const revisions = new Map(thumbnailRefreshTokens.value);
-    revisions.set(id, (revisions.get(id) || 0) + 1);
-    thumbnailRefreshTokens.value = revisions;
-    const failed = new Set(failedThumbnailIDs.value);
-    failed.delete(id);
-    failedThumbnailIDs.value = failed;
-    const urls = new Map(thumbnailURLs.value);
-    const previousURL = urls.get(id);
-    if (previousURL) URL.revokeObjectURL(previousURL);
-    urls.delete(id);
-    thumbnailURLs.value = urls;
-    loadingThumbnailIDs.delete(id);
-    const resource = resources.value.find((item) => item.id === id);
-    if (resource) await loadThumbnail(resource);
+    await retryPreprocessJob(id);
+    if (refresh) await refreshPreprocessJobs();
     return true;
   } catch (error) {
-    if (showFailure) notify(error instanceof Error ? error.message : "缩略图生成失败");
+    if (showFailure) notify(error instanceof Error ? error.message : "无法安排缩略图任务");
     return false;
   } finally {
-    const generating = new Set(generatingThumbnailIDs.value);
-    generating.delete(id);
-    generatingThumbnailIDs.value = generating;
+    const next = new Set(generatingThumbnailIDs.value);
+    next.delete(id);
+    generatingThumbnailIDs.value = next;
   }
 }
 
@@ -356,14 +370,15 @@ async function generateSelectedThumbnails() {
   const worker = async () => {
     while (nextIndex < selected.length) {
       const resource = selected[nextIndex++];
-      if (await generateThumbnail(resource.id, false)) succeeded++;
+      if (await generateThumbnail(resource.id, false, false)) succeeded++;
       else failed++;
       thumbnailBatchProgress.value = { ...thumbnailBatchProgress.value, done: thumbnailBatchProgress.value.done + 1 };
     }
   };
   try {
     await Promise.all([worker(), worker()]);
-    notify(failed ? `完成 ${succeeded} 个，${failed} 个失败` : `已生成 ${succeeded} 个缩略图`);
+    await refreshPreprocessJobs();
+    notify(failed ? `已排队 ${succeeded} 个，${failed} 个失败` : `已将 ${succeeded} 个任务加入队列`);
   } finally {
     generatingThumbnailBatch.value = false;
   }
@@ -417,7 +432,33 @@ function getPreviewMimeType(resource: Resource) {
 function openResourcePreview(resource: Resource) {
   previewResource.value = resource;
   previewMimeType.value = getPreviewMimeType(resource);
-  previewError.value = "";
+  previewError.value = resource.available ? "" : "源文件当前不可用。";
+}
+
+async function moveResourcePreview(direction: -1 | 1) {
+  const index = previewIndex.value;
+  if (index < 0 || previewLoadingNext.value) return;
+  if (direction < 0) {
+    if (index > 0) openResourcePreview(resources.value[index - 1]);
+    return;
+  }
+  if (index + 1 < resources.value.length) {
+    openResourcePreview(resources.value[index + 1]);
+    return;
+  }
+  if (!hasMore.value) return;
+  previewLoadingNext.value = true;
+  const currentID = previewResource.value?.id;
+  const previousLength = resources.value.length;
+  pageOffset.value = previousLength;
+  try {
+    await loadResources(true);
+    if (previewResource.value?.id === currentID && resources.value.length > previousLength) {
+      openResourcePreview(resources.value[previousLength]);
+    }
+  } finally {
+    previewLoadingNext.value = false;
+  }
 }
 
 function closeResourcePreview() {
@@ -442,6 +483,7 @@ async function loadResources(append = false) {
     clearSelection();
     selectionScopeKey = scopeKey;
   }
+  if (!append) void loadAttributeCatalog();
   if (activeFolderID.value === null) {
     resources.value = [];
     total.value = 0;
@@ -509,13 +551,30 @@ async function loadFolders() {
 }
 
 async function loadAttributeCatalog() {
-  const generation = authGeneration;
-  const folderID = activeFolderID.value;
-  if (folderID === null) { attributeCatalog.value = []; return; }
+  const generation = ++attributeCatalogGeneration;
+  const sessionGeneration = authGeneration;
+  const filters = currentFilters();
+  const scope = JSON.stringify({ ...filters, sort: "" });
+  if (scope !== attributeCatalogScope) {
+    attributeCatalog.value = [];
+    attributeCatalogScope = scope;
+  }
+  if (activeFolderID.value === null) {
+    attributeCatalogLoading.value = false;
+    return;
+  }
+  attributeCatalogLoading.value = true;
   try {
-    const result = await getAttributeTags(folderID);
-    if (generation === authGeneration && folderID === activeFolderID.value) attributeCatalog.value = result;
-  } catch (error) { if (generation === authGeneration && folderID === activeFolderID.value) showError(error); }
+    const result = await getAttributeTags(filters);
+    if (generation === attributeCatalogGeneration && sessionGeneration === authGeneration && scope === JSON.stringify({ ...currentFilters(), sort: "" })) attributeCatalog.value = result;
+  } catch (error) {
+    if (generation === attributeCatalogGeneration && sessionGeneration === authGeneration) {
+      attributeCatalog.value = [];
+      showError(error);
+    }
+  } finally {
+    if (generation === attributeCatalogGeneration) attributeCatalogLoading.value = false;
+  }
 }
 
 async function loadCollections() {
@@ -527,7 +586,7 @@ async function loadCollections() {
 }
 
 async function loadWorkspace() {
-  await Promise.all([loadRoots(), loadFolders(), loadTags(), loadAttributeCatalog(), loadCollections(), loadResources()]);
+  await Promise.all([loadRoots(), loadFolders(), loadTags(), loadCollections(), loadResources()]);
 }
 
 function setDetailRoute(id: string) {
@@ -554,7 +613,7 @@ function syncDetailRoute() {
   if (nextFolder !== activeFolderID.value) {
     activeFolderID.value = nextFolder;
     resetFolderFilters();
-    void Promise.all([loadTags(), loadAttributeCatalog(), loadResources()]);
+    void Promise.all([loadTags(), loadResources()]);
   }
 }
 
@@ -588,7 +647,7 @@ function openFolder(id: string | null) {
   if (id === null) url.searchParams.delete("folder");
   else url.searchParams.set("folder", id);
   window.history.pushState({}, "", url.pathname + url.search + url.hash);
-  void Promise.all([loadTags(), loadAttributeCatalog(), loadResources()]);
+  void Promise.all([loadTags(), loadResources()]);
   window.scrollTo(0, 0);
 }
 
@@ -647,10 +706,10 @@ async function moveSelectedToFolder() {
       removeSelected(batch);
       bulkProgress.value = { done: offset + batch.length, total: ids.length };
     }
-    await Promise.all([loadFolders(), loadTags(), loadAttributeCatalog(), loadResources()]);
+    await Promise.all([loadFolders(), loadTags(), loadResources()]);
     notify("已移动 " + ids.length + " 项资源");
   } catch (error) {
-    await Promise.all([loadFolders(), loadTags(), loadAttributeCatalog(), loadResources()]);
+    await Promise.all([loadFolders(), loadTags(), loadResources()]);
     showError(error);
     if (bulkProgress.value.done && errorMessage.value) errorMessage.value += `；已移动 ${bulkProgress.value.done} 项，剩余 ${selectedCount.value} 项仍已选`;
   } finally { bulkBusy.value = ""; }
@@ -658,7 +717,7 @@ async function moveSelectedToFolder() {
 
 async function onDetailFolderChanged() {
   closeDetail();
-  await Promise.all([loadFolders(), loadTags(), loadAttributeCatalog(), loadResources()]);
+  await Promise.all([loadFolders(), loadTags(), loadResources()]);
   notify("文件夹归属已更新");
 }
 
@@ -763,7 +822,7 @@ async function chooseCollection(item: SmartCollection) {
   url.searchParams.set("folder", activeFolderID.value);
   window.history.pushState({}, "", url.pathname + url.search + url.hash);
   await nextTick();
-  void Promise.all([loadTags(), loadAttributeCatalog()]);
+  void loadTags();
   suppressQueryWatch = false;
   void loadResources();
 }
@@ -935,10 +994,10 @@ async function applyBatchTag() {
       bulkProgress.value = { done: offset + batch.length, total: ids.length };
     }
     bulkTagName.value = "";
-    await Promise.all([loadResources(), loadTags(), loadAttributeCatalog()]);
+    await Promise.all([loadResources(), loadTags()]);
     notify(`已为 ${ids.length} 项添加「${name}」`);
   } catch (error) {
-    await Promise.all([loadResources(), loadTags(), loadAttributeCatalog()]);
+    await Promise.all([loadResources(), loadTags()]);
     showError(error);
     if (bulkProgress.value.done && errorMessage.value) errorMessage.value += `；已处理 ${bulkProgress.value.done} 项，剩余 ${selectedCount.value} 项仍已选`;
   } finally { bulkBusy.value = ""; }
@@ -1065,6 +1124,7 @@ async function submitLogin() {
     else nodeTransport.value = "relay";
     await loadWorkspace();
     startStatusPolling();
+    startPreprocessPolling();
   } catch (error) { loginError.value = error instanceof Error ? error.message : "登录失败"; }
   finally { loginBusy.value = false; }
 }
@@ -1104,6 +1164,7 @@ function clearRemoteSession() {
   errorMessage.value = "";
   toastMessage.value = "";
   stopStatusPolling();
+  stopPreprocessPolling();
   closeWebRTC();
 }
 
@@ -1138,6 +1199,35 @@ async function refreshNodeStatus() {
   } catch { nodeOnline.value = false; }
 }
 
+async function refreshPreprocessJobs() {
+  if (remoteMode.value && (!authenticated.value || !nodeOnline.value)) return;
+  try {
+    const ids = resources.value.filter((item) => item.available).map((item) => item.id).slice(-200);
+    const queue = await getPreprocessQueue(ids);
+    preprocessQueue.value = queue;
+    for (const resource of resources.value) {
+      if (["image", "video"].includes(resource.kind) && queue.visible[resource.id] === "done" && !thumbnailURLs.value.has(resource.id) && !loadingThumbnailIDs.has(resource.id)) {
+        void loadThumbnail(resource);
+      }
+    }
+  } catch { /* Keep the last queue snapshot during brief disconnects. */ }
+}
+
+function startPreprocessPolling() {
+  if (jobsTimer) clearInterval(jobsTimer);
+  void refreshPreprocessJobs();
+  jobsTimer = setInterval(() => void refreshPreprocessJobs(), 2000);
+}
+
+function stopPreprocessPolling() {
+  if (jobsTimer) clearInterval(jobsTimer);
+  jobsTimer = undefined;
+}
+
+function preprocessStatusLabel(status: string) {
+  return ({ pending: "排队中", running: "处理中", done: "已完成", failed: "失败" } as Record<string, string>)[status] || status;
+}
+
 function startStatusPolling() {
   stopStatusPolling();
   if (remoteMode.value) statusTimer = setInterval(() => void refreshNodeStatus(), 2000);
@@ -1166,6 +1256,10 @@ watch(resources, (items) => {
   for (const id of signatures.keys()) if (!activeVersions.has(id)) signatures.delete(id);
   thumbnailVersionSignatures.value = signatures;
   for (const resource of items) void loadThumbnail(resource);
+  const visibleIDs = items.filter((item) => item.available).map((item) => item.id).slice(-200);
+  if (visibleIDs.length && (!remoteMode.value || (authenticated.value && nodeOnline.value))) {
+    void prioritizePreprocessJobs(visibleIDs).then(() => refreshPreprocessJobs()).catch(() => {});
+  }
 }, { flush: "post" });
 
 watch(query, () => {
@@ -1198,6 +1292,7 @@ onMounted(async () => {
       if (session?.nodeOnline) await establishWebRTC(session.iceServers);
       await loadWorkspace();
       startStatusPolling();
+      startPreprocessPolling();
     }
   } catch (error) { showError(error); }
   finally { initialized.value = true; }
@@ -1211,6 +1306,7 @@ onBeforeUnmount(() => {
   document.removeEventListener("click", onTagEditorOutside, true);
   document.removeEventListener("click", onTagFilterOutside, true);
   stopStatusPolling();
+  stopPreprocessPolling();
   closeWebRTC();
   for (const url of thumbnailURLs.value.values()) URL.revokeObjectURL(url);
   if (debounceTimer) clearTimeout(debounceTimer);
@@ -1238,7 +1334,7 @@ onBeforeUnmount(() => {
       <div class="sidebar-section-label folder-section-title"><span>文件夹</span><span class="label-count">{{ folders.length }}</span></div>
       <nav class="folder-nav" aria-label="文件夹">
         <button v-for="folder in folders" :key="folder.id" class="nav-link" :class="{ active: activeFolderID === folder.id && !isFiltered }" @click="openFolder(folder.id)"><FolderOpen :size="16" /><span>{{ folder.name }}</span><span class="nav-count">{{ folder.count }}</span></button>
-        <button class="nav-link" :class="{ active: activeFolderID === 'unfiled' && !isFiltered }" @click="openFolder('unfiled')"><FolderOpen :size="16" /><span>未归组</span><span class="nav-count">{{ unfiledCount }}</span></button>
+        <button class="nav-link" title="未归组：尚未放入虚拟文件夹，与手动标签无关" :class="{ active: activeFolderID === 'unfiled' && !isFiltered }" @click="openFolder('unfiled')"><FolderOpen :size="16" /><span>未归组</span><span class="nav-count">{{ unfiledCount }}</span></button>
       </nav>
       <nav v-if="activeFolderID !== null" class="primary-nav" aria-label="当前文件夹">
         <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
@@ -1290,6 +1386,7 @@ onBeforeUnmount(() => {
             </span>
           </template>
           <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>
+          <button v-if="authenticated" class="button button-secondary preprocess-toggle" type="button" @click="preprocessOpen = true"><Clock3 :size="14" />后台任务 <span v-if="preprocessQueue.counts.pending + preprocessQueue.counts.running">({{ preprocessQueue.counts.pending + preprocessQueue.counts.running }})</span></button>
           <button v-if="remoteMode && authenticated" class="quiet-button signout-button" title="退出登录" @click="signOut"><LogOut :size="15" /><span>退出</span></button>
         </div>
       </header>
@@ -1366,6 +1463,7 @@ onBeforeUnmount(() => {
 
         <template v-else>
         <div class="folder-context-bar"><button class="quiet-button" @click="openFolder(null)"><House :size="14" />文件夹首页</button><span>/</span><strong>{{ folderTitle }}</strong><div v-if="activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-context-actions"><button class="quiet-button" @click="editingFolderName = folderTitle; folderEditorOpen = !folderEditorOpen"><Pencil :size="14" />重命名</button><button class="quiet-button" @click="removeFolder"><Trash2 :size="14" />删除</button></div></div>
+        <p v-if="activeFolderID === 'unfiled'" class="folder-scope-hint">尚未放入虚拟文件夹的资源会显示在这里；“待整理”指没有手动标签的资源。</p>
         <form v-if="folderEditorOpen && activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-rename-form" @submit.prevent="saveFolderName"><input v-model="editingFolderName" maxlength="80" aria-label="文件夹名称" /><button class="button button-primary" :disabled="folderBusy || !editingFolderName.trim()">保存</button><button type="button" class="button button-secondary" @click="folderEditorOpen = false">取消</button></form>
         <div v-if="visibleCollections.length" class="mobile-collections" aria-label="智能集合">
           <span>智能集合</span>
@@ -1401,11 +1499,12 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <section v-if="attributeCatalog.length" class="attribute-filter-panel" aria-label="属性标签筛选">
-          <div class="attribute-filter-heading"><strong>属性标签</strong><span>按文件当前属性生成 · 同组任选，不同组叠加</span></div>
-          <div v-if="attributeTypes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件类型</span><div class="attribute-filter-chips"><button v-for="tag in attributeTypes" :key="tag.key" type="button" class="attribute-filter-chip" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ tag.count }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
-          <div v-if="attributeSizes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件大小</span><div class="attribute-filter-chips"><button v-for="tag in attributeSizes" :key="tag.key" type="button" class="attribute-filter-chip" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ tag.count }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
-          <div v-if="attributeCatalog.some((tag) => tag.category === 'extension')" class="attribute-filter-row"><span class="attribute-filter-label">文件格式</span><div class="attribute-format-area"><input v-if="attributeCatalog.filter((tag) => tag.category === 'extension').length > 12" v-model="attributeFormatQuery" type="search" placeholder="查找格式，如 PDF" aria-label="查找文件格式" /><div class="attribute-filter-chips attribute-format-chips"><button v-for="tag in attributeFormats" :key="tag.key" type="button" class="attribute-filter-chip" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ tag.count }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button><span v-if="!attributeFormats.length" class="attribute-format-empty">没有匹配的格式</span></div></div></div>
+        <section v-if="attributeCatalog.length || attributeCatalogLoading" class="attribute-filter-panel" aria-label="属性标签筛选">
+          <div class="attribute-filter-heading"><strong>属性标签</strong><span>数字随当前筛选更新，统计本组时不计本组已选项 · 同组任选，不同组叠加</span></div>
+          <div v-if="attributeCatalogLoading && !attributeCatalog.length" class="attribute-filter-loading"><LoaderCircle class="spin" :size="14" />正在统计当前条件…</div>
+          <div v-if="attributeTypes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件类型</span><div class="attribute-filter-chips"><button v-for="tag in attributeTypes" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
+          <div v-if="attributeSizes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件大小</span><div class="attribute-filter-chips"><button v-for="tag in attributeSizes" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
+          <div v-if="attributeCatalog.some((tag) => tag.category === 'extension')" class="attribute-filter-row"><span class="attribute-filter-label">文件格式</span><div class="attribute-format-area"><input v-if="attributeCatalog.filter((tag) => tag.category === 'extension').length > 12" v-model="attributeFormatQuery" type="search" placeholder="查找格式，如 PDF" aria-label="查找文件格式" /><div class="attribute-filter-chips attribute-format-chips"><button v-for="tag in attributeFormats" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button><span v-if="!attributeFormats.length" class="attribute-format-empty">没有匹配的格式</span></div></div></div>
         </section>
 
         <div class="resource-filter-controls" aria-label="更多筛选和排序">
@@ -1470,7 +1569,7 @@ onBeforeUnmount(() => {
 
         <div v-if="selectedCount || selectingAll" class="bulk-toolbar">
           <div class="selection-summary"><span class="selection-check"><Check :size="14" /></span><strong>{{ selectingAll ? selectionProgress.loaded : selectedCount }}</strong><span>{{ selectingAll ? `/${selectionProgress.total} 项选择中` : '项已选' }}</span></div>
-          <button v-if="selectedMediaCount" class="button button-secondary thumbnail-batch-button" :disabled="generatingThumbnailBatch || !!bulkBusy || selectingAll" @click="generateSelectedThumbnails"><LoaderCircle v-if="generatingThumbnailBatch" class="spin" :size="14" /><Image v-else :size="14" />{{ generatingThumbnailBatch ? `正在生成 ${thumbnailBatchProgress.done}/${thumbnailBatchProgress.total}` : `生成缩略图（${selectedMediaCount}）` }}</button>
+          <button v-if="selectedMediaCount" class="button button-secondary thumbnail-batch-button" :disabled="generatingThumbnailBatch || !!bulkBusy || selectingAll" @click="generateSelectedThumbnails"><LoaderCircle v-if="generatingThumbnailBatch" class="spin" :size="14" /><Image v-else :size="14" />{{ generatingThumbnailBatch ? `正在排队 ${thumbnailBatchProgress.done}/${thumbnailBatchProgress.total}` : `重新排队缩略图（${selectedMediaCount}）` }}</button>
           <span class="bulk-divider"></span>
           <input v-model="bulkTagName" maxlength="40" type="text" placeholder="输入要添加的标签" :disabled="!!bulkBusy || selectingAll" @keydown.enter.prevent="applyBatchTag" />
           <button class="button button-primary" :disabled="!bulkTagName.trim() || !!bulkBusy || selectingAll" @click="applyBatchTag"><LoaderCircle v-if="bulkBusy === 'tag'" class="spin" :size="15" /><Plus v-else :size="15" />{{ bulkBusy === 'tag' ? `添加中 ${bulkProgress.done}/${bulkProgress.total}` : '批量添加标签' }}</button>
@@ -1492,18 +1591,20 @@ onBeforeUnmount(() => {
               <input type="checkbox" :checked="selectedIDs.has(resource.id)" :disabled="selectingAll || !!bulkBusy" @change="toggleSelection(resource.id)" />
               <span class="check-indicator"><Check :size="13" /></span>
             </label>
-            <div class="resource-preview" @click="openDetail(resource)">
+            <div class="resource-preview" role="button" tabindex="0" :aria-label="'预览 ' + resource.name" @click="openResourcePreview(resource)" @keydown.enter.self.prevent="openResourcePreview(resource)" @keydown.space.self.prevent="openResourcePreview(resource)">
               <img v-if="thumbnailURLs.has(resource.id) && !failedThumbnailIDs.has(resource.id)" loading="lazy" :src="thumbnailURLs.get(resource.id)" :alt="resource.name" @error="markThumbnailFailed(resource.id)" />
               <div v-if="!resource.available || !['image', 'video'].includes(resource.kind) || failedThumbnailIDs.has(resource.id) || !thumbnailURLs.has(resource.id)" class="preview-placeholder"><component :is="kindIcon(resource.kind)" :size="29" :stroke-width="1.5" /></div>
-              <button v-if="resource.available && ['image', 'video'].includes(resource.kind) && failedThumbnailIDs.has(resource.id)" class="thumbnail-generate-button" :disabled="isGeneratingThumbnail(resource.id)" @click.stop="generateThumbnail(resource.id)"><LoaderCircle v-if="isGeneratingThumbnail(resource.id)" class="spin" :size="13" />{{ isGeneratingThumbnail(resource.id) ? '正在生成' : '生成缩略图' }}</button>
+              <button v-if="resource.available && ['image', 'video'].includes(resource.kind) && failedThumbnailIDs.has(resource.id) && preprocessQueue.visible[resource.id] === 'failed'" class="thumbnail-generate-button" :disabled="isGeneratingThumbnail(resource.id)" @click.stop="generateThumbnail(resource.id)"><LoaderCircle v-if="isGeneratingThumbnail(resource.id)" class="spin" :size="13" />{{ isGeneratingThumbnail(resource.id) ? '正在排队' : '重试缩略图' }}</button>
+              <span v-else-if="resource.available && ['image', 'video'].includes(resource.kind) && !thumbnailURLs.has(resource.id) && ['pending', 'running'].includes(preprocessQueue.visible[resource.id] || '')" class="thumbnail-generate-button thumbnail-waiting">{{ preprocessStatusLabel(preprocessQueue.visible[resource.id]) }}</span>
               <span v-if="resource.available && resource.kind === 'video' && thumbnailURLs.has(resource.id) && !failedThumbnailIDs.has(resource.id)" class="video-preview-play" aria-hidden="true"><Play :size="17" fill="currentColor" /></span>
               <span class="type-pill">{{ kindLabel(resource.kind) }}</span>
               <span v-if="!resource.available" class="unavailable-pill">来源暂不可用</span>
             </div>
             <div class="resource-info">
-              <p class="resource-name" :title="resource.path">{{ resource.name }}</p>
+              <p class="resource-name" :title="resource.path"><button type="button" class="resource-name-button" @click="openResourcePreview(resource)">{{ resource.name }}</button></p>
               <div class="resource-meta"><span>{{ formatBytes(resource.size) }}</span><span class="meta-dot"></span><span>{{ formatDate(resource.modified) }}</span></div>
               <div v-if="resource.available" class="resource-file-actions">
+                <button class="resource-file-action" type="button" @click="openResourcePreview(resource)"><Image :size="13" />预览</button>
                 <button class="resource-file-action" type="button" @click="openResourceFile(resource, false)"><ExternalLink :size="13" />详情</button>
                 <button class="resource-file-action" type="button" @click="openResourceFile(resource, true)"><Download :size="13" />下载</button>
               </div>
@@ -1537,7 +1638,7 @@ onBeforeUnmount(() => {
           <button v-else-if="isFiltered" class="button button-secondary" @click="chooseAll">清除筛选</button>
         </section>
 
-        <div v-if="hasMore && !loading" class="load-more-wrap"><button class="button button-secondary" @click="pageOffset += pageSize; loadResources(true)">加载更多</button></div>
+        <div v-if="hasMore && !loading" class="load-more-wrap"><button class="button button-secondary" @click="pageOffset = resources.length; loadResources(true)">加载更多</button></div>
         <div v-if="loading && resources.length" class="loading-more"><LoaderCircle class="spin" :size="16" />正在加载…</div>
         </template>
 
@@ -1552,20 +1653,45 @@ onBeforeUnmount(() => {
       <button v-if="activeFolderID !== null && activeFolderID !== 'all'" :class="{ active: selectedTags.length > 0 }" @click="openTagFilterFromMobile"><Tag :size="17" /><span>标签{{ selectedTags.length ? ` ${selectedTags.length}` : "" }}</span></button>
     </nav>
 
-    <div v-if="previewResource" class="resource-preview-backdrop" @click.self="closeResourcePreview">
+    <div v-if="preprocessOpen" class="resource-preview-backdrop" @click.self="preprocessOpen = false">
+      <section class="preprocess-dialog" role="dialog" aria-modal="true" aria-label="后台任务">
+        <header class="resource-preview-header">
+          <div class="resource-preview-heading"><h2>后台任务</h2><p>扫描后自动处理；当前浏览的资源优先</p></div>
+          <button class="quiet-button directory-close" aria-label="关闭后台任务" @click="preprocessOpen = false"><X :size="18" /></button>
+        </header>
+        <div class="preprocess-summary">
+          <span>排队 {{ preprocessQueue.counts.pending }}</span><span>处理中 {{ preprocessQueue.counts.running }}</span><span>失败 {{ preprocessQueue.counts.failed }}</span><span>完成 {{ preprocessQueue.counts.done }}</span>
+        </div>
+        <div class="preprocess-list">
+          <div v-for="job in preprocessQueue.jobs" :key="job.resourceId + job.operation" class="preprocess-row">
+            <component :is="job.operation === 'thumbnail' ? Image : File" :size="16" /><div><strong :title="job.name">{{ job.name }}</strong><small>{{ job.operation === 'thumbnail' ? '缩略图 / 封面' : '文件指纹' }} · {{ preprocessStatusLabel(job.status) }}<span v-if="job.priority && job.status === 'pending'"> · 当前列表优先</span></small><small v-if="job.error" class="preprocess-error" :title="job.error">{{ job.error }}</small></div>
+            <button v-if="job.status === 'failed'" class="button button-secondary" @click="generateThumbnail(job.resourceId)">重试</button>
+          </div>
+          <p v-if="!preprocessQueue.jobs.length" class="directory-empty">任务队列为空</p>
+        </div>
+      </section>
+    </div>
+
+    <ImagePreview v-if="previewResource && previewMimeType.startsWith('image/') && !previewError" :key="previewResource.id" :src="fileURL(previewResource.id)" :name="previewResource.name" :position="previewPosition" :total="previewTotal" :can-previous="canPreviewPrevious" :can-next="canPreviewNext" :loading-next="previewLoadingNext" @close="closeResourcePreview" @download="startRelayDownload(previewResource)" @details="openDetail(previewResource); closeResourcePreview()" @previous="moveResourcePreview(-1)" @next="moveResourcePreview(1)" @error="previewError = '无法加载此图片。请检查文件是否仍可访问。'" />
+    <div v-else-if="previewResource" class="resource-preview-backdrop resource-browser-preview" @click.self="closeResourcePreview">
       <section class="resource-preview-dialog" role="dialog" aria-modal="true" :aria-label="'预览 ' + previewResource.name">
         <header class="resource-preview-header">
           <div class="resource-preview-heading">
             <h2>{{ previewResource.name }}</h2>
             <p>{{ formatBytes(previewResource.size) }} · {{ kindLabel(previewResource.kind) }}</p>
           </div>
+          <div class="resource-preview-navigation">
+            <button type="button" aria-label="上一个文件" :disabled="!canPreviewPrevious" @click="moveResourcePreview(-1)"><ChevronLeft :size="20" /></button>
+            <span>{{ previewPosition }} / {{ previewTotal }}</span>
+            <button type="button" aria-label="下一个文件" :disabled="!canPreviewNext || previewLoadingNext" @click="moveResourcePreview(1)"><LoaderCircle v-if="previewLoadingNext" class="spin" :size="18" /><ChevronRight v-else :size="20" /></button>
+          </div>
+          <button class="resource-preview-download" type="button" @click="openDetail(previewResource); closeResourcePreview()"><ExternalLink :size="14" />详情</button>
           <button class="resource-preview-download" type="button" @click="openResourceFile(previewResource, true)"><Download :size="14" />下载</button>
           <button class="quiet-button directory-close" aria-label="关闭预览" @click="closeResourcePreview"><X :size="18" /></button>
         </header>
         <div class="resource-preview-stage">
           <template v-if="previewMimeType && !previewError">
-            <img v-if="previewMimeType.startsWith('image/')" :src="fileURL(previewResource.id)" :alt="previewResource.name" @error="previewError = '无法加载此图片。请检查文件是否仍可访问。'" />
-            <video v-else-if="previewMimeType.startsWith('video/')" :src="fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此视频格式。你可以下载后打开。'"></video>
+            <video v-if="previewMimeType.startsWith('video/')" :src="fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此视频格式。你可以下载后打开。'"></video>
             <audio v-else-if="previewMimeType.startsWith('audio/')" :src="fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式。你可以下载后打开。'"></audio>
             <iframe v-else :src="fileURL(previewResource.id)" :title="'预览 ' + previewResource.name"></iframe>
           </template>

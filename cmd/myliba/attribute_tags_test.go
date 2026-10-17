@@ -66,6 +66,45 @@ func TestAttributeTagsAndCombinedFilters(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name, query string
+		want        map[string]int
+		absent      []string
+	}{
+		{"manual tag", "folderId=folder&tag=Red", map[string]int{"type:image": 1, "type:document": 1, "extension:jpg": 1, "extension:pdf": 1}, []string{"extension:png"}},
+		{"type facet excludes itself", "folderId=folder&tag=Red&attribute=type:image", map[string]int{"type:image": 1, "type:document": 1, "extension:jpg": 1, "size:lt1m": 1}, []string{"extension:pdf", "size:10to100m"}},
+		{"selected zero-count choices remain visible", "folderId=folder&tag=Red&attribute=type:image&attribute=extension:pdf", map[string]int{"type:image": 0, "type:document": 1, "extension:pdf": 0, "extension:jpg": 1}, []string{"size:lt1m"}},
+		{"keyword search", "folderId=folder&q=b.png", map[string]int{"type:image": 1, "extension:png": 1, "size:1to10m": 1}, []string{"extension:jpg"}},
+		{"unfiled folder", "folderId=unfiled", map[string]int{"type:image": 1, "extension:jpg": 1, "size:gte100m": 1}, []string{"extension:png"}},
+	} {
+		t.Run("attribute counts "+tc.name, func(t *testing.T) {
+			response := request(http.MethodGet, "/api/attribute-tags?"+tc.query, "")
+			var catalog []attributeTag
+			if err := json.Unmarshal(response.Body.Bytes(), &catalog); err != nil {
+				t.Fatal(err)
+			}
+			if response.Code != http.StatusOK {
+				t.Fatalf("catalog: %d %s", response.Code, response.Body.String())
+			}
+			got := map[string]int{}
+			for _, item := range catalog {
+				got[item.Key] = item.Count
+			}
+			for key, count := range tc.want {
+				if value, ok := got[key]; !ok || value != count {
+					t.Errorf("%s: got %d (present %t), want %d; catalog=%s", key, value, ok, count, response.Body.String())
+				}
+			}
+			for _, key := range tc.absent {
+				if _, ok := got[key]; ok {
+					t.Errorf("%s unexpectedly present: %s", key, response.Body.String())
+				}
+			}
+		})
+	}
+	if response := request(http.MethodGet, "/api/attribute-tags?attribute=extension:%25", ""); response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid attribute catalog filter: %d %s", response.Code, response.Body.String())
+	}
+	for _, tc := range []struct {
+		name, query string
 		want        []string
 	}{
 		{"same category OR and cross category AND", "folderId=folder&attribute=type:image&attribute=type:document&attribute=size:lt1m&attribute=size:10to100m", []string{"a", "c"}},

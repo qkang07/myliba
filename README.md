@@ -18,9 +18,19 @@ Open <http://127.0.0.1:4317>. The database is stored under the operating system'
 
 For frontend development, run the local Go service and `pnpm dev` in separate terminals. Vite serves the Vue app at <http://127.0.0.1:5173> and proxies API calls to the local Go service.
 
+### Windows portable build with video support
+
+On the build computer, get a Windows FFmpeg build that includes `ffmpeg.exe`, `ffprobe.exe`, `LICENSE`, and `README.txt`. The [Essentials build](https://www.gyan.dev/ffmpeg/builds/) is sufficient for Myliba and makes a smaller package. Then run:
+
+```powershell
+.\scripts\package-windows.ps1 -CreateZip
+```
+
+After `pnpm install --frozen-lockfile`, the script builds the web app and Go service, and writes a portable folder under `.runtime/releases/`. It places FFmpeg and FFprobe in the `ffmpeg/` folder beside `myliba.exe`, so the target computer needs no separate FFmpeg installation or `PATH` change. The script prefers an Essentials build extracted under `.runtime/ffmpeg-essentials/`; pass `-FFmpegBinDir <path>` to select another build; use `-SkipWebBuild` only when `cmd/myliba/web/dist` is already current. Keep the `ffmpeg/` folder with `myliba.exe` when copying the build. The included FFmpeg license and build information are in `ffmpeg/LICENSE` and `ffmpeg/README.txt`; review the [FFmpeg distribution guidance](https://ffmpeg.org/legal.html) before publishing a package.
+
 ## Remote web access
 
-The same executable runs in two modes. The home node keeps its local HTTP service bound to `127.0.0.1:4317`; it maintains an outbound WebSocket connection to the hub for signaling and fallback relay. After login, the browser negotiates a WebRTC DataChannel with the home node. API requests and resource data use that direct encrypted channel when available; requests fall back to the existing hub relay when the channel is unavailable. The hub serves the app, authenticates the browser, and relays signaling and fallback traffic.
+The same executable runs in two modes. The VPS Hub does not access original files or use FFmpeg; only the home node needs the bundled media tools. The home node keeps its local HTTP service bound to `127.0.0.1:4317`; it maintains an outbound WebSocket connection to the hub for signaling and fallback relay. After login, the browser negotiates a WebRTC DataChannel with the home node. API requests and resource data use that direct encrypted channel when available; requests fall back to the existing hub relay when the channel is unavailable. The hub serves the app, authenticates the browser, and relays signaling and fallback traffic.
 
 ### 1. Build on the VPS
 
@@ -46,15 +56,7 @@ export MYLIBA_HUB_LISTEN=127.0.0.1:4318
 ./myliba
 ```
 
-`MYLIBA_WEB_PASSWORD` must contain at least 16 characters. `MYLIBA_NODE_TOKEN` must contain at least 32 characters and must match on the home node. The hub listens on loopback by default; place it behind a TLS reverse proxy. Example Caddy config (`deploy/Caddyfile.example`):
-
-```caddy
-library.example.com {
-    reverse_proxy 127.0.0.1:4318
-}
-```
-
-Caddy terminates HTTPS and proxies WebSocket upgrades automatically. Keep port 4318 private; expose only the HTTPS reverse proxy.
+`MYLIBA_WEB_PASSWORD` must contain at least 16 characters. `MYLIBA_NODE_TOKEN` must contain at least 32 characters and must match on the home node. The hub listens on loopback by default; place it behind the existing HTTPS gateway. Proxy `/`, `/api/`, `/node`, and `/signal` to the Hub address without rewriting paths. Preserve the `Host` header and WebSocket upgrades on `/node` and `/signal`, allow long-lived WebSocket connections, and avoid caching login and API responses. Keep the Hub port private and match `MYLIBA_HUB_LISTEN` to the address and port used by the gateway.
 
 ### 3. Connect the home node
 
@@ -81,15 +83,15 @@ The hub and home node use the same optional `MYLIBA_ICE_SERVERS` JSON array. Wit
 - Add and scan local folders without moving source files.
 - Keep a stable local resource ID across same-volume file moves where the filesystem exposes a stable file ID.
 - Track local versions when size or modification time changes.
-- Search names, paths, and manual tags with SQLite FTS5 plus substring matching. Filter by derived file attribute tags for type, extension, and size range; values within one attribute category are alternatives, while categories and manual tags combine.
-- Group indexed resources in virtual top-level folders without moving source files. Existing and newly indexed resources start in “Unfiled”; create, rename, delete, and move resources between folders from the web app. Each folder shows only its own tags, and tags support multiple selection.
+- Search names, paths, and manual tags with SQLite FTS5 plus substring matching. Filter by derived file attribute tags for type, extension, and size range; values within one attribute category are alternatives, while categories and manual tags combine. Attribute counts follow the current folder, search, manual tags, and other attribute groups; each group ignores its own selected options when counting alternatives.
+- Group indexed resources in virtual top-level folders without moving source files. Existing and newly indexed resources start in “Unfiled” (no virtual folder, distinct from “Unorganized” resources without manual tags); create, rename, delete, and move resources between folders from the web app. Each folder shows only its own tags, and tags support multiple selection.
 - Add tags one at a time or in batches, and use the unorganized queue to find resources without tags.
 - Select all resources matching the current folder, search, and tag filters across every result page, then add a tag, move them to a virtual folder, or generate media thumbnails in batches.
 - Save smart collections from a search and filters (multiple tags, virtual folder, file type, indexed folder, unorganized state, and sort order). Collections are stored on the home node and update as its index and tags change; the same collections appear through local and remote web access.
 - Open a resource detail page from its card or a direct `?resource=<id>` link. The page shows file metadata, a type-specific preview, original-file download, and add/remove/suggested tags; it also works through the remote hub.
 - Generate and cache image thumbnails in small (240 × 160), medium (480 × 320), and large (1280 × 960) sizes from the detail page. The resource list still uses the medium thumbnail and does not generate thumbnails merely by loading the list.
-- For videos, the detail page divides the duration into six segments and can extract a screenshot at each segment midpoint. The screenshots are cached on the home node. FFmpeg and FFprobe on the node's `PATH` support extraction and duration detection; browsers that can read the video can also supply the duration.
+- For videos, the detail page divides the duration into six segments and can extract a screenshot at each segment midpoint. The screenshots are cached on the home node. The Windows portable build includes FFmpeg and FFprobe; development runs can use tools on the node's `PATH`. Browsers that can read the video can also supply the duration.
 - Serve the responsive app remotely through a password-protected hub and an outbound node connection.
 - Prefer direct browser-to-node WebRTC transfers for remote downloads and non-video file opening, with hub relay fallback.
 
-Video thumbnails and segment screenshots require FFmpeg on the home node. Users can generate thumbnails individually or select several resources for a controlled two-at-a-time batch. Without FFmpeg, JPEG, PNG, and GIF images still get thumbnails using Go standard image decoders. Generated JPEG thumbnails are cached under the Myliba config directory and refreshed when file size or modification time changes. Transcodes, cross-device metadata sync, individual device pairing and revocation, conflict resolution, and offline remote access remain future work. Current version change detection uses file size and modification time; BLAKE3 content verification is planned before remote transfer and deduplication.
+Video thumbnails and segment screenshots use the bundled FFmpeg in Windows portable builds, or FFmpeg on the home node for other builds. Users can generate thumbnails individually or select several resources for a controlled two-at-a-time batch. Without FFmpeg, JPEG, PNG, and GIF images still get thumbnails using Go standard image decoders. Generated JPEG thumbnails are cached under the Myliba config directory and refreshed when file size or modification time changes. Transcodes, cross-device metadata sync, individual device pairing and revocation, conflict resolution, and offline remote access remain future work. Current version change detection uses file size and modification time; BLAKE3 content verification is planned before remote transfer and deduplication.

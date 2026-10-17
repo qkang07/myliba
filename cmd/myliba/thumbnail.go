@@ -67,12 +67,7 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	version := fmt.Sprintf("%s\x00%d\x00%d", r.PathValue("id"), info.Size(), info.ModTime().UnixNano())
-	if width != thumbnailWidth || at != 0 {
-		version += fmt.Sprintf("\x00%d\x00%.3f", width, at)
-	}
-	digest := sha256.Sum256([]byte(version))
-	etag := `"` + hex.EncodeToString(digest[:]) + `"`
+	cachePath, etag := s.thumbnailCachePath(r.PathValue("id"), info, width, at)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	w.Header().Set("Content-Type", "image/jpeg")
@@ -80,7 +75,6 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	cachePath := filepath.Join(s.thumbnailDir, hex.EncodeToString(digest[:])+".jpg")
 	if _, err := os.Stat(cachePath); err == nil {
 		if r.Method == http.MethodPost {
 			w.WriteHeader(http.StatusNoContent)
@@ -94,20 +88,7 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "缩略图尚未生成")
 		return
 	}
-	lock := s.thumbnailLock(r.PathValue("id"))
-	lock.Lock()
-	defer lock.Unlock()
-	if _, err := os.Stat(cachePath); err == nil {
-		if r.Method == http.MethodPost {
-			w.WriteHeader(http.StatusNoContent)
-		} else {
-			http.ServeFile(w, r, cachePath)
-		}
-		return
-	}
-
-	content, err := s.generateThumbnail(r.Context(), sourcePath, kind, width, height, at)
-	if err != nil {
+	if err := s.ensureThumbnail(r.Context(), r.PathValue("id"), sourcePath, kind, info, width, height, at); err != nil {
 		log.Printf("thumbnail generation failed for %s: %v", filepath.Base(sourcePath), err)
 		if kind == "video" && s.ffmpegPath == "" {
 			writeError(w, http.StatusNotImplemented, "提取视频首帧需要安装 FFmpeg 并将其加入 PATH")
@@ -116,27 +97,45 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) thumbnailCachePath(id string, info os.FileInfo, width int, at float64) (string, string) {
+	version := fmt.Sprintf("%s\x00%d\x00%d", id, info.Size(), info.ModTime().UnixNano())
+	if width != thumbnailWidth || at != 0 {
+		version += fmt.Sprintf("\x00%d\x00%.3f", width, at)
+	}
+	digest := sha256.Sum256([]byte(version))
+	hexDigest := hex.EncodeToString(digest[:])
+	return filepath.Join(s.thumbnailDir, hexDigest+".jpg"), fmt.Sprintf("%q", hexDigest)
+}
+
+func (s *server) ensureThumbnail(ctx context.Context, id, sourcePath, kind string, info os.FileInfo, width, height int, at float64) error {
+	cachePath, _ := s.thumbnailCachePath(id, info, width, at)
+	lock := s.thumbnailLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	if _, err := os.Stat(cachePath); err == nil {
+		return nil
+	}
+	content, err := s.generateThumbnail(ctx, sourcePath, kind, width, height, at)
+	if err != nil {
+		return err
+	}
 	temp, err := os.CreateTemp(s.thumbnailDir, "thumbnail-*.tmp")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "无法保存缩略图")
-		return
+		return err
 	}
 	tempName := temp.Name()
 	defer os.Remove(tempName)
 	if _, err := temp.Write(content); err != nil {
 		_ = temp.Close()
-		writeError(w, http.StatusInternalServerError, "无法保存缩略图")
-		return
+		return err
 	}
 	if err := temp.Close(); err != nil {
-		writeError(w, http.StatusInternalServerError, "无法保存缩略图")
-		return
+		return err
 	}
-	if err := os.Rename(tempName, cachePath); err != nil {
-		writeError(w, http.StatusInternalServerError, "无法保存缩略图")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	return os.Rename(tempName, cachePath)
 }
 
 func (s *server) thumbnailLock(id string) *sync.Mutex {

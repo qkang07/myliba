@@ -159,35 +159,62 @@ func attributeFilterSQL(keys []string) ([]string, []any) {
 }
 
 func (s *server) attributeTags(w http.ResponseWriter, r *http.Request) {
-	clause, args := folderScopeSQL(r.URL.Query().Get("folderId"), "r")
-	if clause == "" {
-		clause = "1=1"
-	}
-	rows, err := s.db.Query("SELECT r.name,r.kind,r.size FROM resources r WHERE "+clause, args...)
+	selectedKeys, err := normalizeAttributeKeys(r.URL.Query()["attribute"])
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "无法读取属性标签")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	counts := map[string]attributeTag{}
-	for rows.Next() {
-		var name, kind string
-		var size int64
-		if err := rows.Scan(&name, &kind, &size); err != nil {
+	for _, category := range []string{"type", "size", "extension"} {
+		where, args, err := resourceWhereWithoutAttributeCategory(r, category)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		rows, err := s.db.Query("SELECT r.name,r.kind,r.size FROM resources r WHERE "+strings.Join(where, " AND "), args...)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "无法读取属性标签")
+			return
+		}
+		for rows.Next() {
+			var name, kind string
+			var size int64
+			if err := rows.Scan(&name, &kind, &size); err != nil {
+				rows.Close()
+				writeError(w, http.StatusInternalServerError, "无法读取属性标签")
+				return
+			}
+			for _, tag := range resourceAttributeTags(name, kind, size) {
+				if tag.Category != category {
+					continue
+				}
+				tag.Count = counts[tag.Key].Count + 1
+				counts[tag.Key] = tag
+			}
+		}
+		if err := rows.Err(); err != nil {
 			rows.Close()
 			writeError(w, http.StatusInternalServerError, "无法读取属性标签")
 			return
 		}
-		for _, tag := range resourceAttributeTags(name, kind, size) {
-			tag.Count = counts[tag.Key].Count + 1
-			counts[tag.Key] = tag
-		}
-	}
-	if err := rows.Err(); err != nil {
 		rows.Close()
-		writeError(w, http.StatusInternalServerError, "无法读取属性标签")
-		return
 	}
-	rows.Close()
+	for _, key := range selectedKeys {
+		if _, exists := counts[key]; exists {
+			continue
+		}
+		category, value, _ := strings.Cut(key, ":")
+		label := ""
+		switch category {
+		case "type":
+			label = kindLabels[value]
+		case "size":
+			label = sizeLabels[value]
+		case "extension":
+			label = strings.ToUpper(value)
+		}
+		counts[key] = attributeTag{Key: key, Category: category, Label: label}
+	}
 	items := []attributeTag{}
 	for _, kind := range kindOrder {
 		if item, ok := counts["type:"+kind]; ok {

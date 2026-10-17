@@ -23,6 +23,8 @@ import android.widget.VideoView;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -38,12 +40,17 @@ public final class PreviewActivity extends Activity {
     private Bitmap currentBitmap;
     private int pdfPage;
     private boolean closing;
+    private MobileUi ui;
+    private boolean remote;
+    private File remoteCache;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        ui = new MobileUi(this);
         String value = getIntent().getStringExtra("uri");
         if (value == null) { finish(); return; }
         fileUri = Uri.parse(value);
+        remote = getIntent().hasExtra("server");
         mime = getIntent().getStringExtra("mime");
         if (mime == null) mime = "application/octet-stream";
         String name = getIntent().getStringExtra("name");
@@ -51,7 +58,10 @@ public final class PreviewActivity extends Activity {
 
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setBackgroundColor(Color.rgb(250, 251, 253));
+        layout.setBackgroundColor(MobileUi.BG);
+        getWindow().setStatusBarColor(MobileUi.BG);
+        getWindow().setNavigationBarColor(MobileUi.PAPER);
+        getWindow().getDecorView().setSystemUiVisibility(android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         setContentView(layout);
         if (Build.VERSION.SDK_INT >= 35) {
             getWindow().setDecorFitsSystemWindows(false);
@@ -63,27 +73,52 @@ public final class PreviewActivity extends Activity {
         }
         LinearLayout toolbar = new LinearLayout(this);
         toolbar.setGravity(Gravity.CENTER_VERTICAL);
-        toolbar.setPadding(dp(8), dp(4), dp(8), dp(4));
+        toolbar.setPadding(dp(8), dp(10), dp(8), dp(10));
         toolbar.setBackgroundColor(Color.WHITE);
-        toolbar.addView(button("返回", this::finish));
-        TextView title = new TextView(this);
-        title.setText(name);
-        title.setTextSize(17);
+        toolbar.addView(ui.iconButton("back", "返回文件详情", this::finish));
+        TextView title = ui.text(name, 16, MobileUi.INK, true);
+        title.setPadding(dp(8), 0, dp(8), 0);
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         toolbar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        toolbar.addView(button("其他应用", this::openExternal));
+        if (!remote) toolbar.addView(ui.iconButton("link", "用其他应用打开", this::openExternal));
         layout.addView(toolbar);
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         layout.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
         showMessage("正在打开…");
 
+        if (remote) loadRemote();
+        else openPreview();
+    }
+
+    private void openPreview() {
         if (mime.startsWith("image/")) loadImage();
         else if (mime.equals("application/pdf")) loadPdf();
         else if (mime.startsWith("text/") || mime.equals("application/json") || mime.endsWith("+xml")) loadText();
         else if (mime.startsWith("video/")) showVideo();
-        else showMessage("此格式没有内置预览，可用其他应用打开。");
+        else showMessage(remote ? "此格式没有内置预览，请返回详情下载原文件。" : "此格式没有内置预览，可用其他应用打开。");
+    }
+
+    private void loadRemote() {
+        RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE));
+        if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+            showVideo();
+            return;
+        }
+        if (!(mime.startsWith("image/") || mime.equals("application/pdf") || mime.startsWith("text/") || mime.equals("application/json") || mime.endsWith("+xml"))) {
+            showMessage("此格式没有内置预览，请返回详情下载原文件。");
+            return;
+        }
+        showMessage("正在读取原文件…");
+        worker.execute(() -> {
+            try {
+                byte[] data = client.bytes("GET", "/api/resources/" + RemoteClient.enc(getIntent().getStringExtra("resource")) + "/file", null, 24 * 1024 * 1024);
+                remoteCache = File.createTempFile("preview-", ".bin", getCacheDir());
+                try (FileOutputStream out = new FileOutputStream(remoteCache)) { out.write(data); }
+                runOnUiThread(() -> { if (!closing) { fileUri = Uri.fromFile(remoteCache); openPreview(); } });
+            } catch (Exception error) { fail(error); }
+        });
     }
 
     private void loadImage() {
@@ -110,10 +145,9 @@ public final class PreviewActivity extends Activity {
                 runOnUiThread(() -> {
                     if (closing) { bitmap.recycle(); return; }
                     clearContent();
-                    ImageView image = new ImageView(this);
+                    ImageView image = new ZoomImageView(this);
                     image.setImageBitmap(bitmap);
                     currentBitmap = bitmap;
-                    image.setScaleType(ImageView.ScaleType.FIT_CENTER);
                     content.addView(image, new LinearLayout.LayoutParams(-1, -1));
                 });
             } catch (Exception error) { fail(error); }
@@ -206,7 +240,12 @@ public final class PreviewActivity extends Activity {
         MediaController controls = new MediaController(this);
         controls.setAnchorView(video);
         video.setMediaController(controls);
-        video.setVideoURI(fileUri);
+        if (remote) {
+            RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE));
+            java.util.Map<String, String> headers = new java.util.HashMap<>();
+            headers.put("Cookie", client.cookie());
+            video.setVideoURI(fileUri, headers);
+        } else video.setVideoURI(fileUri);
         content.addView(video, new LinearLayout.LayoutParams(-1, -1));
         video.setOnErrorListener((player, what, extra) -> { showMessage("视频无法播放，可用其他应用打开。"); return true; });
         video.start();
@@ -243,6 +282,10 @@ public final class PreviewActivity extends Activity {
         Button button = new Button(this);
         button.setText(title);
         button.setAllCaps(false);
+        button.setTextColor(MobileUi.GREEN);
+        button.setTextSize(12);
+        button.setBackground(ui.shape(MobileUi.SOFT, 12, 0));
+        button.setPadding(dp(16), dp(8), dp(16), dp(8));
         button.setOnClickListener(view -> action.run());
         return button;
     }
@@ -256,6 +299,7 @@ public final class PreviewActivity extends Activity {
         worker.execute(() -> {
             if (pdf != null) pdf.close();
             if (pdfFile != null) try { pdfFile.close(); } catch (IOException ignored) {}
+            if (remoteCache != null) remoteCache.delete();
         });
         worker.shutdown();
         super.onDestroy();

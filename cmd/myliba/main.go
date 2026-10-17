@@ -34,6 +34,8 @@ type server struct {
 	ffprobePath    string
 	thumbnailMu    sync.Mutex
 	thumbnailLocks map[string]*sync.Mutex
+	jobsWake       chan struct{}
+	jobsStop       chan struct{}
 }
 
 type resource struct {
@@ -81,9 +83,12 @@ func main() {
 	if err := os.MkdirAll(thumbnailDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
-	ffmpegPath, _ := exec.LookPath("ffmpeg")
-	ffprobePath, _ := exec.LookPath("ffprobe")
-	app := &server{db: db, thumbnailDir: thumbnailDir, ffmpegPath: ffmpegPath, ffprobePath: ffprobePath, thumbnailLocks: map[string]*sync.Mutex{}}
+	ffmpegPath := mediaToolPath("ffmpeg")
+	ffprobePath := mediaToolPath("ffprobe")
+	app := &server{db: db, thumbnailDir: thumbnailDir, ffmpegPath: ffmpegPath, ffprobePath: ffprobePath, thumbnailLocks: map[string]*sync.Mutex{}, jobsWake: make(chan struct{}, 1)}
+	if err := app.startPreprocessing(); err != nil {
+		log.Fatal(err)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/session", localSession)
@@ -101,6 +106,9 @@ func main() {
 	mux.HandleFunc("GET /api/resources/{id}/file", app.serveFile)
 	mux.HandleFunc("GET /api/resources/{id}/thumbnail", app.serveThumbnail)
 	mux.HandleFunc("POST /api/resources/{id}/thumbnail", app.serveThumbnail)
+	mux.HandleFunc("GET /api/preprocess", app.listPreprocessJobs)
+	mux.HandleFunc("POST /api/preprocess/prioritize", app.prioritizePreprocessJobs)
+	mux.HandleFunc("POST /api/preprocess/{id}/retry", app.retryPreprocessJob)
 	mux.HandleFunc("POST /api/resources/{id}/tags", app.addTag)
 	mux.HandleFunc("DELETE /api/resources/{id}/tags/{tagID}", app.removeTag)
 	mux.HandleFunc("GET /api/tags", app.tags)
@@ -206,6 +214,19 @@ CREATE INDEX IF NOT EXISTS resources_file_id_idx ON resources(file_id);
 CREATE INDEX IF NOT EXISTS versions_resource_idx ON versions(resource_id, discovered_at);
 CREATE INDEX IF NOT EXISTS resource_tags_tag_idx ON resource_tags(tag_id);
 CREATE INDEX IF NOT EXISTS resource_folders_folder_idx ON resource_folders(folder_id);
+CREATE TABLE IF NOT EXISTS preprocess_jobs (
+    resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    operation TEXT NOT NULL,
+    version_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    priority_at INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(resource_id, operation)
+);
+CREATE INDEX IF NOT EXISTS preprocess_jobs_queue_idx ON preprocess_jobs(status, priority DESC, priority_at DESC, created_at);
 `)
 	return err
 }
@@ -347,6 +368,9 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
+		if err := s.enqueuePreprocessing(id, kind, info); err != nil {
+			return err
+		}
 		count++
 		return nil
 	})
@@ -372,6 +396,7 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 		rows.Close()
 		for _, id := range missing {
 			_, _ = s.db.Exec(`UPDATE resources SET available=0 WHERE id=?`, id)
+			_, _ = s.db.Exec(`DELETE FROM preprocess_jobs WHERE resource_id=? AND status IN ('pending','running')`, id)
 		}
 	}
 	_, err = s.db.Exec(`UPDATE roots SET last_scan_at=? WHERE id=?`, now(), rootID)
@@ -383,6 +408,10 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func resourceWhere(r *http.Request) ([]string, []any, error) {
+	return resourceWhereWithoutAttributeCategory(r, "")
+}
+
+func resourceWhereWithoutAttributeCategory(r *http.Request, excludedCategory string) ([]string, []any, error) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	tags := r.URL.Query()["tag"]
 	attributes, err := normalizeAttributeKeys(r.URL.Query()["attribute"])
@@ -414,9 +443,19 @@ func resourceWhere(r *http.Request) ([]string, []any, error) {
 	if unorganized {
 		where = append(where, `NOT EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.resource_id=r.id)`)
 	}
-	if kind != "" {
+	if kind != "" && excludedCategory != "type" {
 		where = append(where, `r.kind=?`)
 		args = append(args, kind)
+	}
+	if excludedCategory != "" {
+		filtered := attributes[:0]
+		for _, key := range attributes {
+			category, _, _ := strings.Cut(key, ":")
+			if category != excludedCategory {
+				filtered = append(filtered, key)
+			}
+		}
+		attributes = filtered
 	}
 	attributeClauses, attributeArgs := attributeFilterSQL(attributes)
 	where = append(where, attributeClauses...)

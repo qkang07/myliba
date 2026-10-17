@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import { ArrowLeft, Check, CircleAlert, Download, Expand, File, FileText, Image, LoaderCircle, Minimize, Minus, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { ArrowLeft, Check, CircleAlert, Download, Expand, File, FileText, Image, LoaderCircle, Minimize, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
+import ImagePreview from "./ImagePreview.vue";
 import {
   addResourceTag, createThumbnailVariant, fileURL, getResource, getResourceThumbnailVariant,
   getTagSuggestions, getTags, getVideoInfo, moveResourcesToFolder, removeResourceTag,
@@ -25,10 +26,8 @@ const durationError = ref("");
 const images = ref(new Map<string, string>());
 const busy = ref(new Set<string>());
 const captureBusy = ref(false);
-const previewZoom = ref(100);
-const previewViewport = ref<HTMLElement | null>(null);
+const imageViewerOpen = ref(false);
 const expandedPreview = ref(false);
-let wheelDelta = 0;
 let generation = 0;
 
 const mimeType = computed(() => {
@@ -119,9 +118,8 @@ async function generateAllCaptures() {
   } finally { captureBusy.value = false; }
 }
 async function refreshResource() {
+  closeImageViewer();
   closeExpandedPreview();
-  previewZoom.value = 100;
-  wheelDelta = 0;
   const current = ++generation;
   loading.value = true;
   error.value = "";
@@ -222,40 +220,13 @@ function download() {
   link.click();
   link.remove();
 }
-function zoomPreview(change: number) {
-  previewZoom.value = Math.max(100, Math.min(400, previewZoom.value + change));
-  wheelDelta = 0;
+function openImageViewer() {
+  if (!resource.value?.available || !mimeType.value.startsWith("image/") || previewError.value) return;
+  closeExpandedPreview();
+  imageViewerOpen.value = true;
 }
-function resetPreviewZoom() {
-  previewZoom.value = 100;
-  wheelDelta = 0;
-}
-function onPreviewWheel(event: WheelEvent) {
-  const viewport = previewViewport.value;
-  if (!viewport || !resource.value?.available || !mimeType.value.startsWith("image/") || previewError.value || event.ctrlKey || event.metaKey) return;
-  const image = viewport.querySelector("img");
-  if (!image) return;
-  const pixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1);
-  const rect = image.getBoundingClientRect();
-  if (!pixels || !rect.width || !rect.height) return;
-  if ((pixels > 0 && previewZoom.value <= 100) || (pixels < 0 && previewZoom.value >= 400)) {
-    wheelDelta = 0;
-    return;
-  }
-  event.preventDefault();
-  wheelDelta = Math.sign(wheelDelta) === Math.sign(pixels) ? wheelDelta + pixels : pixels;
-  if (Math.abs(wheelDelta) < 50) return;
-  const change = wheelDelta < 0 ? 25 : -25;
-  wheelDelta = 0;
-  const anchorX = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-  const anchorY = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
-  previewZoom.value = Math.max(100, Math.min(400, previewZoom.value + change));
-  void nextTick(() => {
-    if (previewViewport.value !== viewport || !image.isConnected) return;
-    const nextRect = image.getBoundingClientRect();
-    viewport.scrollLeft += nextRect.left + nextRect.width * anchorX - event.clientX;
-    viewport.scrollTop += nextRect.top + nextRect.height * anchorY - event.clientY;
-  });
+function closeImageViewer() {
+  imageViewerOpen.value = false;
 }
 function closeExpandedPreview() {
   expandedPreview.value = false;
@@ -273,6 +244,7 @@ watch(() => props.id, () => void refreshResource(), { immediate: true });
 onBeforeUnmount(() => {
   generation++;
   clearImages();
+  closeImageViewer();
   closeExpandedPreview();
   document.removeEventListener("keydown", onPreviewKeydown);
 });
@@ -293,10 +265,10 @@ onBeforeUnmount(() => {
       <div class="detail-layout">
         <div class="detail-main">
           <section class="detail-panel detail-preview-panel" :class="{ 'is-preview-expanded': expandedPreview }">
-            <div class="detail-panel-heading detail-preview-heading"><h2>文件预览</h2><div class="detail-preview-tools"><span>{{ mimeType || "无法在网页中预览" }}</span><div v-if="resource.available && mimeType.startsWith('image/') && !previewError" class="detail-zoom-tools"><button aria-label="缩小图片" title="缩小图片" :disabled="previewZoom <= 100" @click="zoomPreview(-25)"><Minus :size="14" /></button><button class="detail-zoom-value" aria-label="重置图片缩放" title="重置图片缩放" @click="resetPreviewZoom">{{ previewZoom }}%</button><button aria-label="放大图片" title="放大图片" :disabled="previewZoom >= 400" @click="zoomPreview(25)"><Plus :size="14" /></button></div><button v-if="resource.available && mimeType && !previewError" class="detail-fullscreen-button" :aria-label="expandedPreview ? '退出窗口预览' : '铺满窗口预览'" @click="toggleExpandedPreview"><Minimize v-if="expandedPreview" :size="14" /><Expand v-else :size="14" />{{ expandedPreview ? '退出窗口预览' : '铺满窗口' }}</button></div></div>
-            <div ref="previewViewport" class="detail-preview" :class="{ 'is-zoomed': mimeType.startsWith('image/') && previewZoom > 100 }" :style="{ '--preview-zoom': `${previewZoom}%` }" @wheel="onPreviewWheel">
+            <div class="detail-panel-heading detail-preview-heading"><h2>文件预览</h2><div class="detail-preview-tools"><span>{{ mimeType || "无法在网页中预览" }}</span><button v-if="resource.available && mimeType.startsWith('image/') && !previewError" class="detail-fullscreen-button" aria-label="查看大图" @click="openImageViewer"><Expand :size="14" />查看大图</button><button v-else-if="resource.available && mimeType && !previewError" class="detail-fullscreen-button" :aria-label="expandedPreview ? '退出窗口预览' : '铺满窗口预览'" @click="toggleExpandedPreview"><Minimize v-if="expandedPreview" :size="14" /><Expand v-else :size="14" />{{ expandedPreview ? '退出窗口预览' : '铺满窗口' }}</button></div></div>
+            <div class="detail-preview">
               <template v-if="resource.available && mimeType && !previewError">
-                <img v-if="mimeType.startsWith('image/')" :src="fileURL(resource.id)" :alt="resource.name" title="滚动鼠标滚轮缩放图片" @error="previewError = '图片无法加载'" />
+                <button v-if="mimeType.startsWith('image/')" type="button" class="detail-image-trigger" :aria-label="'预览图片 ' + resource.name" @click="openImageViewer"><img :src="fileURL(resource.id)" :alt="resource.name" @error="previewError = '图片无法加载'" /><span class="detail-image-trigger-hint"><Expand :size="14" />点击查看大图</span></button>
                 <video v-else-if="mimeType.startsWith('video/')" :src="fileURL(resource.id)" controls preload="metadata" @loadedmetadata="onVideoMetadata" @error="previewError = '浏览器无法播放此视频格式'"></video>
                 <audio v-else-if="mimeType.startsWith('audio/')" :src="fileURL(resource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式'"></audio>
                 <iframe v-else sandbox="" :src="fileURL(resource.id)" :title="'预览 ' + resource.name"></iframe>
@@ -348,5 +320,6 @@ onBeforeUnmount(() => {
         </aside>
       </div>
     </template>
+    <ImagePreview v-if="imageViewerOpen && resource" :src="fileURL(resource.id)" :name="resource.name" @close="closeImageViewer" @download="download" />
   </section>
 </template>

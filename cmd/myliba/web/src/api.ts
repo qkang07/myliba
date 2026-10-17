@@ -211,8 +211,8 @@ export function getTags(folderId = "all") {
   return request<TagSummary[]>("/api/tags?folderId=" + encodeURIComponent(folderId));
 }
 
-export function getAttributeTags(folderId: string) {
-  return request<AttributeTag[]>("/api/attribute-tags?folderId=" + encodeURIComponent(folderId));
+export function getAttributeTags(filters: CollectionFilters) {
+  return request<AttributeTag[]>(`/api/attribute-tags?${resourceSearchParams({ ...filters, limit: 1, offset: 0 })}`);
 }
 
 export function getFolders() {
@@ -318,4 +318,33 @@ export function createThumbnailVariant(id: string, size: "small" | "medium" | "l
   const search = new URLSearchParams({ size });
   if (at > 0) search.set("at", at.toFixed(3));
   return request<void>(`/api/resources/${encodeURIComponent(id)}/thumbnail?${search}`, { method: "POST" });
+}
+
+export interface PreprocessJob {
+  resourceId: string;
+  name: string;
+  operation: string;
+  status: "pending" | "running" | "done" | "failed";
+  priority: number;
+  updatedAt: string;
+  error: string;
+}
+
+export interface PreprocessQueue {
+  counts: Record<"pending" | "running" | "done" | "failed", number>;
+  jobs: PreprocessJob[];
+  visible: Record<string, PreprocessJob["status"]>;
+}
+
+export function getPreprocessQueue(ids: string[] = []) {
+  const search = ids.length ? "?ids=" + encodeURIComponent(ids.join(",")) : "";
+  return request<PreprocessQueue>("/api/preprocess" + search);
+}
+
+export function prioritizePreprocessJobs(ids: string[]) {
+  return request<void>("/api/preprocess/prioritize", { method: "POST", body: JSON.stringify({ ids }) });
+}
+
+export function retryPreprocessJob(id: string) {
+  return request<void>(`/api/preprocess/${encodeURIComponent(id)}/retry`, { method: "POST" });
 }
