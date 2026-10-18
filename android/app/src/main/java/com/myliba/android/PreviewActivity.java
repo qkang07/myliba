@@ -19,6 +19,8 @@ import android.widget.MediaController;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.VideoView;
+import android.view.View;
+import java.util.ArrayList;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -43,6 +45,10 @@ public final class PreviewActivity extends Activity {
     private MobileUi ui;
     private boolean remote;
     private File remoteCache;
+    private LinearLayout toolbar, browserNav;
+    private ArrayList<String> browseIds, browseNames, browseMimes;
+    private int browseIndex;
+    private boolean imageControlsVisible = true;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -55,15 +61,17 @@ public final class PreviewActivity extends Activity {
         if (mime == null) mime = "application/octet-stream";
         String name = getIntent().getStringExtra("name");
         if (name == null) name = "文件预览";
+        browseIds=getIntent().getStringArrayListExtra("browse_ids");browseNames=getIntent().getStringArrayListExtra("browse_names");browseMimes=getIntent().getStringArrayListExtra("browse_mimes");browseIndex=getIntent().getIntExtra("browse_index",-1);
+        boolean media=mime.startsWith("image/")||mime.startsWith("video/");
 
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setBackgroundColor(MobileUi.BG);
-        getWindow().setStatusBarColor(MobileUi.BG);
-        getWindow().setNavigationBarColor(MobileUi.PAPER);
-        getWindow().getDecorView().setSystemUiVisibility(android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        layout.setBackgroundColor(media?Color.BLACK:MobileUi.BG);
+        getWindow().setStatusBarColor(media?Color.BLACK:MobileUi.BG);
+        getWindow().setNavigationBarColor(media?Color.BLACK:MobileUi.PAPER);
+        getWindow().getDecorView().setSystemUiVisibility(media?View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY:View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR|View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         setContentView(layout);
-        if (Build.VERSION.SDK_INT >= 35) {
+        if (Build.VERSION.SDK_INT >= 35 && !media) {
             getWindow().setDecorFitsSystemWindows(false);
             layout.setOnApplyWindowInsetsListener((view, insets) -> {
                 android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
@@ -71,21 +79,29 @@ public final class PreviewActivity extends Activity {
                 return insets;
             });
         }
-        LinearLayout toolbar = new LinearLayout(this);
+        toolbar = new LinearLayout(this);
         toolbar.setGravity(Gravity.CENTER_VERTICAL);
         toolbar.setPadding(dp(8), dp(10), dp(8), dp(10));
-        toolbar.setBackgroundColor(Color.WHITE);
-        toolbar.addView(ui.iconButton("back", "返回文件详情", this::finish));
-        TextView title = ui.text(name, 16, MobileUi.INK, true);
+        toolbar.setBackgroundColor(media?0xff171b19:Color.WHITE);
+        ImageView back=ui.iconButton("back", "关闭预览", this::finish);
+        if(media)back.setImageDrawable(new MobileUi.Icon("back",Color.WHITE));
+        toolbar.addView(back);
+        TextView title = ui.text(name, 16, media?Color.WHITE:MobileUi.INK, true);
         title.setPadding(dp(8), 0, dp(8), 0);
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         toolbar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        if (!remote) toolbar.addView(ui.iconButton("link", "用其他应用打开", this::openExternal));
+        if (!remote){ImageView external=ui.iconButton("link", "用其他应用打开", this::openExternal);if(media)external.setImageDrawable(new MobileUi.Icon("link",Color.WHITE));toolbar.addView(external);}
         layout.addView(toolbar);
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         layout.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
+        if(media && browseIds!=null && browseNames!=null && browseMimes!=null && browseIds.size()==browseNames.size() && browseIds.size()==browseMimes.size() && browseIndex>=0 && browseIndex<browseIds.size()){
+            browserNav=new LinearLayout(this);browserNav.setGravity(Gravity.CENTER_VERTICAL);browserNav.setPadding(dp(12),dp(8),dp(12),dp(8));browserNav.setBackgroundColor(0xff171b19);
+            TextView previous=button("上一项",()->navigateMedia(-1));previous.setEnabled(browseIndex>0);browserNav.addView(previous);
+            TextView position=ui.text((browseIndex+1)+" / "+browseIds.size(),13,Color.WHITE,false);position.setGravity(Gravity.CENTER);browserNav.addView(position,new LinearLayout.LayoutParams(0,-2,1));
+            TextView next=button("下一项",()->navigateMedia(1));next.setEnabled(browseIndex+1<browseIds.size());browserNav.addView(next);layout.addView(browserNav);
+        }
         showMessage("正在打开…");
 
         if (remote) loadRemote();
@@ -131,7 +147,7 @@ public final class PreviewActivity extends Activity {
                     BitmapFactory.decodeStream(stream, null, bounds);
                 }
                 BitmapFactory.Options options = new BitmapFactory.Options();
-                options.inPreferredConfig = Bitmap.Config.RGB_565;
+                options.inPreferredConfig = Bitmap.Config.ARGB_8888;
                 options.inSampleSize = 1;
                 while (bounds.outWidth / options.inSampleSize > 2048 || bounds.outHeight / options.inSampleSize > 2048) {
                     options.inSampleSize *= 2;
@@ -146,6 +162,7 @@ public final class PreviewActivity extends Activity {
                     if (closing) { bitmap.recycle(); return; }
                     clearContent();
                     ImageView image = new ZoomImageView(this);
+                    image.setOnClickListener(v->toggleImageControls());
                     image.setImageBitmap(bitmap);
                     currentBitmap = bitmap;
                     content.addView(image, new LinearLayout.LayoutParams(-1, -1));
@@ -258,6 +275,8 @@ public final class PreviewActivity extends Activity {
         try { startActivity(Intent.createChooser(intent, "打开文件")); }
         catch (RuntimeException error) { showMessage("没有可打开此文件的应用，或目录授权已失效。"); }
     }
+    private void toggleImageControls(){if(!mime.startsWith("image/"))return;imageControlsVisible=!imageControlsVisible;toolbar.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);if(browserNav!=null)browserNav.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);}
+    private void navigateMedia(int step){int target=browseIndex+step;if(browseIds==null||target<0||target>=browseIds.size())return;Intent next=new Intent(this,PreviewActivity.class);String id=browseIds.get(target);next.putExtra("uri",remote?getIntent().getStringExtra("server")+"/api/resources/"+RemoteClient.enc(id)+"/file":id);next.putExtra("name",browseNames.get(target));next.putExtra("mime",browseMimes.get(target));if(remote)next.putExtra("server",getIntent().getStringExtra("server")).putExtra("resource",id);next.putStringArrayListExtra("browse_ids",browseIds);next.putStringArrayListExtra("browse_names",browseNames);next.putStringArrayListExtra("browse_mimes",browseMimes);next.putExtra("browse_index",target);startActivity(next);finish();}
 
     private void fail(Exception error) { runOnUiThread(() -> { if (!closing) showMessage("预览失败：" + error.getMessage()); }); }
 

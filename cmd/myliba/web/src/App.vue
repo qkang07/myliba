@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { closeWebRTC, connectWebRTC } from "./webrtc";
 import ResourceDetail from "./ResourceDetail.vue";
 import ImagePreview from "./ImagePreview.vue";
+import HubSettings from "./HubSettings.vue";
 import {
   Check,
   ChevronDown,
@@ -52,6 +53,7 @@ import {
   getPreprocessQueue,
   prioritizePreprocessJobs,
   retryPreprocessJob,
+  retryFailedPreprocessJobs,
   type PreprocessQueue,
   getBatchTagSuggestions,
   getResources,
@@ -98,6 +100,7 @@ const errorMessage = ref("");
 const resources = ref<Resource[]>([]);
 const failedThumbnailIDs = ref(new Set<string>());
 const preprocessOpen = ref(false);
+const retryingFailedJobs = ref(false);
 const preprocessQueue = ref<PreprocessQueue>({ counts: { pending: 0, running: 0, done: 0, failed: 0 }, jobs: [], visible: {} });
 const thumbnailURLs = ref(new Map<string, string>());
 const thumbnailVersionSignatures = ref(new Map<string, string>());
@@ -119,6 +122,7 @@ const newFolderName = ref("");
 const folderBusy = ref(false);
 const bulkFolderID = ref("");
 const folderEditorOpen = ref(false);
+const sidebarFolderCreateOpen = ref(false);
 const editingFolderName = ref("");
 const total = ref(0);
 const query = ref("");
@@ -150,7 +154,9 @@ const loadingBatchSuggestions = ref(false);
 const batchSuggestionsScanned = ref(0);
 const applyingBatchSuggestion = ref("");
 const rootPath = ref("");
+const rootAutoPreprocess = ref(true);
 const rootBusy = ref(false);
+const rootSettingBusyID = ref("");
 const pickerBusy = ref(false);
 const directoryPickerOpen = ref(false);
 const directoryListing = ref<DirectoryListing | null>(null);
@@ -201,6 +207,7 @@ const onShortcut = (event: KeyboardEvent) => {
     void moveResourcePreview(event.key === "ArrowLeft" ? -1 : 1);
     return;
   }
+  if (event.key === "Escape" && sidebarFolderCreateOpen.value) { sidebarFolderCreateOpen.value = false; return; }
   if (event.key === "Escape" && tagFilterOpen.value) {
     tagFilterOpen.value = false;
     return;
@@ -222,12 +229,6 @@ const onTagEditorOutside = (event: MouseEvent) => {
   const target = event.target;
   if (target instanceof Element && target.closest(".tag-editor-wrap")) return;
   closeTagEditor();
-};
-
-const onTagFilterOutside = (event: MouseEvent) => {
-  if (tagFilterOpen.value && event.target instanceof Element && !event.target.closest(".tag-filter")) {
-    tagFilterOpen.value = false;
-  }
 };
 
 function currentFilters(): CollectionFilters {
@@ -355,6 +356,20 @@ async function generateThumbnail(id: string, showFailure = true, refresh = true)
     const next = new Set(generatingThumbnailIDs.value);
     next.delete(id);
     generatingThumbnailIDs.value = next;
+  }
+}
+
+async function retryAllFailedJobs() {
+  if (retryingFailedJobs.value || !preprocessQueue.value.counts.failed) return;
+  retryingFailedJobs.value = true;
+  try {
+    const result = await retryFailedPreprocessJobs();
+    await refreshPreprocessJobs();
+    notify(result.retried ? `已将 ${result.retried} 个失败任务重新加入队列` : "没有可重试的失败任务");
+  } catch (error) {
+    notify(error instanceof Error ? error.message : "无法批量重试任务");
+  } finally {
+    retryingFailedJobs.value = false;
   }
 }
 
@@ -651,6 +666,13 @@ function openFolder(id: string | null) {
   window.scrollTo(0, 0);
 }
 
+async function toggleSidebarFolderCreate() {
+  sidebarFolderCreateOpen.value = !sidebarFolderCreateOpen.value;
+  if (!sidebarFolderCreateOpen.value) return;
+  await nextTick();
+  document.querySelector<HTMLInputElement>("#sidebar-new-folder-name")?.focus();
+}
+
 async function submitFolder() {
   const name = newFolderName.value.trim();
   if (!name || folderBusy.value) return;
@@ -658,6 +680,7 @@ async function submitFolder() {
   try {
     const item = await createFolder(name);
     newFolderName.value = "";
+    sidebarFolderCreateOpen.value = false;
     await loadFolders();
     openFolder(item.id);
     notify("文件夹已创建");
@@ -756,6 +779,13 @@ function toggleTag(name: string) {
   void loadResources();
 }
 
+function chooseSidebarTag(name: string) {
+  if (detailResourceID.value) closeDetail();
+  selectedTags.value = selectedTags.value.length === 1 && selectedTags.value[0] === name ? [] : [name];
+  unorganizedOnly.value = false;
+  void loadResources();
+}
+
 function clearSelectedTags() {
   if (!selectedTags.value.length) return;
   selectedTags.value = [];
@@ -800,7 +830,7 @@ async function openTagFilterFromMobile() {
   if (detailResourceID.value) closeDetail();
   tagFilterOpen.value = true;
   await nextTick();
-  document.querySelector(".tag-filter")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  document.querySelector(".tag-filter-panel")?.scrollIntoView({ behavior: "smooth", block: "center" });
   document.querySelector<HTMLInputElement>("#tag-filter-search")?.focus({ preventScroll: true });
 }
 
@@ -1044,7 +1074,7 @@ async function submitRoot() {
   rootBusy.value = true;
   errorMessage.value = "";
   try {
-    const root = await addRoot(path);
+    const root = await addRoot(path, rootAutoPreprocess.value);
     const result = await scanRoot(root.id);
     rootPath.value = "";
     notify(`扫描完成，收录 ${result.indexed} 个文件`);
@@ -1079,6 +1109,18 @@ async function selectCurrentDirectory() {
   directoryPickerOpen.value = false;
   rootPath.value = path;
   await submitRoot();
+}
+
+async function toggleRootPreprocessing(root: RootSummary) {
+  if (rootSettingBusyID.value || scanningRootID.value === root.id) return;
+  rootSettingBusyID.value = root.id;
+  try {
+    const enabled = !root.autoPreprocess;
+    await addRoot(root.path, enabled);
+    root.autoPreprocess = enabled;
+    notify(enabled ? "已启用自动预处理" : "后续扫描将仅索引文件");
+  } catch (error) { showError(error); }
+  finally { rootSettingBusyID.value = ""; }
 }
 
 async function rescanRoot(root: RootSummary) {
@@ -1275,7 +1317,6 @@ onMounted(async () => {
   window.addEventListener("keydown", onShortcut);
   window.addEventListener("popstate", syncDetailRoute);
   document.addEventListener("click", onTagEditorOutside, true);
-  document.addEventListener("click", onTagFilterOutside, true);
   try {
     const session = await getSession();
     if (!session) {
@@ -1304,7 +1345,6 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onShortcut);
   window.removeEventListener("popstate", syncDetailRoute);
   document.removeEventListener("click", onTagEditorOutside, true);
-  document.removeEventListener("click", onTagFilterOutside, true);
   stopStatusPolling();
   stopPreprocessPolling();
   closeWebRTC();
@@ -1327,39 +1367,41 @@ onBeforeUnmount(() => {
         <button class="nav-link" :class="{ active: activeFolderID === null }" @click="openFolder(null)">
           <House :size="17" /><span>文件夹首页</span>
         </button>
-        <button class="nav-link" :class="{ active: activeFolderID === 'all' && !isFiltered && !activeCollection }" @click="openFolder('all')">
-          <LibraryBig :size="17" /><span>全部资源</span><span class="nav-count">{{ totalIndexed }}</span>
-        </button>
       </nav>
-      <div class="sidebar-section-label folder-section-title"><span>文件夹</span><span class="label-count">{{ folders.length }}</span></div>
+      <div class="sidebar-section-label folder-section-title"><span>文件夹</span><span class="sidebar-heading-actions"><span class="label-count">{{ folders.length }}</span><button class="sidebar-add" type="button" title="新建文件夹" aria-label="新建文件夹" :aria-expanded="sidebarFolderCreateOpen" @click="toggleSidebarFolderCreate"><Plus :size="14" /></button></span></div>
+      <form v-if="sidebarFolderCreateOpen" class="sidebar-folder-create" @submit.prevent="submitFolder"><label class="sr-only" for="sidebar-new-folder-name">文件夹名称</label><input id="sidebar-new-folder-name" v-model="newFolderName" maxlength="80" placeholder="文件夹名称" autocomplete="off" /><button type="submit" :disabled="folderBusy || !newFolderName.trim()" aria-label="创建文件夹"><Plus :size="15" /></button></form>
       <nav class="folder-nav" aria-label="文件夹">
-        <button v-for="folder in folders" :key="folder.id" class="nav-link" :class="{ active: activeFolderID === folder.id && !isFiltered }" @click="openFolder(folder.id)"><FolderOpen :size="16" /><span>{{ folder.name }}</span><span class="nav-count">{{ folder.count }}</span></button>
-        <button class="nav-link" title="未归组：尚未放入虚拟文件夹，与手动标签无关" :class="{ active: activeFolderID === 'unfiled' && !isFiltered }" @click="openFolder('unfiled')"><FolderOpen :size="16" /><span>未归组</span><span class="nav-count">{{ unfiledCount }}</span></button>
+        <button class="nav-link" :class="{ active: activeFolderID === 'all' }" @click="openFolder('all')"><LibraryBig :size="16" /><span>全部资源</span><span class="nav-count">{{ totalIndexed }}</span></button>
+        <button v-for="folder in folders" :key="folder.id" class="nav-link" :class="{ active: activeFolderID === folder.id }" @click="openFolder(folder.id)"><FolderOpen :size="16" /><span>{{ folder.name }}</span><span class="nav-count">{{ folder.count }}</span></button>
+        <button class="nav-link" title="未归组：尚未放入虚拟文件夹，与手动标签无关" :class="{ active: activeFolderID === 'unfiled' }" @click="openFolder('unfiled')"><FolderOpen :size="16" /><span>未归组</span><span class="nav-count">{{ unfiledCount }}</span></button>
       </nav>
-      <nav v-if="activeFolderID !== null" class="primary-nav" aria-label="当前文件夹">
-        <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
-      </nav>
+      <div v-if="activeFolderID !== null" class="folder-children" :aria-label="folderTitle + '的内容'">
+        <div class="folder-children-title">{{ folderTitle }} · 内容</div>
+        <nav class="primary-nav" aria-label="当前文件夹">
+          <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
+        </nav>
 
-      <div v-if="activeFolderID !== null" class="sidebar-section-label collection-section-title">
-        <span>智能集合</span><button class="sidebar-add" type="button" title="保存当前筛选为集合" aria-label="新建智能集合" @click="openCollectionEditor()"><Plus :size="14" /></button>
-      </div>
-      <nav v-if="activeFolderID !== null" class="collection-nav" aria-label="智能集合">
-        <div v-for="item in visibleCollections" :key="item.id" class="collection-nav-row" :class="{ active: activeCollection?.id === item.id }">
-          <button type="button" class="collection-nav-open" @click="chooseCollection(item)"><Bookmark :size="14" /><span>{{ item.name }}</span></button>
-          <button type="button" class="collection-nav-edit" :aria-label="`编辑集合 ${item.name}`" @click="openCollectionEditor(item, true)"><Pencil :size="13" /></button>
+        <div class="sidebar-section-label collection-section-title">
+          <span>智能集合</span><button class="sidebar-add" type="button" title="保存当前筛选为集合" aria-label="新建智能集合" @click="openCollectionEditor()"><Plus :size="14" /></button>
         </div>
-        <p v-if="!visibleCollections.length" class="sidebar-empty">保存当前文件夹的常用筛选。</p>
-      </nav>
+        <nav class="collection-nav" aria-label="智能集合">
+          <div v-for="item in visibleCollections" :key="item.id" class="collection-nav-row" :class="{ active: activeCollection?.id === item.id }">
+            <button type="button" class="collection-nav-open" @click="chooseCollection(item)"><Bookmark :size="14" /><span>{{ item.name }}</span></button>
+            <button type="button" class="collection-nav-edit" :aria-label="`编辑集合 ${item.name}`" @click="openCollectionEditor(item, true)"><Pencil :size="13" /></button>
+          </div>
+          <p v-if="!visibleCollections.length" class="sidebar-empty">保存当前文件夹的常用筛选。</p>
+        </nav>
 
-      <div v-if="activeFolderID !== null && activeFolderID !== 'all'" class="sidebar-section-label tag-section-title">
-        <span>手动标签</span><span class="label-count">{{ tags.length }}</span>
+        <div v-if="activeFolderID !== 'all'" class="sidebar-section-label tag-section-title">
+          <span>手动标签</span><span class="label-count">{{ tags.length }}</span>
+        </div>
+        <nav v-if="activeFolderID !== 'all'" class="tag-nav" aria-label="手动标签单选导航">
+          <button v-for="tag in tags" :key="tag.id" class="tag-nav-link" :class="{ active: selectedTags.length === 1 && selectedTags[0] === tag.name }" :aria-pressed="selectedTags.length === 1 && selectedTags[0] === tag.name" @click="chooseSidebarTag(tag.name)">
+            <Tag :size="15" /><span class="tag-nav-name">{{ tag.name }}</span><span class="tag-count">{{ tag.count }}</span><Check v-if="selectedTags.length === 1 && selectedTags[0] === tag.name" :size="13" />
+          </button>
+          <p v-if="!tags.length" class="sidebar-empty">给资源添加标签后，会显示在这里。</p>
+        </nav>
       </div>
-      <nav v-if="activeFolderID !== null && activeFolderID !== 'all'" class="tag-nav" aria-label="按标签筛选">
-        <button v-for="tag in tags" :key="tag.id" class="tag-nav-link" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)">
-          <Tag :size="15" /><span class="tag-nav-name">{{ tag.name }}</span><span class="tag-count">{{ tag.count }}</span><Check v-if="selectedTags.includes(tag.name)" :size="13" />
-        </button>
-        <p v-if="!tags.length" class="sidebar-empty">给资源添加标签后，会显示在这里。</p>
-      </nav>
 
       <div class="sidebar-bottom">
         <div class="node-status-card">
@@ -1386,6 +1428,7 @@ onBeforeUnmount(() => {
             </span>
           </template>
           <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>
+          <HubSettings v-if="!remoteMode && authenticated" />
           <button v-if="authenticated" class="button button-secondary preprocess-toggle" type="button" @click="preprocessOpen = true"><Clock3 :size="14" />后台任务 <span v-if="preprocessQueue.counts.pending + preprocessQueue.counts.running">({{ preprocessQueue.counts.pending + preprocessQueue.counts.running }})</span></button>
           <button v-if="remoteMode && authenticated" class="quiet-button signout-button" title="退出登录" @click="signOut"><LogOut :size="15" /><span>退出</span></button>
         </div>
@@ -1428,12 +1471,14 @@ onBeforeUnmount(() => {
             <button class="button button-primary" type="submit" :disabled="rootBusy || !rootPath.trim()">
               <LoaderCircle v-if="rootBusy" class="spin" :size="16" /><Plus v-else :size="16" /><span>{{ rootBusy ? "正在扫描" : "添加目录" }}</span>
             </button>
+            <label class="root-preprocess-option"><input v-model="rootAutoPreprocess" type="checkbox" :disabled="rootBusy" /><span>扫描后自动执行预处理（生成缩略图和文件指纹）</span></label>
           </form>
           <div v-if="roots.length" class="root-list">
             <div v-for="root in roots" :key="root.id" class="root-row">
               <span class="root-folder-icon"><FolderOpen :size="15" /></span>
               <span class="root-path" :title="root.path">{{ root.path }}</span>
-              <span class="root-count">{{ root.count.toLocaleString("zh-CN") }} 个文件</span>
+              <span class="root-count">{{ root.count.toLocaleString("zh-CN") }} 个文件 · {{ root.autoPreprocess ? "自动预处理" : "仅扫描" }}</span>
+              <button class="button button-ghost root-preprocess-switch" type="button" :disabled="!!rootSettingBusyID || scanningRootID === root.id" @click="toggleRootPreprocessing(root)">{{ root.autoPreprocess ? "关闭预处理" : "开启预处理" }}</button>
               <button class="button button-ghost rescan-button" :disabled="scanningRootID === root.id" @click="rescanRoot(root)">
                 <LoaderCircle v-if="scanningRootID === root.id" class="spin" :size="15" /><RefreshCw v-else :size="15" /><span>重新扫描</span>
               </button>
@@ -1482,29 +1527,31 @@ onBeforeUnmount(() => {
               <kbd>⌘ K</kbd>
               <button v-if="query" class="search-clear" type="button" aria-label="清除搜索" @click="query = ''"><X :size="14" /></button>
             </label>
-            <div v-if="activeFolderID !== 'all'" class="tag-filter">
-              <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: selectedTags.length > 0 }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>{{ selectedTags.length ? `已选 ${selectedTags.length} 个标签` : "按标签筛选" }}</span><ChevronDown :size="14" /></button>
-              <div v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-popover">
-                <label class="tag-filter-search" for="tag-filter-search"><Search :size="14" /><input id="tag-filter-search" v-model="tagFilterQuery" type="search" placeholder="查找标签" autocomplete="off" /></label>
-                <p class="tag-filter-hint">可多选 · 结果同时包含所选标签</p>
-                <div class="tag-filter-list">
-                  <button v-for="tag in matchingTags" :key="tag.id" class="tag-filter-option" type="button" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)"><span>{{ tag.name }}</span><small>{{ tag.count }}</small><Check v-if="selectedTags.includes(tag.name)" :size="14" /></button>
-                  <p v-if="!matchingTags.length" class="tag-filter-empty">{{ tags.length ? "没有匹配的标签" : "还没有标签" }}</p>
-                </div>
-                <button v-if="selectedTags.length" class="tag-filter-clear" type="button" @click="clearSelectedTags">清除已选标签</button>
-              </div>
-            </div>
+            <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: selectedTags.length || activeAttributeKeys.length }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>标签筛选{{ selectedTags.length + activeAttributeKeys.length ? ' · ' + (selectedTags.length + activeAttributeKeys.length) : '' }}</span><ChevronDown :size="14" /></button>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'grid' }" title="网格视图" @click="listMode = 'grid'"><LayoutGrid :size="16" /></button>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'list' }" title="列表视图" @click="listMode = 'list'"><List :size="16" /></button>
           </div>
         </section>
 
-        <section v-if="attributeCatalog.length || attributeCatalogLoading" class="attribute-filter-panel" aria-label="属性标签筛选">
-          <div class="attribute-filter-heading"><strong>属性标签</strong><span>数字随当前筛选更新，统计本组时不计本组已选项 · 同组任选，不同组叠加</span></div>
-          <div v-if="attributeCatalogLoading && !attributeCatalog.length" class="attribute-filter-loading"><LoaderCircle class="spin" :size="14" />正在统计当前条件…</div>
-          <div v-if="attributeTypes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件类型</span><div class="attribute-filter-chips"><button v-for="tag in attributeTypes" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
-          <div v-if="attributeSizes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件大小</span><div class="attribute-filter-chips"><button v-for="tag in attributeSizes" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
-          <div v-if="attributeCatalog.some((tag) => tag.category === 'extension')" class="attribute-filter-row"><span class="attribute-filter-label">文件格式</span><div class="attribute-format-area"><input v-if="attributeCatalog.filter((tag) => tag.category === 'extension').length > 12" v-model="attributeFormatQuery" type="search" placeholder="查找格式，如 PDF" aria-label="查找文件格式" /><div class="attribute-filter-chips attribute-format-chips"><button v-for="tag in attributeFormats" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button><span v-if="!attributeFormats.length" class="attribute-format-empty">没有匹配的格式</span></div></div></div>
+        <section v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-panel" aria-label="标签筛选">
+          <div class="tag-filter-panel-heading"><strong>标签筛选</strong><button type="button" aria-label="收起标签筛选" @click="tagFilterOpen = false"><ChevronDown :size="15" /></button></div>
+          <div class="tag-filter-group">
+            <div class="tag-filter-group-heading"><strong>手动标签</strong><span>可多选，结果同时包含所选标签</span></div>
+            <label class="tag-filter-search" for="tag-filter-search"><Search :size="14" /><input id="tag-filter-search" v-model="tagFilterQuery" type="search" placeholder="查找手动标签" autocomplete="off" /></label>
+            <div class="tag-filter-list">
+              <button v-for="tag in matchingTags" :key="tag.id" class="tag-filter-option" type="button" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)"><span>{{ tag.name }}</span><small>{{ tag.count }}</small><Check v-if="selectedTags.includes(tag.name)" :size="14" /></button>
+              <p v-if="!matchingTags.length" class="tag-filter-empty">{{ tags.length ? "没有匹配的标签" : "还没有标签" }}</p>
+            </div>
+            <button v-if="selectedTags.length" class="tag-filter-clear" type="button" @click="clearSelectedTags">清除已选手动标签</button>
+          </div>
+          <div class="tag-filter-group">
+            <div class="tag-filter-group-heading"><strong>属性标签</strong><span>按文件属性自动更新</span></div>
+            <div v-if="attributeCatalogLoading && !attributeCatalog.length" class="attribute-filter-loading"><LoaderCircle class="spin" :size="14" />正在统计当前条件…</div>
+            <div v-if="attributeTypes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件类型</span><div class="attribute-filter-chips"><button v-for="tag in attributeTypes" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
+            <div v-if="attributeSizes.length" class="attribute-filter-row"><span class="attribute-filter-label">文件大小</span><div class="attribute-filter-chips"><button v-for="tag in attributeSizes" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button></div></div>
+            <div v-if="attributeCatalog.some((tag) => tag.category === 'extension')" class="attribute-filter-row"><span class="attribute-filter-label">文件格式</span><div class="attribute-format-area"><input v-if="attributeCatalog.filter((tag) => tag.category === 'extension').length > 12" v-model="attributeFormatQuery" type="search" placeholder="查找格式，如 PDF" aria-label="查找文件格式" /><div class="attribute-filter-chips attribute-format-chips"><button v-for="tag in attributeFormats" :key="tag.key" type="button" class="attribute-filter-chip" :disabled="attributeCatalogLoading" :class="{ active: activeAttributeKeys.includes(tag.key) }" :aria-pressed="activeAttributeKeys.includes(tag.key)" @click="toggleAttribute(tag.key)">{{ tag.label }}<small>{{ attributeCatalogLoading ? '…' : (tag.count ?? 0) }}</small><Check v-if="activeAttributeKeys.includes(tag.key)" :size="12" /></button><span v-if="!attributeFormats.length" class="attribute-format-empty">没有匹配的格式</span></div></div></div>
+            <p v-if="!attributeCatalog.length && !attributeCatalogLoading" class="tag-filter-empty">当前没有可用的属性标签</p>
+          </div>
         </section>
 
         <div class="resource-filter-controls" aria-label="更多筛选和排序">
@@ -1522,7 +1569,7 @@ onBeforeUnmount(() => {
         </form>
 
         <div v-if="selectedTags.length" class="selected-tag-filters" aria-label="已选标签">
-          <span>同时包含</span>
+          <span>{{ selectedTags.length > 1 ? "同时包含" : "手动标签" }}</span>
           <button v-for="name in selectedTags" :key="name" type="button" :aria-label="`移除标签 ${name}`" @click="toggleTag(name)"><Tag :size="12" />{{ name }}<X :size="12" /></button>
         </div>
 
@@ -1650,17 +1697,18 @@ onBeforeUnmount(() => {
     <nav class="mobile-nav" aria-label="资源导航">
       <button :class="{ active: activeFolderID === null }" @click="openFolder(null)"><House :size="17" /><span>文件夹</span></button>
       <button :class="{ active: activeFolderID === 'unfiled' }" @click="openFolder('unfiled')"><FolderOpen :size="17" /><span>未归组</span></button>
-      <button v-if="activeFolderID !== null && activeFolderID !== 'all'" :class="{ active: selectedTags.length > 0 }" @click="openTagFilterFromMobile"><Tag :size="17" /><span>标签{{ selectedTags.length ? ` ${selectedTags.length}` : "" }}</span></button>
+      <button v-if="activeFolderID !== null" :class="{ active: selectedTags.length + activeAttributeKeys.length > 0 }" @click="openTagFilterFromMobile"><Tag :size="17" /><span>标签{{ selectedTags.length + activeAttributeKeys.length ? ' ' + (selectedTags.length + activeAttributeKeys.length) : '' }}</span></button>
     </nav>
 
     <div v-if="preprocessOpen" class="resource-preview-backdrop" @click.self="preprocessOpen = false">
       <section class="preprocess-dialog" role="dialog" aria-modal="true" aria-label="后台任务">
         <header class="resource-preview-header">
-          <div class="resource-preview-heading"><h2>后台任务</h2><p>扫描后自动处理；当前浏览的资源优先</p></div>
+          <div class="resource-preview-heading"><h2>后台任务</h2><p>已启用自动预处理的目录在扫描后入队；当前浏览的资源优先</p></div>
           <button class="quiet-button directory-close" aria-label="关闭后台任务" @click="preprocessOpen = false"><X :size="18" /></button>
         </header>
         <div class="preprocess-summary">
           <span>排队 {{ preprocessQueue.counts.pending }}</span><span>处理中 {{ preprocessQueue.counts.running }}</span><span>失败 {{ preprocessQueue.counts.failed }}</span><span>完成 {{ preprocessQueue.counts.done }}</span>
+          <button class="button button-secondary preprocess-retry-all" type="button" :disabled="retryingFailedJobs || !preprocessQueue.counts.failed" @click="retryAllFailedJobs"><LoaderCircle v-if="retryingFailedJobs" class="spin" :size="13" /><RefreshCw v-else :size="13" />{{ retryingFailedJobs ? "正在重试" : "重试全部失败任务" }}</button>
         </div>
         <div class="preprocess-list">
           <div v-for="job in preprocessQueue.jobs" :key="job.resourceId + job.operation" class="preprocess-row">

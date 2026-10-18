@@ -57,8 +57,14 @@ try {
         if (-not (Test-Path -LiteralPath 'node_modules/vite/bin/vite.js' -PathType Leaf)) {
             throw 'Web dependencies are missing. Run pnpm install --frozen-lockfile before packaging.'
         }
-        & node node_modules/vite/bin/vite.js build --config vite.config.ts --configLoader native
-        if ($LASTEXITCODE -ne 0) { throw 'Web build failed' }
+        $nativeConfig = Join-Path $repoRoot 'vite.package.config.mjs'
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'vite.config.ts') -Destination $nativeConfig
+        try {
+            & node node_modules/vite/bin/vite.js build --config $nativeConfig --configLoader native
+            if ($LASTEXITCODE -ne 0) { throw 'Web build failed' }
+        } finally {
+            Remove-Item -LiteralPath $nativeConfig -ErrorAction SilentlyContinue
+        }
     }
     if (-not (Test-Path -LiteralPath 'cmd/myliba/web/dist/index.html' -PathType Leaf)) {
         throw 'Embedded web build is missing'
@@ -81,6 +87,7 @@ Myliba portable Windows build
 
 Run myliba.exe from this folder. FFmpeg and FFprobe are bundled in ffmpeg/ and
 are discovered automatically; no separate installation or PATH setup is needed.
+Open http://127.0.0.1:4317 and use the 服务端 button to add or switch VPS Hubs.
 
 FFmpeg is a separate third-party program. Its build information, license, and
 source reference are in ffmpeg/README.txt and ffmpeg/LICENSE. Review

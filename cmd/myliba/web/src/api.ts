@@ -42,6 +42,7 @@ export interface ResourcePage {
 }
 
 export interface RootSummary {
+  autoPreprocess: boolean;
   id: string;
   path: string;
   addedAt: string;
@@ -106,6 +107,35 @@ export interface SessionInfo {
   webTraffic?: TrafficRate;
   nodeTraffic?: TrafficRate;
   iceServers?: RTCIceServer[];
+}
+
+export interface HubProfile {
+  id: string;
+  name: string;
+  url: string;
+  hasToken: boolean;
+}
+
+export interface HubProfilesView {
+  profiles: HubProfile[];
+  activeId: string;
+  status: "disabled" | "connecting" | "connected" | "disconnected";
+}
+
+export function getHubProfiles() {
+  return request<HubProfilesView>("/api/hubs");
+}
+
+export function saveHubProfile(profile: { id?: string; name: string; url: string; token: string }) {
+  return request<HubProfilesView>("/api/hubs", { method: "POST", body: JSON.stringify(profile) });
+}
+
+export function selectHubProfile(id: string) {
+  return request<HubProfilesView>("/api/hubs/active", { method: "PUT", body: JSON.stringify({ id }) });
+}
+
+export function deleteHubProfile(id: string) {
+  return request<HubProfilesView>(`/api/hubs/${encodeURIComponent(id)}`, { method: "DELETE", body: "{}" });
 }
 
 export class ApiError extends Error {
@@ -251,10 +281,10 @@ export function getDirectories(path = "") {
   return request<DirectoryListing>(`/api/directories${search.size ? `?${search}` : ""}`);
 }
 
-export function addRoot(path: string) {
+export function addRoot(path: string, autoPreprocess: boolean) {
   return request<{ id: string; path: string; existing?: boolean }>("/api/roots", {
     method: "PUT",
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, autoPreprocess }),
   });
 }
 
@@ -347,4 +377,7 @@ export function prioritizePreprocessJobs(ids: string[]) {
 
 export function retryPreprocessJob(id: string) {
   return request<void>(`/api/preprocess/${encodeURIComponent(id)}/retry`, { method: "POST" });
+}
+export function retryFailedPreprocessJobs() {
+  return request<{ retried: number }>("/api/preprocess/retry-failed", { method: "POST" });
 }

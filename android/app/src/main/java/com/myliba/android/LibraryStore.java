@@ -25,14 +25,15 @@ final class LibraryStore {
         List<Facet> tags=new ArrayList<>(),attributes=new ArrayList<>();int total,unfiled;boolean online=true;
     }
     static final class Page { List<Entry> items=new ArrayList<>();int total; }
-    Meta metadata(String folder)throws Exception{
+    Meta metadata(LocalFilters filters)throws Exception{
         Meta m=new Meta();
+        String folder=filters.folderId;
         if(!remote){
             for(LocalLibrary.Root r:local.roots()){m.roots.add(new Group(r.uri,r.name,r.count));m.total+=r.count;}
             for(LocalLibrary.Folder f:local.folders())m.folders.add(new Group(f.id,f.name,f.count));
             for(LocalLibrary.Collection c:local.collections()){Group g=new Group(c.id,c.name,0);g.filters=c.filters;m.collections.add(g);}
             for(LocalLibrary.Attribute t:local.tagCatalog(folder))m.tags.add(new Facet(t.key,t.label,t.count));
-            for(LocalLibrary.Attribute t:local.attributeCatalog(folder))m.attributes.add(new Facet(t.key,t.label,t.count));
+            for(LocalLibrary.Attribute t:local.attributeCatalog(filters))m.attributes.add(new Facet(t.key,t.label,t.count));
             int grouped=0;for(Group g:m.folders)grouped+=g.count;m.unfiled=m.total-grouped;
         }else{
             JSONObject session=client.json("GET","/api/session",null);m.online=session.optBoolean("nodeOnline",false);
@@ -40,7 +41,7 @@ final class LibraryStore {
             JSONObject fs=client.json("GET","/api/folders",null);m.unfiled=fs.optInt("unfiledCount");JSONArray folders=fs.optJSONArray("items");if(folders!=null)for(int i=0;i<folders.length();i++){JSONObject f=folders.getJSONObject(i);m.folders.add(new Group(f.getString("id"),f.getString("name"),f.optInt("count")));}
             JSONArray cs=client.array("/api/collections");for(int i=0;i<cs.length();i++){JSONObject c=cs.getJSONObject(i);Group g=new Group(c.getString("id"),c.getString("name"),0);g.filters=fromRemote(c.getJSONObject("filters"));m.collections.add(g);}
             JSONArray ts=client.array("/api/tags?folderId="+RemoteClient.enc(folder));for(int i=0;i<ts.length();i++){JSONObject t=ts.getJSONObject(i);m.tags.add(new Facet(t.getString("name"),t.getString("name"),t.optInt("count")));}
-            JSONArray as=client.array("/api/attribute-tags?folderId="+RemoteClient.enc(folder));for(int i=0;i<as.length();i++){JSONObject t=as.getJSONObject(i);m.attributes.add(new Facet(t.getString("key"),t.getString("label"),t.optInt("count")));}
+            JSONArray as=client.array(path(filters,"/api/attribute-tags",0,0));for(int i=0;i<as.length();i++){JSONObject t=as.getJSONObject(i);m.attributes.add(new Facet(t.getString("key"),t.getString("label"),t.optInt("count")));}
         }return m;
     }
     Page page(LocalFilters f,int offset)throws Exception{

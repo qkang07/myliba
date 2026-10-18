@@ -56,10 +56,11 @@ func TestThumbnailVariantsAndResourceDetail(t *testing.T) {
 	}
 	app := &server{db: db, thumbnailDir: thumbDir, thumbnailLocks: map[string]*sync.Mutex{}}
 	for _, tc := range []struct {
-		size                string
-		maxWidth, maxHeight int
+		size                      string
+		expectWidth, expectHeight int
 	}{
-		{"small", 240, 160}, {"medium", 480, 320}, {"large", 1280, 960},
+		{"small", 240, 150}, {"medium", 480, 300},
+		{"large", 1280, 800}, {"mobile", 720, 450},
 	} {
 		t.Run(tc.size, func(t *testing.T) {
 			path := "/api/resources/item/thumbnail?size=" + tc.size
@@ -81,8 +82,8 @@ func TestThumbnailVariantsAndResourceDetail(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if config.Width > tc.maxWidth || config.Height > tc.maxHeight || config.Width == 0 || config.Height == 0 {
-				t.Fatalf("unexpected dimensions: %dx%d", config.Width, config.Height)
+			if config.Width != tc.expectWidth || config.Height != tc.expectHeight {
+				t.Fatalf("unexpected dimensions for %s: %dx%d", tc.size, config.Width, config.Height)
 			}
 		})
 	}
@@ -102,7 +103,7 @@ func TestThumbnailVariantsAndResourceDetail(t *testing.T) {
 	}
 	if !allowedRemoteRequest(http.MethodGet, "/api/resources/item") || !allowedRemoteRequest(http.MethodGet, "/api/resources/item/video-info") ||
 		!allowedRemoteRequest(http.MethodGet, "/api/resources/item/thumbnail?size=small") ||
-		!allowedRemoteRequest(http.MethodPost, "/api/resources/item/thumbnail?size=small") {
+		!allowedRemoteRequest(http.MethodPost, "/api/resources/item/thumbnail?size=mobile&at=12.5") {
 		t.Fatal("remote detail routes rejected")
 	}
 }

@@ -26,9 +26,11 @@ import (
 )
 
 const (
-	thumbnailWidth  = 480
-	thumbnailHeight = 320
-	maxImagePixels  = 80_000_000
+	thumbnailWidth        = 480
+	thumbnailHeight       = 320
+	mobileThumbnailWidth  = 720
+	mobileThumbnailHeight = 960
+	maxImagePixels        = 80_000_000
 )
 
 func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +157,8 @@ func thumbnailSize(level string) (int, int) {
 		return 240, 160
 	case "large":
 		return 1280, 960
+	case "mobile":
+		return mobileThumbnailWidth, mobileThumbnailHeight
 	default:
 		return thumbnailWidth, thumbnailHeight
 	}

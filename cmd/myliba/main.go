@@ -86,12 +86,24 @@ func main() {
 	ffmpegPath := mediaToolPath("ffmpeg")
 	ffprobePath := mediaToolPath("ffprobe")
 	app := &server{db: db, thumbnailDir: thumbnailDir, ffmpegPath: ffmpegPath, ffprobePath: ffprobePath, thumbnailLocks: map[string]*sync.Mutex{}, jobsWake: make(chan struct{}, 1)}
+	iceServers, err := loadICEServers()
+	if err != nil {
+		log.Fatal(err)
+	}
+	hubs, err := newHubProfiles(db, iceServers)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := app.startPreprocessing(); err != nil {
 		log.Fatal(err)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/session", localSession)
+	mux.HandleFunc("GET /api/hubs", hubs.list)
+	mux.HandleFunc("POST /api/hubs", hubs.save)
+	mux.HandleFunc("PUT /api/hubs/active", hubs.selectActive)
+	mux.HandleFunc("DELETE /api/hubs/{id}", hubs.remove)
 	mux.HandleFunc("GET /api/directories", app.directories)
 	mux.HandleFunc("GET /api/roots", app.roots)
 	mux.HandleFunc("PUT /api/roots", app.addRoot)
@@ -108,6 +120,7 @@ func main() {
 	mux.HandleFunc("POST /api/resources/{id}/thumbnail", app.serveThumbnail)
 	mux.HandleFunc("GET /api/preprocess", app.listPreprocessJobs)
 	mux.HandleFunc("POST /api/preprocess/prioritize", app.prioritizePreprocessJobs)
+	mux.HandleFunc("POST /api/preprocess/retry-failed", app.retryFailedPreprocessJobs)
 	mux.HandleFunc("POST /api/preprocess/{id}/retry", app.retryPreprocessJob)
 	mux.HandleFunc("POST /api/resources/{id}/tags", app.addTag)
 	mux.HandleFunc("DELETE /api/resources/{id}/tags/{tagID}", app.removeTag)
@@ -129,21 +142,6 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(static)))
 	addr := "127.0.0.1:4317"
 	log.Printf("Myliba is ready at http://%s (data: %s)", addr, dataDir)
-	if hubURL := strings.TrimSpace(os.Getenv("MYLIBA_HUB_URL")); hubURL != "" {
-		nodeToken := strings.TrimSpace(os.Getenv("MYLIBA_NODE_TOKEN"))
-		if nodeToken == "" {
-			log.Fatal("MYLIBA_NODE_TOKEN is required when MYLIBA_HUB_URL is set")
-		}
-		if err := validateHubURL(hubURL); err != nil {
-			log.Fatal(err)
-		}
-		iceServers, err := loadICEServers()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go runNodeAgent(hubURL, nodeToken, iceServers)
-		log.Printf("Remote node enabled; connecting to %s", hubURL)
-	}
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
 }
 
@@ -157,7 +155,8 @@ CREATE TABLE IF NOT EXISTS roots (
 	id TEXT PRIMARY KEY,
 	path TEXT NOT NULL UNIQUE,
 	added_at TEXT NOT NULL,
-	last_scan_at TEXT
+	last_scan_at TEXT,
+	auto_preprocess INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS resources (
 	id TEXT PRIMARY KEY,
@@ -228,6 +227,34 @@ CREATE TABLE IF NOT EXISTS preprocess_jobs (
 );
 CREATE INDEX IF NOT EXISTS preprocess_jobs_queue_idx ON preprocess_jobs(status, priority DESC, priority_at DESC, created_at);
 `)
+	if err != nil {
+		return err
+	}
+	columns, err := db.Query(`PRAGMA table_info(roots)`)
+	if err != nil {
+		return err
+	}
+	hasAutoPreprocess := false
+	for columns.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := columns.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			columns.Close()
+			return err
+		}
+		if name == "auto_preprocess" {
+			hasAutoPreprocess = true
+		}
+	}
+	if err := columns.Err(); err != nil {
+		columns.Close()
+		return err
+	}
+	columns.Close()
+	if !hasAutoPreprocess {
+		_, err = db.Exec(`ALTER TABLE roots ADD COLUMN auto_preprocess INTEGER NOT NULL DEFAULT 1`)
+	}
 	return err
 }
 
@@ -236,7 +263,7 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) roots(w http.ResponseWriter, _ *http.Request) {
-	rows, err := s.db.Query(`SELECT r.id, r.path, r.added_at, COALESCE(r.last_scan_at, '') , COUNT(x.id)
+	rows, err := s.db.Query(`SELECT r.id, r.path, r.added_at, COALESCE(r.last_scan_at, ''), r.auto_preprocess, COUNT(x.id)
 		FROM roots r LEFT JOIN resources x ON x.root_id=r.id GROUP BY r.id ORDER BY r.added_at`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -247,18 +274,20 @@ func (s *server) roots(w http.ResponseWriter, _ *http.Request) {
 	for rows.Next() {
 		var id, path, added, scanned string
 		var count int
-		if err := rows.Scan(&id, &path, &added, &scanned, &count); err != nil {
+		var autoPreprocess bool
+		if err := rows.Scan(&id, &path, &added, &scanned, &autoPreprocess, &count); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		result = append(result, map[string]any{"id": id, "path": path, "addedAt": added, "lastScanAt": scanned, "count": count})
+		result = append(result, map[string]any{"id": id, "path": path, "addedAt": added, "lastScanAt": scanned, "autoPreprocess": autoPreprocess, "count": count})
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Path string `json:"path"`
+		Path           string `json:"path"`
+		AutoPreprocess *bool  `json:"autoPreprocess"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "请输入有效的目录路径")
@@ -282,6 +311,12 @@ func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 	var id string
 	err = s.db.QueryRow(`SELECT id FROM roots WHERE path=?`, path).Scan(&id)
 	if err == nil {
+		if input.AutoPreprocess != nil {
+			if _, err := s.db.Exec(`UPDATE roots SET auto_preprocess=? WHERE id=?`, *input.AutoPreprocess, id); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "path": path, "existing": true})
 		return
 	}
@@ -290,7 +325,11 @@ func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id = newID()
-	_, err = s.db.Exec(`INSERT INTO roots(id,path,added_at) VALUES(?,?,?)`, id, path, now())
+	autoPreprocess := true
+	if input.AutoPreprocess != nil {
+		autoPreprocess = *input.AutoPreprocess
+	}
+	_, err = s.db.Exec(`INSERT INTO roots(id,path,added_at,auto_preprocess) VALUES(?,?,?,?)`, id, path, now(), autoPreprocess)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -301,7 +340,8 @@ func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 	rootID := r.PathValue("id")
 	var rootPath string
-	if err := s.db.QueryRow(`SELECT path FROM roots WHERE id=?`, rootID).Scan(&rootPath); err != nil {
+	var autoPreprocess bool
+	if err := s.db.QueryRow(`SELECT path,auto_preprocess FROM roots WHERE id=?`, rootID).Scan(&rootPath, &autoPreprocess); err != nil {
 		writeError(w, http.StatusNotFound, "目录不存在")
 		return
 	}
@@ -368,8 +408,10 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		if err := s.enqueuePreprocessing(id, kind, info); err != nil {
-			return err
+		if autoPreprocess {
+			if err := s.enqueuePreprocessing(id, kind, info); err != nil {
+				return err
+			}
 		}
 		count++
 		return nil

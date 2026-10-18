@@ -152,24 +152,36 @@ func (w *remoteWaiter) finish() {
 	w.once.Do(func() { close(w.done) })
 }
 
-func runNodeAgent(hubURL, token string, iceServers []iceServerConfig) {
+func runNodeAgent(ctx context.Context, hubURL, token string, iceServers []iceServerConfig, setStatus func(string)) {
 	for {
-		if err := connectNode(hubURL, token, iceServers); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		setStatus("connecting")
+		if err := connectNode(ctx, hubURL, token, iceServers, func() { setStatus("connected") }); err != nil && ctx.Err() == nil {
 			log.Printf("Remote hub connection ended: %v", err)
 		}
-		time.Sleep(3 * time.Second)
+		if ctx.Err() != nil {
+			return
+		}
+		setStatus("disconnected")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 }
 
 func validateHubURL(hubURL string) error {
 	parsed, err := url.Parse(hubURL)
-	if err != nil || parsed.Scheme != "wss" || parsed.Host == "" {
-		return errors.New("MYLIBA_HUB_URL must be a wss:// URL")
+	if err != nil || parsed.Scheme != "wss" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/" && parsed.Path != "/node") {
+		return errors.New("MYLIBA_HUB_URL must be a wss:// URL ending in /node")
 	}
 	return nil
 }
 
-func connectNode(hubURL, token string, iceServers []iceServerConfig) error {
+func connectNode(parent context.Context, hubURL, token string, iceServers []iceServerConfig, connected func()) error {
 	parsed, err := url.Parse(hubURL)
 	if err != nil || parsed.Scheme != "wss" || parsed.Host == "" {
 		return errors.New("MYLIBA_HUB_URL must be a wss:// URL")
@@ -177,7 +189,7 @@ func connectNode(hubURL, token string, iceServers []iceServerConfig) error {
 	if parsed.Path == "" || parsed.Path == "/" {
 		parsed.Path = "/node"
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	headers := http.Header{"Authorization": []string{"Bearer " + token}}
 	conn, _, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPHeader: headers})
@@ -187,6 +199,7 @@ func connectNode(hubURL, token string, iceServers []iceServerConfig) error {
 	defer conn.Close(websocket.StatusNormalClosure, "node stopped")
 	conn.SetReadLimit(2 << 20)
 	log.Printf("Connected to remote hub %s", parsed.Host)
+	connected()
 	writeMu := &sync.Mutex{}
 	rtc := newNodeRTCManager(conn, writeMu, iceServers)
 	defer rtc.closeAll()
@@ -484,6 +497,8 @@ func allowedRemoteRequest(method, rawURI string) bool {
 	case len(parts) == 2 && parts[1] == "preprocess":
 		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "preprocess" && parts[2] == "prioritize":
+		return method == http.MethodPost
+	case len(parts) == 3 && parts[1] == "preprocess" && parts[2] == "retry-failed":
 		return method == http.MethodPost
 	case len(parts) == 4 && parts[1] == "preprocess" && parts[3] == "retry":
 		return method == http.MethodPost

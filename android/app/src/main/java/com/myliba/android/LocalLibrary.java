@@ -296,23 +296,31 @@ final class LocalLibrary extends SQLiteOpenHelper {
         return result;
     }
 
-    List<Attribute> attributeCatalog(String folderId) {
+    List<Attribute> attributeCatalog(LocalFilters filters) {
         java.util.LinkedHashMap<String, Integer> counts = new java.util.LinkedHashMap<>();
-        String scope = "unfiled".equals(folderId) ? " WHERE folder_id IS NULL" : "all".equals(folderId) ? "" : " WHERE folder_id=?";
-        String[] args = scope.endsWith("=?") ? new String[]{folderId} : null;
-        try (Cursor cursor = getReadableDatabase().rawQuery("SELECT name, kind, size FROM items" + scope, args)) {
-            while (cursor.moveToNext()) {
-                addCount(counts, "type:" + cursor.getString(1));
-                long size = cursor.getLong(2);
-                addCount(counts, "size:" + (size < 1048576 ? "lt1m" : size < 10485760 ? "1to10m" : size < 104857600 ? "10to100m" : "gte100m"));
-                String name = cursor.getString(0);
-                int dot = name.lastIndexOf('.');
-                if (dot > 0 && dot < name.length() - 1) {
-                    String ext = name.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
-                    if (ext.length() <= 16 && ext.matches("[a-z0-9]+")) addCount(counts, "extension:" + ext);
+        for (String category : new String[]{"type", "size", "extension"}) {
+            LocalFilters scope = filters.copy();
+            scope.attributes.removeIf(key -> key.startsWith(category + ":"));
+            ArrayList<String> args = new ArrayList<>();
+            String clause = where(scope, args);
+            try (Cursor cursor = getReadableDatabase().rawQuery("SELECT i.name, i.kind, i.size FROM items i WHERE " + clause, args.toArray(new String[0]))) {
+                while (cursor.moveToNext()) {
+                    if (category.equals("type")) addCount(counts, "type:" + cursor.getString(1));
+                    else if (category.equals("size")) {
+                        long size = cursor.getLong(2);
+                        addCount(counts, "size:" + (size < 1048576 ? "lt1m" : size < 10485760 ? "1to10m" : size < 104857600 ? "10to100m" : "gte100m"));
+                    } else {
+                        String name = cursor.getString(0);
+                        int dot = name.lastIndexOf('.');
+                        if (dot > 0 && dot < name.length() - 1) {
+                            String ext = name.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
+                            if (ext.length() <= 16 && ext.matches("[a-z0-9]+")) addCount(counts, "extension:" + ext);
+                        }
+                    }
                 }
             }
         }
+        for (String key : filters.attributes) if (!counts.containsKey(key)) counts.put(key, 0);
         List<Attribute> result = new ArrayList<>();
         for (String key : new String[]{"type:image", "type:video", "type:audio", "type:document", "type:file", "size:lt1m", "size:1to10m", "size:10to100m", "size:gte100m"}) {
             if (counts.containsKey(key)) result.add(new Attribute(key, attributeLabel(key), counts.get(key)));

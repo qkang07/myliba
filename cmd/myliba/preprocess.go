@@ -55,9 +55,12 @@ func (s *server) enqueuePreprocessing(id, kind string, info os.FileInfo) error {
 	operation := preprocessOperation(kind)
 	status := "pending"
 	if operation == thumbnailOperation {
-		cachePath, _ := s.thumbnailCachePath(id, info, thumbnailWidth, 0)
-		if _, err := os.Stat(cachePath); err == nil {
-			status = "done"
+		desktopPath, _ := s.thumbnailCachePath(id, info, thumbnailWidth, 0)
+		mobilePath, _ := s.thumbnailCachePath(id, info, mobileThumbnailWidth, 0)
+		if _, desktopErr := os.Stat(desktopPath); desktopErr == nil {
+			if _, mobileErr := os.Stat(mobilePath); mobileErr == nil {
+				status = "done"
+			}
 		}
 	} else {
 		var contentID, modified string
@@ -103,7 +106,7 @@ func (s *server) startPreprocessing() error {
 }
 
 func (s *server) backfillPreprocessing() {
-	rows, err := s.db.Query(`SELECT id,path,kind FROM resources WHERE available=1`)
+	rows, err := s.db.Query(`SELECT r.id,r.path,r.kind FROM resources r JOIN roots x ON x.id=r.root_id WHERE r.available=1 AND x.auto_preprocess=1`)
 	if err != nil {
 		log.Printf("preprocess backfill: %v", err)
 		return
@@ -180,9 +183,12 @@ func (s *server) preprocessWorker() {
 				}
 			}
 			if err == nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 				if operation == thumbnailOperation {
 					err = s.ensureThumbnail(ctx, id, path, kind, info, thumbnailWidth, thumbnailHeight, 0)
+					if err == nil {
+						err = s.ensureThumbnail(ctx, id, path, kind, info, mobileThumbnailWidth, mobileThumbnailHeight, 0)
+					}
 				} else {
 					err = s.fingerprintResource(ctx, id, path, info)
 				}
@@ -314,16 +320,19 @@ func (s *server) prioritizePreprocessJobs(w http.ResponseWriter, r *http.Request
 			continue
 		}
 		var path, kind string
-		if err := s.db.QueryRow(`SELECT path,kind FROM resources WHERE id=? AND available=1`, id).Scan(&path, &kind); err != nil {
+		var autoPreprocess bool
+		if err := s.db.QueryRow(`SELECT r.path,r.kind,x.auto_preprocess FROM resources r JOIN roots x ON x.id=r.root_id WHERE r.id=? AND r.available=1`, id).Scan(&path, &kind, &autoPreprocess); err != nil {
 			continue
 		}
-		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		if err := s.enqueuePreprocessing(id, kind, info); err != nil {
-			writeError(w, http.StatusInternalServerError, "无法安排预处理任务")
-			return
+		if autoPreprocess {
+			info, err := os.Stat(path)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			if err := s.enqueuePreprocessing(id, kind, info); err != nil {
+				writeError(w, http.StatusInternalServerError, "无法安排预处理任务")
+				return
+			}
 		}
 		if _, err := s.db.Exec(`UPDATE preprocess_jobs SET priority=1,priority_at=? WHERE resource_id=? AND operation=? AND status='pending'`,
 			base+int64(len(input.IDs)-index), id, preprocessOperation(kind)); err != nil {
@@ -361,4 +370,24 @@ func (s *server) retryPreprocessJob(w http.ResponseWriter, r *http.Request) {
 		s.wakePreprocessing()
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *server) retryFailedPreprocessJobs(w http.ResponseWriter, _ *http.Request) {
+	result, err := s.db.Exec(`UPDATE preprocess_jobs SET status='pending',priority=1,priority_at=?,updated_at=?,error=''
+        WHERE status='failed' AND EXISTS (
+            SELECT 1 FROM resources r WHERE r.id=preprocess_jobs.resource_id AND r.available=1
+        )`, time.Now().UnixNano(), now())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法批量重试任务")
+		return
+	}
+	retried, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法读取重试数量")
+		return
+	}
+	if retried > 0 {
+		s.wakePreprocessing()
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"retried": retried})
 }

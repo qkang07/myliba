@@ -26,12 +26,43 @@ final class ThumbnailLoader {
         pool.execute(()->{try{Bitmap b=read(store,e);if(b==null)return;cache.put(key,b);activity.runOnUiThread(()->{if(!activity.isFinishing()&&key.equals(target.getTag())){target.setImageBitmap(b);fallback.setVisibility(View.GONE);}});}catch(Exception ignored){}});
     }
     private Bitmap read(LibraryStore s,LibraryStore.Entry e)throws Exception{
-        if(s.remote){byte[] data=s.client.bytes("GET","/api/resources/"+RemoteClient.enc(e.id)+"/thumbnail",null,3*1024*1024);return BitmapFactory.decodeByteArray(data,0,data.length);}
+        if(s.remote){
+            String endpoint="/api/resources/"+RemoteClient.enc(e.id)+"/thumbnail";
+            byte[] data;
+            try { data=s.client.bytes("GET",endpoint+"?size=mobile",null,3*1024*1024); }
+            catch(RemoteClient.Failure error){if(error.status!=404)throw error;data=s.client.bytes("GET",endpoint,null,3*1024*1024);}
+            return BitmapFactory.decodeByteArray(data,0,data.length);
+        }
         Uri uri=Uri.parse(e.id);
-        if(Build.VERSION.SDK_INT>=29){try{return activity.getContentResolver().loadThumbnail(uri,new Size(320,240),null);}catch(Exception ignored){}}
-        if(e.kind.equals("video")){if(Build.VERSION.SDK_INT<27)return null;MediaMetadataRetriever r=new MediaMetadataRetriever();try{r.setDataSource(activity,uri);return r.getScaledFrameAtTime(0,MediaMetadataRetriever.OPTION_CLOSEST_SYNC,320,240);}finally{r.release();}}
-        if(e.mime.equals("application/pdf")){try(ParcelFileDescriptor fd=activity.getContentResolver().openFileDescriptor(uri,"r");PdfRenderer r=new PdfRenderer(fd);PdfRenderer.Page p=r.openPage(0)){Bitmap b=Bitmap.createBitmap(240,320,Bitmap.Config.ARGB_8888);b.eraseColor(Color.WHITE);p.render(b,null,null,PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);return b;}}
-        BitmapFactory.Options options=new BitmapFactory.Options();options.inJustDecodeBounds=true;try(InputStream in=activity.getContentResolver().openInputStream(uri)){BitmapFactory.decodeStream(in,null,options);}options.inJustDecodeBounds=false;options.inSampleSize=1;while(options.outWidth/options.inSampleSize>640||options.outHeight/options.inSampleSize>640)options.inSampleSize*=2;options.inPreferredConfig=Bitmap.Config.RGB_565;try(InputStream in=activity.getContentResolver().openInputStream(uri)){return BitmapFactory.decodeStream(in,null,options);}
+        if(Build.VERSION.SDK_INT>=29){try{return fitMobile(activity.getContentResolver().loadThumbnail(uri,new Size(720,960),null));}catch(Exception ignored){}}
+        if(e.kind.equals("video"))return videoFrame(activity,uri,0);
+        if(e.mime.equals("application/pdf")){try(ParcelFileDescriptor fd=activity.getContentResolver().openFileDescriptor(uri,"r");PdfRenderer r=new PdfRenderer(fd);PdfRenderer.Page p=r.openPage(0)){float scale=Math.min(1f,Math.min(720f/p.getWidth(),960f/p.getHeight()));Bitmap b=Bitmap.createBitmap(Math.max(1,Math.round(p.getWidth()*scale)),Math.max(1,Math.round(p.getHeight()*scale)),Bitmap.Config.ARGB_8888);b.eraseColor(Color.WHITE);p.render(b,null,null,PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);return b;}}
+        BitmapFactory.Options options=new BitmapFactory.Options();options.inJustDecodeBounds=true;try(InputStream in=activity.getContentResolver().openInputStream(uri)){BitmapFactory.decodeStream(in,null,options);}options.inJustDecodeBounds=false;options.inSampleSize=1;while(options.outWidth/options.inSampleSize>720||options.outHeight/options.inSampleSize>960)options.inSampleSize*=2;options.inPreferredConfig=Bitmap.Config.RGB_565;try(InputStream in=activity.getContentResolver().openInputStream(uri)){return fitMobile(BitmapFactory.decodeStream(in,null,options));}
+    }
+    private static Bitmap fitMobile(Bitmap source){
+        if(source==null||source.getWidth()<=720&&source.getHeight()<=960)return source;
+        double scale=Math.min(720.0/source.getWidth(),960.0/source.getHeight());
+        Bitmap fitted=Bitmap.createScaledBitmap(source,Math.max(1,(int)Math.round(source.getWidth()*scale)),Math.max(1,(int)Math.round(source.getHeight()*scale)),true);
+        if(fitted!=source)source.recycle();
+        return fitted;
+    }
+    static Bitmap videoFrame(Activity activity,Uri uri,long atMicros)throws Exception{
+        MediaMetadataRetriever retriever=new MediaMetadataRetriever();
+        try{
+            retriever.setDataSource(activity,uri);
+            int width=Integer.parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
+            int height=Integer.parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
+            if(width<1||height<1)throw new IOException("无法读取视频尺寸");
+            double scale=Math.min(1.0,Math.min(720.0/width,960.0/height));
+            int targetWidth=Math.max(1,(int)Math.round(width*scale));
+            int targetHeight=Math.max(1,(int)Math.round(height*scale));
+            if(Build.VERSION.SDK_INT>=27)return retriever.getScaledFrameAtTime(atMicros,MediaMetadataRetriever.OPTION_CLOSEST_SYNC,targetWidth,targetHeight);
+            Bitmap full=retriever.getFrameAtTime(atMicros,MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            if(full==null)return null;
+            Bitmap scaled=Bitmap.createScaledBitmap(full,targetWidth,targetHeight,true);
+            if(scaled!=full)full.recycle();
+            return scaled;
+        }finally{retriever.release();}
     }
     void clear(){cache.evictAll();}
     void close(){pool.shutdownNow();cache.evictAll();}

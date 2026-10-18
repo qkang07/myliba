@@ -1,12 +1,13 @@
-# Myliba for Android · 0.3
+# Myliba for Android
 
 The native Android interface uses one navigation model for both libraries:
 
 - **资源**: search, type shortcuts, combined filters, list/grid views, sorting and file details. Tap to open details; long-press to select. Selection exposes batch tag editing and virtual-folder moves, including all matching search results.
 - **文件夹**: virtual folders and saved searches (smart collections).
 - **来源**: authorized phone directories, rescanning and server connection settings.
+- **传输**: downloads started from the home library, with live progress, completion, failure, open and cancel controls. The list survives app restarts.
 
-Switch **本机 / 家中** from the top-right library picker. Filters are independent for each library. Dialogs use native bottom sheets; short menus fit their content. Images support pinch zoom, double-tap zoom/reset and bounded panning. Lists reuse views and cache thumbnails in memory. There is no embedded remote web page.
+Switch **本机 / 家中** from the top-right library picker. Filters are independent for each library. Dialogs use native bottom sheets; short menus fit their content. Tap a file thumbnail for a full-screen preview. Images support pinch zoom, double-tap zoom/reset and bounded panning; tap once to hide preview controls. Previous/next buttons browse media in the current loaded result page. Lists reuse views and cache thumbnails in memory. There is no embedded remote web page.
 
 See [actual APK screenshots and verification notes](docs/verification-0.3.md).
 
@@ -17,7 +18,7 @@ The Android app has two independent libraries:
 
 The phone library and the server library are separate. Local virtual folders, tags, and smart collections live only in the app database. This version does not upload phone files, sync tags, or provide an offline server library. Local search uses SQLite substring matching; server search uses the existing server API. Server tag suggestions can be requested from a file's details.
 
-Server image, text and PDF previews load on demand, with a 24 MiB limit and a temporary app-private file deleted when the preview closes normally. Video/audio use authenticated streaming. Larger or unsupported files can be downloaded from the details sheet. The app reads cached server thumbnails automatically; generation remains an explicit action. It uses HTTPS Hub requests rather than the web client's WebRTC transport.
+Server image, text and PDF previews load on demand, with a 24 MiB limit and a temporary app-private file deleted when the preview closes normally. Video/audio use authenticated streaming. Larger or unsupported files can be downloaded from the details sheet and followed in **传输**. The app requests a dedicated mobile thumbnail (maximum 720 × 960 pixels), with a legacy cache fallback. The server preprocessing queue generates both the web thumbnail and the mobile thumbnail or video first frame. The file detail sheet can generate six video segment screenshots at the same mobile size, or accept a manual timestamp when the video duration is unavailable; **重新生成移动端封面** and **后台预处理** use the current server API. Attribute filter counts follow the current search and other filters while retaining selected zero-count options. It uses HTTPS Hub requests rather than the web client's WebRTC transport.
 
 ## Build
 

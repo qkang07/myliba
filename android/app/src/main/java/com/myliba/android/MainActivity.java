@@ -2,7 +2,12 @@ package com.myliba.android;
 
 import android.app.*;
 import android.content.*;
+import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.media.MediaMetadataRetriever;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.*;
 import android.provider.DocumentsContract;
@@ -13,6 +18,8 @@ import android.widget.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import static com.myliba.android.MobileUi.*;
 
@@ -33,6 +40,7 @@ public final class MainActivity extends Activity {
     private boolean home,grid,loading,selecting,busy,scanning,destroyed,needsLogin;
     private int tab,generation,total; private String error="",scanMessage="",activeCollection;
     private final Runnable searchTask=()->reload(false,false);
+    private final Runnable transferRefresh=new Runnable(){@Override public void run(){if(!destroyed&&tab==3){renderTransfers();handler.postDelayed(this,1000);}}};
 
     @Override public void onCreate(Bundle saved){
         super.onCreate(saved);ui=new MobileUi(this);db=new LocalLibrary(this);localStore=new LibraryStore(db,null);
@@ -47,7 +55,7 @@ public final class MainActivity extends Activity {
             android.graphics.Insets bars=insets.getInsets(WindowInsets.Type.systemBars()),ime=insets.getInsets(WindowInsets.Type.ime());
             shell.setPadding(bars.left,bars.top,bars.right,Math.max(bars.bottom,ime.bottom));navigation.setVisibility(ime.bottom>bars.bottom?View.GONE:View.VISIBLE);return insets;});}
         if(Build.VERSION.SDK_INT>=33)getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,this::handleBack);
-        render();reload(false,true);
+        render();if(tab==3)handler.postDelayed(transferRefresh,1000);else reload(false,true);
     }
     private LibraryStore store(){return home?hubStore:localStore;}
     private LocalFilters f(){return home?hubFilters:localFilters;}
@@ -56,21 +64,21 @@ public final class MainActivity extends Activity {
         if(home==remote)return;hideKeyboard();handler.removeCallbacks(searchTask);generation++;home=remote;meta=new LibraryStore.Meta();entries.clear();total=0;error="";needsLogin=false;selected.clear();selecting=false;activeCollection=null;
         render();reload(false,true);
     }
-    private void navigate(int page){if(tab==page)return;hideKeyboard();handler.removeCallbacks(searchTask);generation++;loading=false;tab=page;selected.clear();selecting=false;error="";render();reload(false,true);}
+    private void navigate(int page){if(tab==page)return;hideKeyboard();handler.removeCallbacks(searchTask);handler.removeCallbacks(transferRefresh);generation++;loading=false;tab=page;selected.clear();selecting=false;error="";render();if(tab==3)handler.postDelayed(transferRefresh,1000);else reload(false,true);}
     private void render(){
         header.removeAllViews();content.removeAllViews();files=null;adapter=null;search=null;resultArea=null;resultLabel=null;
         header.setPadding(ui.d(22),ui.d(14),ui.d(18),ui.d(14));
         TextView brand=ui.text("MYLIBA",10,GREEN,true);brand.setLetterSpacing(.18f);header.addView(brand);
-        LinearLayout title=ui.row();String[] titles={"资源库","文件夹","来源"};title.addView(ui.text(titles[tab],28,INK,true),ui.weight());
+        LinearLayout title=ui.row();String[] titles={"资源库","文件夹","来源","传输列表"};title.addView(ui.text(titles[tab],28,INK,true),ui.weight());
         LinearLayout source=ui.row();ui.pad(source,12,8);source.addView(ui.icon(home?"server":"phone",17,GREEN));TextView label=ui.text(home?"家中":"本机",12,GREEN,true);label.setPadding(ui.d(7),0,ui.d(5),0);source.addView(label);source.addView(ui.icon("down",15,GREEN));ui.touch(source,SOFT,20,this::sourceSheet);source.setContentDescription("切换资源库，当前"+(home?"家中":"本机"));title.addView(source);
         header.addView(title,ui.top(7));
-        if(tab==0)renderLibrary();else if(tab==1)renderFolders();else renderSources();
+        if(tab==0)renderLibrary();else if(tab==1)renderFolders();else if(tab==2)renderSources();else renderTransfers();
         renderNav();renderBatch();
     }
     private void renderNav(){
         navigation.removeAllViews();navigation.setBackgroundColor(PAPER);navigation.setPadding(ui.d(14),ui.d(8),ui.d(14),ui.d(8));
-        String[] icons={"library","folder","sources"},labels={"资源","文件夹","来源"};
-        for(int i=0;i<3;i++){final int index=i;LinearLayout item=ui.col();item.setGravity(Gravity.CENTER);ui.pad(item,0,4);
+        String[] icons={"library","folder","sources","download"},labels={"资源","文件夹","来源","传输"};
+        for(int i=0;i<4;i++){final int index=i;LinearLayout item=ui.col();item.setGravity(Gravity.CENTER);ui.pad(item,0,4);
             FrameLayout bubble=new FrameLayout(this);bubble.setBackground(ui.shape(tab==i?SOFT:Color.TRANSPARENT,17,0));ImageView icon=ui.icon(icons[i],23,tab==i?GREEN:MUTED);FrameLayout.LayoutParams ip=new FrameLayout.LayoutParams(ui.d(23),ui.d(23),Gravity.CENTER);bubble.addView(icon,ip);item.addView(bubble,ui.lp(58,31));TextView t=ui.text(labels[i],11,tab==i?GREEN:MUTED,tab==i);t.setGravity(Gravity.CENTER);item.addView(t,ui.top(4));ui.touch(item,Color.TRANSPARENT,18,()->navigate(index));item.setContentDescription(labels[i]);item.setSelected(tab==i);navigation.addView(item,new LinearLayout.LayoutParams(0,ui.d(60),1));}
     }
     private void renderLibrary(){
@@ -140,13 +148,14 @@ public final class MainActivity extends Activity {
             LibraryStore s=store();if(s!=null)thumbs.load(s,e,image,placeholder);
             more.setImageDrawable(new MobileUi.Icon(selecting?(checked?"check":"plus"):"more",selecting?GREEN:INK));more.setContentDescription(selecting?(checked?"取消选择 ":"选择 ")+e.name:e.name+"的操作");more.setOnClickListener(v->{if(selecting)toggleSelection(e.id);else entryMenu(e);});
             if(tile)more.setBackground(ui.shape(0xeaffffff,12,0));
+            preview.setOnClickListener(v->{if(selecting)toggleSelection(e.id);else openPreview(e);});
             root.setOnClickListener(v->{if(selecting)toggleSelection(e.id);else showDetail(e);});root.setOnLongClickListener(v->{selecting=true;toggleSelection(e.id);return true;});root.setContentDescription(e.name+"，"+typeName(e.kind)+"，"+size(e.size));
         }
     }
     private void reload(boolean append,boolean metadata){
         if(destroyed||scanning)return;if(append&&loading)return;LibraryStore s=store();if(s==null){loading=false;updateResults();return;}
         LocalFilters query=f().copy();int token=++generation,offset=append?entries.size():0;int targetTab=tab;loading=true;error="";if(!append){selected.clear();selecting=false;}updateResults();
-        io.execute(()->{try{LibraryStore.Meta next=metadata?s.metadata(query.folderId):null;LibraryStore.Page p=targetTab==0?s.page(query,offset):null;
+        io.execute(()->{try{LibraryStore.Meta next=(metadata||targetTab==0&&!append)?s.metadata(query):null;LibraryStore.Page p=targetTab==0?s.page(query,offset):null;
             runOnUiThread(()->{if(destroyed||token!=generation||s!=store())return;loading=false;needsLogin=false;if(next!=null)meta=next;if(p!=null){if(!append)entries.clear();entries.addAll(p.items);total=p.total;}if(tab==0)updateResults();else render();});
         }catch(Exception e){runOnUiThread(()->{if(destroyed||token!=generation||s!=store())return;loading=false;error=message(e);needsLogin=e instanceof RemoteClient.Failure&&((RemoteClient.Failure)e).status==401;if(needsLogin)entries.clear();if(tab==0)updateResults();else render();});}});
     }
@@ -158,7 +167,9 @@ public final class MainActivity extends Activity {
         s.body.addView(ui.item("phone","本机文件",!home?"当前资源库 · 可离线使用":"读取已授权的手机文件夹",()->{s.close();switchSource(false);}));
         s.body.addView(ui.item("server","家中资源库",hubStore==null?"连接你的 Myliba 服务端":Uri.parse(hubStore.client.base).getHost(),()->{s.close();switchSource(true);if(hubStore==null)connectSheet();}),ui.top(10));s.show();
     }
-    private void libraryMenu(){MobileUi.Sheet s=ui.sheet("资源操作",null);s.body.addView(ui.item("check","选择文件","长按任意文件也可开始选择",()->{s.close();selecting=true;updateResults();}));s.body.addView(ui.item("spark","保存为智能集合","保存当前搜索和筛选条件",()->{s.close();saveCollection(null);}));s.body.addView(ui.item("refresh","刷新资源库","重新读取索引中的文件",()->{s.close();reload(false,true);}));s.show();}
+    private void libraryMenu(){MobileUi.Sheet s=ui.sheet("资源操作",null);s.body.addView(ui.item("check","选择文件","长按任意文件也可开始选择",()->{s.close();selecting=true;updateResults();}));s.body.addView(ui.item("spark","保存为智能集合","保存当前搜索和筛选条件",()->{s.close();saveCollection(null);}));if(home)s.body.addView(ui.item("refresh","后台预处理","查看缩略图与文件指纹任务",()->{s.close();preprocessSheet();}));s.body.addView(ui.item("refresh","刷新资源库","重新读取索引中的文件",()->{s.close();reload(false,true);}));s.show();}
+    private void preprocessSheet(){LibraryStore s=store();if(s==null||!s.remote)return;MobileUi.Sheet sheet=ui.sheet("后台预处理","家中资源库的缩略图和文件指纹任务");TextView loading=ui.text("正在读取任务…",13,MUTED,false);sheet.body.addView(loading);sheet.show();loadPreprocess(sheet,s);}
+    private void loadPreprocess(MobileUi.Sheet sheet,LibraryStore s){io.execute(()->{try{JSONObject queue=s.client.json("GET","/api/preprocess",null);runOnUiThread(()->{if(destroyed||!sheet.dialog.isShowing())return;sheet.body.removeAllViews();sheet.footer.removeAllViews();JSONObject counts=queue.optJSONObject("counts");if(counts!=null)sheet.body.addView(ui.text("排队 "+counts.optInt("pending")+" · 处理中 "+counts.optInt("running")+" · 失败 "+counts.optInt("failed")+" · 完成 "+counts.optInt("done"),13,INK,true));if(counts!=null&&counts.optInt("failed")>0)sheet.body.addView(ui.button("重试全部失败任务",false,()->{sheet.close();mutate(s,()->s.client.json("POST","/api/preprocess/retry-failed",null),"已重新排队",()->preprocessSheet());}),ui.top(14));JSONArray jobs=queue.optJSONArray("jobs");if(jobs==null||jobs.length()==0)sheet.body.addView(ui.text("当前没有任务",13,MUTED,false),ui.top(16));else for(int i=0;i<jobs.length();i++){JSONObject job=jobs.optJSONObject(i);if(job==null)continue;String status=job.optString("status");String label=status.equals("pending")?"排队中":status.equals("running")?"处理中":status.equals("failed")?"失败":"已完成";String op=job.optString("operation").equals("thumbnail")?"缩略图":"文件指纹";String detail=op+" · "+label+(job.optInt("priority")>0&&status.equals("pending")?" · 当前列表优先":"");if(!job.optString("error").isEmpty())detail+=" · "+job.optString("error");String id=job.optString("resourceId");LinearLayout row=ui.item(op.equals("缩略图")?"image":"file",job.optString("name"),detail,()->{if(!status.equals("failed"))return;sheet.close();mutate(s,()->s.client.json("POST","/api/preprocess/"+RemoteClient.enc(id)+"/retry",null),"任务已重新排队",()->preprocessSheet());});sheet.body.addView(row,ui.top(8));}sheet.footer.addView(ui.button("刷新状态",false,()->loadPreprocess(sheet,s)),ui.top(8));});}catch(Exception ex){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing()){sheet.body.removeAllViews();sheet.body.addView(ui.text("读取失败："+message(ex),13,RED,false));}});}});}
     private void toggleSelection(String id){selecting=true;if(!selected.add(id))selected.remove(id);updateResults();}
     private void renderBatch(){
         if(batchDock==null)return;batchDock.removeAllViews();batchDock.setVisibility(selecting?View.VISIBLE:View.GONE);if(!selecting)return;
@@ -248,14 +259,106 @@ public final class MainActivity extends Activity {
     }
     private void detailBody(MobileUi.Sheet sheet,LibraryStore s,LibraryStore.Entry e){
         sheet.body.removeAllViews();sheet.footer.removeAllViews();FrameLayout frame=new FrameLayout(this);frame.setBackground(ui.shape(typeBg(e.kind),18,0));frame.setClipToOutline(true);ImageView img=new ImageView(this);img.setScaleType(ImageView.ScaleType.FIT_CENTER);frame.addView(img,new FrameLayout.LayoutParams(-1,-1));ImageView icon=ui.icon(e.kind,54,typeColor(e.kind));frame.addView(icon,new FrameLayout.LayoutParams(ui.d(54),ui.d(54),Gravity.CENTER));sheet.body.addView(frame,ui.lp(-1,190));thumbs.load(s,e,img,icon);
-        if(s.remote&&(e.kind.equals("image")||e.kind.equals("video"))&&e.available){TextView generate=ui.chip("生成 / 刷新缩略图",false,()->mutate(s,()->s.client.json("POST","/api/resources/"+RemoteClient.enc(e.id)+"/thumbnail",null),"缩略图已就绪",()->{thumbs.clear();detailBody(sheet,s,e);}));sheet.body.addView(generate,ui.top(8));}
+        if(s.remote&&(e.kind.equals("image")||e.kind.equals("video"))&&e.available){TextView generate=ui.chip("重新生成移动端封面",false,()->mutate(s,()->s.client.json("POST","/api/resources/"+RemoteClient.enc(e.id)+"/thumbnail?size=mobile",null),"移动端封面已生成",()->{thumbs.clear();detailBody(sheet,s,e);}));sheet.body.addView(generate,ui.top(8));}
+        if(e.kind.equals("video")&&e.available)sheet.body.addView(ui.item("video","分段截图","按视频时长分为 6 段，生成适合手机的截图",()->{sheet.close();showVideoCaptures(s,e);}),ui.top(12));
         section(sheet.body,"文件信息",null,null);detailLine(sheet.body,"大小",size(e.size));detailLine(sheet.body,"修改时间",dateTime(e.modified));detailLine(sheet.body,"文件路径",e.path);if(!e.available)detailLine(sheet.body,"状态","来源暂不可用");
         section(sheet.body,"手动标签","添加",()->tagPrompt(Collections.singletonList(e.id),()->refreshDetail(sheet,s,e)));
         if(e.tags.isEmpty())sheet.body.addView(ui.text("加一个标签，下次更容易找到。",12,MUTED,false),ui.top(9));else{MobileUi.Flow flow=ui.new Flow();for(String t:e.tags)flow.addView(ui.chip(t+"  ×",true,()->confirm("移除标签“"+t+"”？",e.name,()->mutate(s,()->s.removeTag(Collections.singletonList(e.id),t),"标签已移除",()->refreshDetail(sheet,s,e)))));sheet.body.addView(flow,ui.top(10));}
         sheet.body.addView(ui.item("folder","移动到文件夹",folderName(e.folderId),()->{sheet.close();moveSheet(Collections.singletonList(e.id));}),ui.top(20));
         if(s.remote){sheet.body.addView(ui.item("spark","获取建议标签","根据服务端的资源信息获取建议",()->suggestTags(sheet,s,e)),ui.top(10));}
-        TextView open=ui.button("打开文件",true,()->{Intent i=new Intent(this,PreviewActivity.class);i.putExtra("uri",s.remote?s.client.base+"/api/resources/"+RemoteClient.enc(e.id)+"/file":e.id);i.putExtra("name",e.name);i.putExtra("mime",e.mime);if(s.remote){i.putExtra("server",s.client.base);i.putExtra("resource",e.id);}startActivity(i);});open.setEnabled(e.available);open.setAlpha(e.available?1:.45f);sheet.footer.addView(open,ui.top(8));
+        TextView open=ui.button("全屏预览",true,()->{sheet.close();openPreview(e);});open.setEnabled(e.available);open.setAlpha(e.available?1:.45f);sheet.footer.addView(open,ui.top(8));
         if(s.remote)sheet.footer.addView(ui.button("下载原文件",false,()->download(s,e)),ui.top(8));
+    }
+    private void showVideoCaptures(LibraryStore store,LibraryStore.Entry entry){
+        MobileUi.Sheet sheet=ui.sheet("分段截图",entry.name);
+        sheet.body.addView(ui.text("正在读取视频时长…",13,MUTED,false));sheet.show();
+        io.execute(()->{
+            try{
+                double duration;
+                if(store.remote)duration=store.client.json("GET","/api/resources/"+RemoteClient.enc(entry.id)+"/video-info",null).getDouble("duration");
+                else duration=localVideoDuration(Uri.parse(entry.id));
+                if(!Double.isFinite(duration)||duration<=0)throw new IllegalArgumentException("视频时长不可用");
+                runOnUiThread(()->{
+                    if(destroyed||!sheet.dialog.isShowing())return;
+                    sheet.body.removeAllViews();sheet.footer.removeAllViews();
+                    sheet.body.addView(ui.text("每段中点截取一帧 · 移动端最长边不超过 960 像素",12,MUTED,false));
+                    ArrayList<Bitmap> generated=new ArrayList<>();
+                    sheet.dialog.setOnDismissListener(ignored->{for(Bitmap bitmap:generated)bitmap.recycle();});
+                    ArrayList<TextView> actions=new ArrayList<>();
+                    for(int index=0;index<6;index++){
+                        final int part=index;double at=Math.max(0,Math.min(duration-0.05,(index+0.5)*duration/6));
+                        LinearLayout card=ui.card();card.addView(ui.text("第 "+(index+1)+" 段 · "+String.format(Locale.ROOT,"%.1f",at)+" 秒",14,INK,true));
+                        ImageView image=new ImageView(this);image.setScaleType(ImageView.ScaleType.FIT_CENTER);image.setBackground(ui.shape(SOFT,12,0));card.addView(image,ui.top(8));image.getLayoutParams().height=ui.d(150);
+                        TextView state=ui.text("尚未生成",12,MUTED,false);card.addView(state,ui.top(6));
+                        TextView action=ui.button("生成截图",false,()->{
+                            captureVideoFrame(sheet,store,entry,at,image,state,generated,actions.get(part));
+                        });actions.add(action);card.addView(action,ui.top(10));sheet.body.addView(card,ui.top(10));
+                    }
+                    sheet.footer.addView(ui.button("生成全部截图",true,()->{for(TextView action:actions)if(action.isEnabled())action.performClick();}),ui.top(8));
+                });
+            }catch(Exception error){runOnUiThread(()->{
+                if(destroyed||!sheet.dialog.isShowing())return;
+                sheet.body.removeAllViews();sheet.footer.removeAllViews();
+                sheet.body.addView(ui.text("无法读取视频时长，请输入截图位置（秒）。",13,MUTED,false));
+                EditText input=ui.input("例如 1.5 秒","0.5");
+                input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER|android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);
+                sheet.body.addView(input,ui.top(12));
+                ImageView image=new ImageView(this);image.setScaleType(ImageView.ScaleType.FIT_CENTER);image.setBackground(ui.shape(SOFT,12,0));sheet.body.addView(image,ui.top(12));image.getLayoutParams().height=ui.d(200);
+                TextView state=ui.text("输入时间后生成适合手机的截图",12,MUTED,false);sheet.body.addView(state,ui.top(8));
+                ArrayList<Bitmap> generated=new ArrayList<>();
+                sheet.dialog.setOnDismissListener(ignored->{for(Bitmap bitmap:generated)bitmap.recycle();});
+                TextView action=ui.button("生成截图",true,()->{});
+                action.setOnClickListener(view->{
+                    try{
+                        double at=Double.parseDouble(input.getText().toString());
+                        if(!Double.isFinite(at)||at<0||at>86400)throw new NumberFormatException();
+                        captureVideoFrame(sheet,store,entry,at,image,state,generated,action);
+                    }catch(NumberFormatException invalid){state.setText("请输入 0–86400 秒之间的时间");}
+                });
+                sheet.footer.addView(action,ui.top(8));
+            });}
+        });
+    }
+    private double localVideoDuration(Uri uri)throws Exception{
+        double seconds=0;
+        MediaMetadataRetriever retriever=new MediaMetadataRetriever();
+        try{
+            retriever.setDataSource(this,uri);
+            String value=retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+            if(value!=null&&!value.isEmpty())seconds=Long.parseLong(value)/1000.0;
+        }finally{retriever.release();}
+        if(seconds>0)return seconds;
+        MediaExtractor extractor=new MediaExtractor();
+        try{
+            extractor.setDataSource(this,uri,null);
+            for(int index=0;index<extractor.getTrackCount();index++){
+                MediaFormat format=extractor.getTrackFormat(index);
+                if(format.containsKey(MediaFormat.KEY_DURATION))seconds=Math.max(seconds,format.getLong(MediaFormat.KEY_DURATION)/1_000_000.0);
+            }
+        }finally{extractor.release();}
+        if(seconds>0)return seconds;
+        MediaPlayer player=MediaPlayer.create(this,uri);
+        if(player!=null)try{seconds=player.getDuration()/1000.0;}finally{player.release();}
+        return seconds;
+    }
+    private void captureVideoFrame(MobileUi.Sheet sheet,LibraryStore store,LibraryStore.Entry entry,double at,ImageView image,TextView state,ArrayList<Bitmap> generated,TextView action){
+        action.setEnabled(false);state.setText("正在生成…");
+        io.execute(()->{
+            try{
+                Bitmap bitmap;
+                if(store.remote){
+                    String path="/api/resources/"+RemoteClient.enc(entry.id)+"/thumbnail?size=mobile&at="+String.format(Locale.ROOT,"%.3f",at);
+                    store.client.bytes("POST",path,null,1024);
+                    byte[] bytes=store.client.bytes("GET",path,null,3*1024*1024);
+                    bitmap=android.graphics.BitmapFactory.decodeByteArray(bytes,0,bytes.length);
+                }else bitmap=ThumbnailLoader.videoFrame(this,Uri.parse(entry.id),(long)(at*1_000_000));
+                if(bitmap==null)throw new IllegalStateException("视频帧不可用");
+                runOnUiThread(()->{
+                    if(destroyed||!sheet.dialog.isShowing()){bitmap.recycle();return;}
+                    generated.add(bitmap);image.setImageBitmap(bitmap);state.setText(bitmap.getWidth()+" × "+bitmap.getHeight());action.setText("重新生成截图");action.setEnabled(true);
+                });
+            }catch(Exception error){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing()){state.setText("生成失败："+message(error));action.setEnabled(true);}});}
+        });
     }
     private void suggestTags(MobileUi.Sheet detail,LibraryStore s,LibraryStore.Entry e){
         MobileUi.Sheet suggestions=ui.sheet("建议标签","选择一个建议，将它添加到这个文件。");TextView state=ui.text("正在读取建议…",13,MUTED,false);suggestions.body.addView(state);suggestions.show();
@@ -263,10 +366,39 @@ public final class MainActivity extends Activity {
     }
     private void refreshDetail(MobileUi.Sheet sheet,LibraryStore s,LibraryStore.Entry e){io.execute(()->{try{LibraryStore.Entry fresh=s.detail(e);runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing())detailBody(sheet,s,fresh);});}catch(Exception ex){runOnUiThread(()->toast(message(ex)));}});}
     private void detailLine(LinearLayout parent,String label,String value){LinearLayout row=ui.col();row.addView(ui.text(label,11,MUTED,false));TextView t=ui.text(value==null?"—":value,13,INK,false);t.setTextIsSelectable(true);row.addView(t,ui.top(5));parent.addView(row,ui.top(14));}
+    private void openPreview(LibraryStore.Entry e){
+        if(!e.available){toast("来源暂不可用");return;}
+        LibraryStore s=store();if(s==null)return;
+        Intent intent=new Intent(this,PreviewActivity.class);
+        intent.putExtra("uri",s.remote?s.client.base+"/api/resources/"+RemoteClient.enc(e.id)+"/file":e.id);
+        intent.putExtra("name",e.name).putExtra("mime",e.mime);
+        if(s.remote)intent.putExtra("server",s.client.base).putExtra("resource",e.id);
+        ArrayList<String> ids=new ArrayList<>(),names=new ArrayList<>(),mimes=new ArrayList<>();
+        for(LibraryStore.Entry item:entries)if(item.available&&(item.kind.equals("image")||item.kind.equals("video"))){ids.add(item.id);names.add(item.name);mimes.add(item.mime);}
+        if(ids.contains(e.id)){intent.putStringArrayListExtra("browse_ids",ids);intent.putStringArrayListExtra("browse_names",names);intent.putStringArrayListExtra("browse_mimes",mimes);intent.putExtra("browse_index",ids.indexOf(e.id));}
+        startActivity(intent);
+    }
     private void entryMenu(LibraryStore.Entry e){MobileUi.Sheet s=ui.sheet(e.name,typeName(e.kind));s.body.addView(ui.item("file","文件详情",null,()->{s.close();showDetail(e);}));s.body.addView(ui.item("tag","添加标签",null,()->{s.close();tagPrompt(Collections.singletonList(e.id),null);}));s.body.addView(ui.item("folder","移动到文件夹",null,()->{s.close();moveSheet(Collections.singletonList(e.id));}));s.body.addView(ui.item("check","选择文件",null,()->{s.close();selecting=true;toggleSelection(e.id);}));s.show();}
     private void tagPrompt(List<String> ids,Runnable after){if(ids.isEmpty())return;LibraryStore s=store();prompt("添加标签",ids.size()==1?"例如：旅行、工作":"给 "+ids.size()+" 个文件添加标签","",name->{String clean=LibraryStore.clean(name,s.remote?40:64);mutate(s,()->s.addTag(ids,clean),"标签已添加",after);});}
     private void moveSheet(List<String> ids){if(ids.isEmpty())return;LibraryStore st=store();MobileUi.Sheet s=ui.sheet("移动到文件夹",ids.size()+" 个文件 · 原文件位置不变");s.body.addView(ui.item("download","未归组",null,()->{s.close();mutate(st,()->st.move(ids,"unfiled"),"文件已移至未归组",null);}));for(LibraryStore.Group g:meta.folders)s.body.addView(ui.item("folder",g.name,g.count+" 个文件",()->{s.close();mutate(st,()->st.move(ids,g.id),"文件已移动",null);}),ui.top(6));if(meta.folders.isEmpty())s.body.addView(ui.text("还没有自定义文件夹，可以在“文件夹”页创建。",12,MUTED,false),ui.top(20));s.show();}
-    private void download(LibraryStore s,LibraryStore.Entry e){try{DownloadManager.Request r=new DownloadManager.Request(Uri.parse(s.client.base+"/api/resources/"+RemoteClient.enc(e.id)+"/file?download=1"));r.addRequestHeader("Cookie",s.client.cookie());r.setTitle(e.name);r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,e.name.replace('/','_').replace('\\','_'));((DownloadManager)getSystemService(DOWNLOAD_SERVICE)).enqueue(r);toast("已加入下载任务");}catch(Exception ex){toast("下载失败："+message(ex));}}
+    private void download(LibraryStore s,LibraryStore.Entry e){try{DownloadManager.Request r=new DownloadManager.Request(Uri.parse(s.client.base+"/api/resources/"+RemoteClient.enc(e.id)+"/file?download=1"));r.addRequestHeader("Cookie",s.client.cookie());r.setTitle(e.name);r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,e.name.replace('/','_').replace('\\','_'));long id=((DownloadManager)getSystemService(DOWNLOAD_SERVICE)).enqueue(r);JSONArray saved=transfers();JSONObject item=new JSONObject();item.put("id",id);item.put("name",e.name);saved.put(item);prefs.edit().putString("transfers",saved.toString()).apply();toast("已加入传输列表");if(tab==3)renderTransfers();}catch(Exception ex){toast("下载失败："+message(ex));}}
+    private JSONArray transfers(){try{return new JSONArray(prefs.getString("transfers","[]"));}catch(Exception ignored){return new JSONArray();}}
+    private void renderTransfers(){
+        if(tab!=3)return;int scrollPosition=content.getChildCount()>0&&content.getChildAt(0) instanceof ScrollView?content.getChildAt(0).getScrollY():0;content.removeAllViews();ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout body=ui.col();body.setPadding(ui.d(20),0,ui.d(20),ui.d(24));scroll.addView(body);content.addView(scroll,new LinearLayout.LayoutParams(-1,-1));scroll.post(()->scroll.scrollTo(0,scrollPosition));
+        body.addView(ui.text("下载到手机的文件",13,MUTED,false),ui.top(6));JSONArray saved=transfers();
+        if(saved.length()==0){LinearLayout empty=ui.card();empty.addView(ui.icon("download",36,GREEN));empty.addView(ui.text("暂无传输任务",18,INK,true),ui.top(16));empty.addView(ui.text("从家中资源库打开文件详情，即可下载原文件。",13,MUTED,false),ui.top(8));body.addView(empty,ui.top(20));return;}
+        DownloadManager manager=(DownloadManager)getSystemService(DOWNLOAD_SERVICE);
+        for(int i=saved.length()-1;i>=0;i--){JSONObject item=saved.optJSONObject(i);if(item==null)continue;long id=item.optLong("id",-1);if(id<0)continue;String name=item.optString("name","下载文件");
+            int status=0,reason=0;long downloaded=0,totalBytes=-1;try(android.database.Cursor cursor=manager.query(new DownloadManager.Query().setFilterById(id))){if(cursor!=null&&cursor.moveToFirst()){status=cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));reason=cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));downloaded=cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));totalBytes=cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));}}catch(Exception ignored){}
+            LinearLayout card=ui.card();TextView title=ui.text(name,15,INK,true);title.setMaxLines(2);card.addView(title);String state=status==DownloadManager.STATUS_SUCCESSFUL?"已完成":status==DownloadManager.STATUS_FAILED?"下载失败（"+reason+"）":status==DownloadManager.STATUS_RUNNING?"下载中":status==DownloadManager.STATUS_PAUSED?"已暂停":status==DownloadManager.STATUS_PENDING?"等待下载":"任务已不存在";
+            card.addView(ui.text(state+" · "+size(downloaded)+(totalBytes>0?" / "+size(totalBytes):""),12,MUTED,false),ui.top(7));
+            if(status==DownloadManager.STATUS_RUNNING||status==DownloadManager.STATUS_PAUSED||status==DownloadManager.STATUS_PENDING){ProgressBar bar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);bar.setMax(100);bar.setIndeterminate(totalBytes<=0);if(totalBytes>0)bar.setProgress((int)Math.min(100,downloaded*100/totalBytes));card.addView(bar,ui.top(12));}
+            final int stateValue=status;final long downloadId=id;if(status==DownloadManager.STATUS_SUCCESSFUL)card.addView(ui.button("打开文件",false,()->{Uri uri=manager.getUriForDownloadedFile(downloadId);if(uri==null){toast("文件已移走或不可用");return;}Intent open=new Intent(Intent.ACTION_VIEW);String mime=manager.getMimeTypeForDownloadedFile(downloadId);open.setDataAndType(uri,mime==null?"*/*":mime);open.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);try{startActivity(Intent.createChooser(open,"打开下载文件"));}catch(Exception ex){toast("没有可用的应用打开此文件");}}),ui.top(12));
+            else if(stateValue==DownloadManager.STATUS_RUNNING||stateValue==DownloadManager.STATUS_PAUSED||stateValue==DownloadManager.STATUS_PENDING)card.addView(ui.button("取消下载",false,()->{manager.remove(downloadId);removeTransfer(downloadId);renderTransfers();}),ui.top(12));
+            else card.addView(ui.button("移出列表",false,()->{removeTransfer(downloadId);renderTransfers();}),ui.top(12));body.addView(card,ui.top(12));
+        }
+    }
+    private void removeTransfer(long id){JSONArray old=transfers(),next=new JSONArray();for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item!=null&&item.optLong("id")!=id)next.put(item);}prefs.edit().putString("transfers",next.toString()).apply();}
     private interface Work{void run()throws Exception;}
     private void mutate(LibraryStore target,Work work,String success,Runnable after){if(target==null||busy||scanning){toast("请等待当前操作完成");return;}busy=true;renderBatch();io.execute(()->{try{work.run();runOnUiThread(()->{busy=false;if(destroyed)return;toast(success);if(target==store()){selected.clear();selecting=false;if(after!=null)after.run();reload(false,true);}});}catch(Exception e){runOnUiThread(()->{busy=false;if(destroyed)return;toast(message(e));renderBatch();});}});}
     private interface TextAction{void run(String s);}

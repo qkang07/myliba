@@ -39,7 +39,6 @@ Install Go, a C compiler, C build tools, and pnpm. Build the Vue assets and exec
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
-go build -tags sqlite_fts5 -o myliba ./cmd/myliba
 ```
 
 The hub needs outbound access to download the Go module dependencies on its first build.
@@ -60,11 +59,9 @@ export MYLIBA_HUB_LISTEN=127.0.0.1:4318
 
 ### 3. Connect the home node
 
-On the computer that runs the local Myliba index, set the hub URL and the same node token before starting the app:
+On the computer that runs the local Myliba index, start the app and open <http://127.0.0.1:4317>. Click **服务端** in the top bar, then add the Hub's `wss://.../node` address and the node token configured on the VPS. The local app saves named Hub profiles in its local database. You can switch or disconnect at any time without restarting; only one Hub is connected at a time. The token is not returned to the browser after saving. Existing `MYLIBA_HUB_URL` and `MYLIBA_NODE_TOKEN` variables are imported once when the local database has no Hub profiles, for compatibility with older startup scripts.
 
 ```powershell
-$env:MYLIBA_HUB_URL = 'wss://library.example.com/node'
-$env:MYLIBA_NODE_TOKEN = 'the-same-node-secret-configured-on-the-hub'
 go run -tags sqlite_fts5 ./cmd/myliba
 ```
 
@@ -89,7 +86,7 @@ The hub and home node use the same optional `MYLIBA_ICE_SERVERS` JSON array. Wit
 - Select all resources matching the current folder, search, and tag filters across every result page, then add a tag, move them to a virtual folder, or generate media thumbnails in batches.
 - Save smart collections from a search and filters (multiple tags, virtual folder, file type, indexed folder, unorganized state, and sort order). Collections are stored on the home node and update as its index and tags change; the same collections appear through local and remote web access.
 - Open a resource detail page from its card or a direct `?resource=<id>` link. The page shows file metadata, a type-specific preview, original-file download, and add/remove/suggested tags; it also works through the remote hub.
-- Generate and cache image thumbnails in small (240 × 160), medium (480 × 320), and large (1280 × 960) sizes from the detail page. The resource list still uses the medium thumbnail and does not generate thumbnails merely by loading the list.
+- Generate and cache image thumbnails in small (240 × 160), medium (480 × 320), and large (1280 × 960) sizes from the web detail page. The API also offers a mobile variant bounded by 720 × 960 pixels. Automatic preprocessing prepares both the medium and mobile variants for images and video first frames. The resource list still uses the medium thumbnail and does not generate thumbnails merely by loading the list.
 - For videos, the detail page divides the duration into six segments and can extract a screenshot at each segment midpoint. The screenshots are cached on the home node. The Windows portable build includes FFmpeg and FFprobe; development runs can use tools on the node's `PATH`. Browsers that can read the video can also supply the duration.
 - Serve the responsive app remotely through a password-protected hub and an outbound node connection.
 - Prefer direct browser-to-node WebRTC transfers for remote downloads and non-video file opening, with hub relay fallback.

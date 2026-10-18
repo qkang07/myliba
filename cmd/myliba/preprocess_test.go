@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -124,6 +125,8 @@ func TestPreprocessRemoteRoutesAreScoped(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/preprocess", true},
 		{http.MethodPost, "/api/preprocess/prioritize", true},
+		{http.MethodPost, "/api/preprocess/retry-failed", true},
+		{http.MethodGet, "/api/preprocess/retry-failed", false},
 		{http.MethodPost, "/api/preprocess/item/retry", true},
 		{http.MethodDelete, "/api/preprocess/item/retry", false},
 		{http.MethodGet, "/api/preprocess/item/retry", false},
@@ -191,6 +194,13 @@ func TestPreprocessWorkerCompletesQueuedThumbnail(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("worker thumbnail: %d", response.Code)
 			}
+			mobile := httptest.NewRequest(http.MethodGet, "/api/resources/"+id+"/thumbnail?size=mobile", nil)
+			mobile.SetPathValue("id", id)
+			response = httptest.NewRecorder()
+			app.serveThumbnail(response, mobile)
+			if response.Code != http.StatusOK {
+				t.Fatalf("worker mobile thumbnail: %d", response.Code)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -251,4 +261,118 @@ func TestOtherFilesReceiveFingerprintTask(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("background fingerprint did not complete")
+}
+
+func TestScanCanSkipAutomaticPreprocessingAndRetryFailedJobs(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "library")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 105; i++ {
+		if err := os.WriteFile(filepath.Join(root, "note-"+strconv.Itoa(i)+".txt"), []byte("content"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "library.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	app := &server{db: db, jobsWake: make(chan struct{}, 1)}
+	body, _ := json.Marshal(map[string]any{"path": root, "autoPreprocess": false})
+	response := httptest.NewRecorder()
+	app.addRoot(response, httptest.NewRequest(http.MethodPut, "/api/roots", bytes.NewReader(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("add root: %d %s", response.Code, response.Body.String())
+	}
+	var added struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &added); err != nil {
+		t.Fatal(err)
+	}
+	scan := httptest.NewRequest(http.MethodPost, "/api/roots/"+added.ID+"/scan", nil)
+	scan.SetPathValue("id", added.ID)
+	response = httptest.NewRecorder()
+	app.scanRoot(response, scan)
+	if response.Code != http.StatusOK {
+		t.Fatalf("scan: %d %s", response.Code, response.Body.String())
+	}
+	var resourceID string
+	if err := db.QueryRow(`SELECT id FROM resources WHERE root_id=?`, added.ID).Scan(&resourceID); err != nil {
+		t.Fatal(err)
+	}
+	app.backfillPreprocessing()
+	priorityBody, _ := json.Marshal(map[string]any{"ids": []string{resourceID}})
+	response = httptest.NewRecorder()
+	app.prioritizePreprocessJobs(response, httptest.NewRequest(http.MethodPost, "/api/preprocess/prioritize", bytes.NewReader(priorityBody)))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("prioritize: %d %s", response.Code, response.Body.String())
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM preprocess_jobs`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("disabled root queued %d jobs: %v", count, err)
+	}
+	rows, err := db.Query(`SELECT id FROM resources WHERE root_id=?`, added.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	for _, id := range ids {
+		if _, err := db.Exec(`INSERT INTO preprocess_jobs(resource_id,operation,version_key,status,created_at,updated_at,error)
+            VALUES(?, 'fingerprint', '1', 'failed', '2026-01-01', '2026-01-01', 'previous error')`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	response = httptest.NewRecorder()
+	app.retryFailedPreprocessJobs(response, httptest.NewRequest(http.MethodPost, "/api/preprocess/retry-failed", nil))
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"retried":105`)) {
+		t.Fatalf("bulk retry: %d %s", response.Code, response.Body.String())
+	}
+	var pending int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM preprocess_jobs WHERE status='pending' AND error=''`).Scan(&pending); err != nil || pending != 105 {
+		t.Fatalf("retried jobs: %d, %v", pending, err)
+	}
+	var status, jobError string
+	if err := db.QueryRow(`SELECT status,error FROM preprocess_jobs WHERE resource_id=?`, resourceID).Scan(&status, &jobError); err != nil || status != "pending" || jobError != "" {
+		t.Fatalf("retried job: status=%s error=%s query=%v", status, jobError, err)
+	}
+}
+
+func TestMigratePreservesExistingRootsPreprocessDefault(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "library.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE roots (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, added_at TEXT NOT NULL, last_scan_at TEXT);
+        INSERT INTO roots(id,path,added_at) VALUES('old','C:/old','2026-01-01')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	var enabled bool
+	if err := db.QueryRow(`SELECT auto_preprocess FROM roots WHERE id='old'`).Scan(&enabled); err != nil || !enabled {
+		t.Fatalf("legacy root auto preprocess = %v, %v", enabled, err)
+	}
 }
