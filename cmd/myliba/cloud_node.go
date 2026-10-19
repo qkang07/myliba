@@ -1,0 +1,479 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+type cloudRuntime struct {
+	disk      *cloudDisk
+	id        string
+	role      string
+	endpoint  string
+	db        *sql.DB
+	hubURL    string
+	token     string
+	mu        sync.RWMutex
+	peers     []cloudNode
+	bootstrap []cloudNode
+	locations map[string][]cloudNode
+	client    *http.Client
+}
+
+func cloudDataDir(storageOnly bool) (string, error) {
+	if dir := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_DATA_DIR")); dir != "" {
+		return dir, nil
+	}
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	if storageOnly {
+		return filepath.Join(base, "myliba-storage"), nil
+	}
+	return filepath.Join(base, "myliba", "cloud"), nil
+}
+
+func readOrCreateCloudID(dir string) (string, error) {
+	path := filepath.Join(dir, "node-id")
+	if raw, err := os.ReadFile(path); err == nil {
+		id := strings.TrimSpace(string(raw))
+		if len(id) == 32 {
+			return id, nil
+		}
+	}
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	id := hex.EncodeToString(raw[:])
+	if err := os.WriteFile(path, []byte(id), 0600); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
+	dir, err := cloudDataDir(storageOnly)
+	if err != nil {
+		return nil, err
+	}
+	disk, err := newCloudDisk(dir)
+	if err != nil {
+		return nil, err
+	}
+	if storageOnly {
+		disk.backend, err = newCloudBackendFromEnv()
+		if err != nil {
+			return nil, err
+		}
+	}
+	id, err := readOrCreateCloudID(dir)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := strings.TrimRight(strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_PUBLIC_URL")), "/")
+	if !validCloudEndpoint(endpoint) {
+		return nil, errors.New("MYLIBA_CLOUD_PUBLIC_URL must be HTTPS, or loopback HTTP for development")
+	}
+	role := "client"
+	if storageOnly {
+		role = "storage"
+	}
+	rt := &cloudRuntime{
+		disk: disk, id: id, role: role, endpoint: endpoint, db: db,
+		client: &http.Client{
+			Timeout:       45 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		locations: map[string][]cloudNode{},
+	}
+	if raw := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_BOOTSTRAP_URLS")); raw != "" {
+		var endpoints []string
+		if err := json.Unmarshal([]byte(raw), &endpoints); err != nil {
+			return nil, errors.New("MYLIBA_CLOUD_BOOTSTRAP_URLS must be a JSON URL array")
+		}
+		for _, endpoint := range endpoints {
+			endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+			if endpoint == "" || !validCloudEndpoint(endpoint) {
+				return nil, errors.New("invalid cloud bootstrap URL")
+			}
+			if endpoint != rt.endpoint {
+				rt.bootstrap = append(rt.bootstrap, cloudNode{ID: cloudHash([]byte(endpoint)), Endpoint: endpoint, Role: "storage"})
+			}
+		}
+		rt.peers = append([]cloudNode(nil), rt.bootstrap...)
+	}
+	if storageOnly {
+		rt.hubURL = os.Getenv("MYLIBA_HUB_URL")
+		rt.token = os.Getenv("MYLIBA_CLOUD_TOKEN")
+		if endpoint == "" {
+			return nil, errors.New("storage node needs MYLIBA_CLOUD_PUBLIC_URL")
+		}
+		if rt.hubURL == "" || len(rt.token) < 32 {
+			return nil, errors.New("storage node needs MYLIBA_HUB_URL and MYLIBA_CLOUD_TOKEN")
+		}
+	}
+	return rt, nil
+}
+
+func (c *cloudRuntime) credentials() (string, string, error) {
+	if c.db == nil {
+		return c.hubURL, c.token, nil
+	}
+	var rawURL, token string
+	err := c.db.QueryRow(`SELECT p.url,p.cloud_token FROM hub_profiles p JOIN hub_settings s ON s.value=p.id WHERE s.key='active_hub'`).Scan(&rawURL, &token)
+	if err == sql.ErrNoRows {
+		return "", strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_TOKEN")), nil
+	}
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_TOKEN"))
+	}
+	return rawURL, token, err
+}
+
+func (c *cloudRuntime) request(ctx context.Context, method, base, path, token string, body io.Reader) (*http.Response, error) {
+	if !validCloudEndpoint(base) || base == "" {
+		return nil, errors.New("invalid cloud endpoint")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	return c.client.Do(req)
+}
+
+func (c *cloudRuntime) put(ctx context.Context, base, kind, id, token string, data []byte) error {
+	response, err := c.request(ctx, http.MethodPut, base, "/cloud/"+kind+"/"+id, token, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("cloud %s PUT: HTTP %d", kind, response.StatusCode)
+	}
+	return nil
+}
+
+func (c *cloudRuntime) get(ctx context.Context, base, kind, id, token string, limit int64) ([]byte, error) {
+	response, err := c.request(ctx, http.MethodGet, base, "/cloud/"+kind+"/"+id, token, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cloud %s GET: HTTP %d", kind, response.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit || cloudHash(data) != id {
+		return nil, errors.New("cloud object failed verification")
+	}
+	return data, nil
+}
+
+func (c *cloudRuntime) remoteIDs(ctx context.Context, base, token string) ([]string, error) {
+	response, err := c.request(ctx, http.MethodGet, base, "/cloud/catalog", token, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("catalog list: HTTP %d", response.StatusCode)
+	}
+	var list struct {
+		Records []string `json:"records"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<20)).Decode(&list); err != nil {
+		return nil, err
+	}
+	for _, id := range list.Records {
+		if !validCloudHash(id) {
+			return nil, errors.New("invalid remote catalog ID")
+		}
+	}
+	return list.Records, nil
+}
+
+func (c *cloudRuntime) syncCatalog(ctx context.Context, base, token string) error {
+	remote, err := c.remoteIDs(ctx, base, token)
+	if err != nil {
+		return err
+	}
+	local, err := c.disk.list("catalog")
+	if err != nil {
+		return err
+	}
+	localSet, remoteSet := map[string]bool{}, map[string]bool{}
+	for _, id := range local {
+		if c.disk.valid("catalog", id) {
+			localSet[id] = true
+		}
+	}
+	for _, id := range remote {
+		remoteSet[id] = true
+	}
+	for _, id := range remote {
+		if localSet[id] {
+			continue
+		}
+		data, err := c.get(ctx, base, "catalog", id, token, cloudMaxRecordSize)
+		if err == nil {
+			err = c.disk.put("catalog", id, bytes.NewReader(data), cloudMaxRecordSize)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, id := range local {
+		if !localSet[id] {
+			continue
+		}
+		if remoteSet[id] {
+			continue
+		}
+		file, err := c.disk.get("catalog", id)
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(io.LimitReader(file, cloudMaxRecordSize+1))
+		file.Close()
+		if err != nil {
+			return err
+		}
+		if err := c.put(ctx, base, "catalog", id, token, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *cloudRuntime) activePeers() []cloudNode {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := append([]cloudNode(nil), c.peers...)
+	return result
+}
+
+func (c *cloudRuntime) blockLocations(id string) []cloudNode {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]cloudNode(nil), c.locations[id]...)
+}
+
+func (c *cloudRuntime) peerInventory(ctx context.Context, peer cloudNode, token string) ([]string, error) {
+	ids := []string{}
+	after := ""
+	for {
+		path := "/cloud/inventory"
+		if after != "" {
+			path += "?after=" + after
+		}
+		response, err := c.request(ctx, http.MethodGet, peer.Endpoint, path, token, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Blocks []string `json:"blocks"`
+			Next   string   `json:"next"`
+		}
+		err = json.NewDecoder(io.LimitReader(response.Body, 128<<10)).Decode(&page)
+		response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK {
+			return nil, errors.New("inventory unavailable")
+		}
+		for _, id := range page.Blocks {
+			if !validCloudHash(id) || (after != "" && id <= after) {
+				return nil, errors.New("invalid inventory")
+			}
+			after = id
+			ids = append(ids, id)
+		}
+		if page.Next == "" {
+			return ids, nil
+		}
+		if page.Next != after || len(page.Blocks) == 0 {
+			return nil, errors.New("invalid inventory cursor")
+		}
+	}
+}
+
+func (c *cloudRuntime) refreshLocations(ctx context.Context, token string, peers []cloudNode) {
+	locations := map[string][]cloudNode{}
+	if ids, err := c.disk.list("blocks"); err == nil {
+		self := cloudNode{ID: c.id, Endpoint: c.endpoint, Role: c.role}
+		for _, id := range ids {
+			locations[id] = append(locations[id], self)
+		}
+	}
+	for _, peer := range peers {
+		ids, err := c.peerInventory(ctx, peer, token)
+		if err != nil {
+			continue
+		}
+		for _, id := range ids {
+			locations[id] = append(locations[id], peer)
+		}
+	}
+	c.mu.Lock()
+	c.locations = locations
+	c.mu.Unlock()
+}
+
+func (c *cloudRuntime) syncOnce(ctx context.Context) error {
+	wsURL, token, err := c.credentials()
+	if err != nil || len(token) < 32 {
+		return err
+	}
+	peers := c.activePeers()
+	known := map[string]bool{}
+	for _, peer := range peers {
+		known[peer.Endpoint] = true
+	}
+	for _, peer := range c.bootstrap {
+		if !known[peer.Endpoint] {
+			peers = append(peers, peer)
+			known[peer.Endpoint] = true
+		}
+	}
+	var hubErr error
+	if wsURL != "" {
+		hub, parseErr := hubHTTPURL(wsURL)
+		if parseErr != nil {
+			hubErr = parseErr
+		} else {
+			var discovered []cloudNode
+			discovered, hubErr = c.hubPeers(ctx, hub, token)
+			if hubErr == nil {
+				peers = append([]cloudNode(nil), c.bootstrap...)
+				known = map[string]bool{}
+				for _, peer := range peers {
+					known[peer.Endpoint] = true
+				}
+			}
+			for _, peer := range discovered {
+				if !known[peer.Endpoint] {
+					peers = append(peers, peer)
+					known[peer.Endpoint] = true
+				}
+			}
+			if hubErr == nil {
+				hubErr = c.syncCatalog(ctx, hub, token)
+			}
+		}
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
+	c.mu.Lock()
+	c.peers = peers
+	c.mu.Unlock()
+	for _, peer := range peers {
+		if err := c.syncCatalog(ctx, peer.Endpoint, token); err != nil {
+			log.Printf("Cloud index sync with %s: %v", peer.ID, err)
+		}
+	}
+	c.refreshLocations(ctx, token, peers)
+	c.repairBlocks(ctx, token, peers)
+	return hubErr
+}
+
+func (c *cloudRuntime) hubPeers(ctx context.Context, hub, token string) ([]cloudNode, error) {
+	stats, err := c.disk.stats()
+	if err != nil {
+		log.Printf("Cloud storage stats unavailable: %v", err)
+	}
+	data, _ := json.Marshal(cloudNode{ID: c.id, Endpoint: c.endpoint, Role: c.role, cloudStorageStats: stats})
+	response, err := c.request(ctx, http.MethodPost, hub, "/cloud/nodes/heartbeat", token, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return nil, fmt.Errorf("Hub registration: HTTP %d", response.StatusCode)
+	}
+	response, err = c.request(ctx, http.MethodGet, hub, "/cloud/nodes", token, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Hub node list: HTTP %d", response.StatusCode)
+	}
+	var list struct {
+		Nodes []cloudNode `json:"nodes"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&list); err != nil {
+		return nil, err
+	}
+	peers := []cloudNode{}
+	for _, node := range list.Nodes {
+		if node.ID != c.id && node.Endpoint != "" && validCloudEndpoint(node.Endpoint) {
+			peers = append(peers, node)
+		}
+	}
+	return peers, nil
+}
+
+func (c *cloudRuntime) run(ctx context.Context) {
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	for {
+		attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := c.syncOnce(attempt); err != nil {
+			log.Printf("Cloud sync: %v", err)
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *cloudRuntime) serveDirect() error {
+	addr := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_LISTEN"))
+	if addr == "" {
+		addr = "127.0.0.1:4319"
+	}
+	mux := http.NewServeMux()
+	// Credentials can rotate when a saved Hub profile is updated.
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, token, err := c.credentials()
+		if err != nil || len(token) < 32 {
+			http.Error(w, "unavailable", 503)
+			return
+		}
+		inner := http.NewServeMux()
+		c.disk.routes(inner, token)
+		inner.ServeHTTP(w, r)
+	}))
+	log.Printf("Cloud direct endpoint listening on %s", addr)
+	return (&http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}).ListenAndServe()
+}
+
+func runCloudStorage() error {
+	c, err := newCloudRuntime(nil, true)
+	if err != nil {
+		return err
+	}
+	go c.run(context.Background())
+	return c.serveDirect()
+}

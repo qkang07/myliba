@@ -72,7 +72,7 @@ func (s *server) readCollectionInput(w http.ResponseWriter, r *http.Request) (co
 	input.Filters.FolderID = strings.TrimSpace(input.Filters.FolderID)
 	if input.Name == "" || utf8.RuneCountInString(input.Name) > 80 || utf8.RuneCountInString(input.Filters.Query) > 200 ||
 		!validCollectionKind(input.Filters.Kind) || !validCollectionSort(input.Filters.Sort) || len(input.Filters.Tags) > 20 {
-		writeError(w, http.StatusBadRequest, "集合名称或筛选条件无效")
+		writeError(w, http.StatusBadRequest, "查询名称或筛选条件无效")
 		return input, false
 	}
 	if input.Filters.Sort == "" {
@@ -133,7 +133,7 @@ func (s *server) readCollectionInput(w http.ResponseWriter, r *http.Request) (co
 func (s *server) listCollections(w http.ResponseWriter, _ *http.Request) {
 	rows, err := s.db.Query(`SELECT id,name,filters_json,created_at FROM smart_collections ORDER BY name COLLATE NOCASE, id`)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "无法读取智能集合")
+		writeError(w, http.StatusInternalServerError, "无法读取常用查询")
 		return
 	}
 	defer rows.Close()
@@ -142,13 +142,13 @@ func (s *server) listCollections(w http.ResponseWriter, _ *http.Request) {
 		var item smartCollection
 		var filtersJSON string
 		if err := rows.Scan(&item.ID, &item.Name, &filtersJSON, &item.CreatedAt); err != nil || json.Unmarshal([]byte(filtersJSON), &item.Filters) != nil {
-			writeError(w, http.StatusInternalServerError, "无法读取智能集合")
+			writeError(w, http.StatusInternalServerError, "无法读取常用查询")
 			return
 		}
 		items = append(items, item)
 	}
 	if rows.Err() != nil {
-		writeError(w, http.StatusInternalServerError, "无法读取智能集合")
+		writeError(w, http.StatusInternalServerError, "无法读取常用查询")
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
@@ -182,7 +182,7 @@ func (s *server) updateCollection(w http.ResponseWriter, r *http.Request) {
 	}
 	count, err := result.RowsAffected()
 	if err != nil || count == 0 {
-		writeError(w, http.StatusNotFound, "智能集合不存在")
+		writeError(w, http.StatusNotFound, "常用查询不存在")
 		return
 	}
 	var item smartCollection
@@ -190,7 +190,7 @@ func (s *server) updateCollection(w http.ResponseWriter, r *http.Request) {
 	item.Name = input.Name
 	item.Filters = input.Filters
 	if err := s.db.QueryRow(`SELECT created_at FROM smart_collections WHERE id=?`, item.ID).Scan(&item.CreatedAt); err != nil {
-		writeError(w, http.StatusInternalServerError, "无法读取智能集合")
+		writeError(w, http.StatusInternalServerError, "无法读取常用查询")
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
@@ -199,12 +199,12 @@ func (s *server) updateCollection(w http.ResponseWriter, r *http.Request) {
 func (s *server) deleteCollection(w http.ResponseWriter, r *http.Request) {
 	result, err := s.db.Exec(`DELETE FROM smart_collections WHERE id=?`, r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "无法删除智能集合")
+		writeError(w, http.StatusInternalServerError, "无法删除常用查询")
 		return
 	}
 	count, err := result.RowsAffected()
 	if err != nil || count == 0 {
-		writeError(w, http.StatusNotFound, "智能集合不存在")
+		writeError(w, http.StatusNotFound, "常用查询不存在")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -213,8 +213,8 @@ func (s *server) deleteCollection(w http.ResponseWriter, r *http.Request) {
 func writeCollectionError(w http.ResponseWriter, err error) {
 	var sqliteErr sqlite3.Error
 	if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrConstraint {
-		writeError(w, http.StatusConflict, "已有同名智能集合")
+		writeError(w, http.StatusConflict, "已有同名常用查询")
 		return
 	}
-	writeError(w, http.StatusInternalServerError, "无法保存智能集合")
+	writeError(w, http.StatusInternalServerError, "无法保存常用查询")
 }

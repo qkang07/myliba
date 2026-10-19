@@ -59,6 +59,12 @@ func main() {
 		}
 		return
 	}
+	if os.Getenv("MYLIBA_MODE") == "storage" {
+		if err := runCloudStorage(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	dataDir, err := os.UserConfigDir()
 	if err != nil {
 		log.Fatal(err)
@@ -94,11 +100,32 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	cloudRuntime, err := newCloudRuntime(db, false)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cloud, err := newCloudClient(cloudRuntime)
+	if err != nil {
+		log.Fatal(err)
+	}
+	go cloudRuntime.run(context.Background())
+	go func() {
+		if err := cloudRuntime.serveDirect(); err != nil {
+			log.Fatal(err)
+		}
+	}()
 	if err := app.startPreprocessing(); err != nil {
 		log.Fatal(err)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
+	mux.HandleFunc("GET /api/cloud/files", cloud.list)
+	mux.HandleFunc("GET /api/cloud/files/{id}/file", cloud.download)
+	mux.HandleFunc("GET /api/cloud/files/{id}/versions", cloud.versions)
+	mux.HandleFunc("GET /api/cloud/files/{id}/versions/{revision}/file", cloud.download)
+	mux.HandleFunc("POST /api/cloud/resources/{id}/upload", cloud.upload)
+	mux.HandleFunc("GET /api/cloud/recovery", cloud.recovery)
+	mux.HandleFunc("POST /api/cloud/recovery", cloud.recovery)
 	mux.HandleFunc("GET /api/session", localSession)
 	mux.HandleFunc("GET /api/hubs", hubs.list)
 	mux.HandleFunc("POST /api/hubs", hubs.save)

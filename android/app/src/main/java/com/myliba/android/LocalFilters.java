@@ -57,7 +57,7 @@ final class LocalFilters {
             filters.unorganized = json.optBoolean("unorganized", false);
             filters.sort = json.optString("sort", "modified_desc");
         } catch (JSONException error) {
-            throw new IllegalArgumentException("智能集合筛选条件已损坏", error);
+            throw new IllegalArgumentException("常用查询筛选条件已损坏", error);
         }
         return filters;
     }

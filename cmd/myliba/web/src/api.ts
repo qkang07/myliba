@@ -1,5 +1,8 @@
 import { webRTCConnected, webRTCFetch } from "./webrtc";
 
+let remoteSession = false;
+const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail)|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file))(?:\?|$)/;
+
 export interface Resource {
   id: string;
   name: string;
@@ -114,6 +117,7 @@ export interface HubProfile {
   name: string;
   url: string;
   hasToken: boolean;
+  hasCloudToken: boolean;
 }
 
 export interface HubProfilesView {
@@ -126,7 +130,7 @@ export function getHubProfiles() {
   return request<HubProfilesView>("/api/hubs");
 }
 
-export function saveHubProfile(profile: { id?: string; name: string; url: string; token: string }) {
+export function saveHubProfile(profile: { id?: string; name: string; url: string; token: string; cloudToken: string }) {
   return request<HubProfilesView>("/api/hubs", { method: "POST", body: JSON.stringify(profile) });
 }
 
@@ -148,7 +152,10 @@ export class ApiError extends Error {
 }
 
 async function apiFetch(url: string, init?: RequestInit) {
-  if (url.startsWith("/api/") && url !== "/api/session" && webRTCConnected()) {
+  if (remoteSession && contentPath.test(url) && !webRTCConnected()) {
+    throw new Error("文件内容仅通过节点直连传输；当前直连不可用");
+  }
+  if (url.startsWith("/api/") && url !== "/api/session" && !url.startsWith("/api/hub/") && webRTCConnected()) {
     return webRTCFetch(url, init);
   }
   return fetch(url, init);
@@ -178,15 +185,100 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export async function getSession(): Promise<SessionInfo | null> {
   const response = await fetch("/api/session", { credentials: "same-origin" });
-  if (response.status === 404) return null;
+  if (response.status === 404) { remoteSession = false; return null; }
+  remoteSession = true;
   if (response.status === 401) return { authenticated: false, nodeOnline: false, webTraffic: { downloadBps: 0, uploadBps: 0 }, nodeTraffic: { downloadBps: 0, uploadBps: 0 } };
   if (!response.ok) throw new ApiError(response.status, "无法读取登录状态");
   const session = await response.json() as SessionInfo;
+  remoteSession = !session.local;
   return session.local ? null : session;
 }
 
 export function login(password: string) {
+  remoteSession = true;
   return request<SessionInfo>("/api/session", { method: "POST", body: JSON.stringify({ password }) });
+}
+
+export interface CloudFile {
+  id: string;
+  name: string;
+  size: number;
+  modified: string;
+  history: boolean;
+  sourceId?: string;
+  chunks: number;
+  revisionId: string;
+  minReplicas: number;
+}
+
+export interface CloudNode {
+  id: string;
+  endpoint: string;
+  role: "client" | "storage";
+  seenAt: string;
+}
+
+export interface HubCloudNode extends CloudNode {
+  online: boolean;
+  statsReady?: boolean;
+  backend?: "disk" | "s3" | "webdav";
+  blockCount: number;
+  blockBytes?: number;
+  catalogCount: number;
+  capacityBytes?: number;
+  availableBytes?: number;
+}
+
+export interface HubCloudOverview {
+  enabled: boolean;
+  nodes: HubCloudNode[];
+  online?: number;
+  offline?: number;
+  reportedBlockCount?: number;
+  reportedBlockBytes?: number;
+  unknownBlockBytesNodes?: number;
+  knownCapacityBytes?: number;
+  knownAvailableBytes?: number;
+  unknownCapacityNodes?: number;
+  catalogRecords?: number;
+}
+
+export function getHubCloudOverview() {
+  return request<HubCloudOverview>("/api/hub/cloud/overview");
+}
+
+export interface CloudView {
+  files: CloudFile[];
+  jobs: Record<string, string>;
+  nodeId: string;
+  libraryId: string;
+  peers: CloudNode[];
+  directEndpoint: string;
+}
+
+export function getCloudFiles() {
+  return request<CloudView>("/api/cloud/files");
+}
+
+export function uploadResourceToCloud(id: string, history?: boolean) {
+  return request<{ status: string }>(`/api/cloud/resources/${encodeURIComponent(id)}/upload`, { method: "POST", body: JSON.stringify({ history }), headers: { "X-Myliba-Local": "1" } });
+}
+
+export function getCloudFile(id: string, revisionId?: string) {
+  const base = `/api/cloud/files/${encodeURIComponent(id)}`;
+  return apiFetch(revisionId ? `${base}/versions/${encodeURIComponent(revisionId)}/file` : `${base}/file`);
+}
+
+export function getCloudVersions(id: string) {
+  return request<CloudFile[]>(`/api/cloud/files/${encodeURIComponent(id)}/versions`);
+}
+
+export function getCloudRecovery() {
+  return request<{ recoveryKey: string; libraryId: string }>("/api/cloud/recovery", { headers: { "X-Myliba-Local": "1" } });
+}
+
+export function importCloudRecovery(recoveryKey: string) {
+  return request<{ libraryId: string }>("/api/cloud/recovery", { method: "POST", body: JSON.stringify({ recoveryKey }), headers: { "X-Myliba-Local": "1" } });
 }
 
 export function logout() {

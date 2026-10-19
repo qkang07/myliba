@@ -39,6 +39,18 @@ func runHub() error {
 	}
 	hub := &remoteHub{waiters: map[string]*remoteWaiter{}, password: password, secure: os.Getenv("MYLIBA_HUB_COOKIE_SECURE") != "0", sessions: map[string]time.Time{}, iceServers: iceServers, signalSessions: map[string]*websocket.Conn{}}
 	mux := http.NewServeMux()
+	cloudToken := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_TOKEN"))
+	var cloud *cloudHub
+	if cloudToken != "" {
+		if len(cloudToken) < 32 {
+			return errors.New("MYLIBA_CLOUD_TOKEN must be at least 32 characters")
+		}
+		cloud, err = newCloudHub()
+		if err != nil {
+			return err
+		}
+		cloud.routes(mux, cloudToken)
+	}
 	mux.HandleFunc("GET /node", func(w http.ResponseWriter, r *http.Request) {
 		if !validBearer(r, nodeToken) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -55,6 +67,14 @@ func runHub() error {
 	mux.HandleFunc("GET /api/session", hub.sessionStatus)
 	mux.HandleFunc("POST /api/session", hub.login)
 	mux.HandleFunc("DELETE /api/session", hub.logout)
+	mux.Handle("GET /api/hub/cloud/overview", hub.requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cloud == nil {
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "nodes": []cloudNode{}})
+			return
+		}
+		cloud.overview(w, r)
+	})))
 	mux.Handle("/api/", hub.requireSession(http.HandlerFunc(hub.proxy)))
 	mux.Handle("/", http.FileServer(http.FS(static)))
 	server := &http.Server{Addr: addr, Handler: hubHeaders(hub.trackWebTraffic(mux)), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}

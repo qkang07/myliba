@@ -421,7 +421,7 @@ final class LocalLibrary extends SQLiteOpenHelper {
         ContentValues values = new ContentValues();
         String actualId = id == null ? UUID.randomUUID().toString() : id;
         values.put("id", actualId);
-        values.put("name", cleanName(name, "智能集合"));
+        values.put("name", cleanName(name, "常用查询"));
         values.put("filters_json", filters.serialize());
         if (id == null) getWritableDatabase().insertOrThrow("collections", null, values);
         else getWritableDatabase().update("collections", values, "id=?", new String[]{id});

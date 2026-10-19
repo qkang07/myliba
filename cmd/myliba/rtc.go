@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,7 +44,20 @@ type rtcRequest struct {
 }
 
 func newNodeRTCManager(conn *websocket.Conn, writeMu *sync.Mutex, servers []iceServerConfig) *nodeRTCManager {
-	return &nodeRTCManager{sessions: map[string]*nodeRTCSession{}, config: pionICEConfiguration(servers), conn: conn, writeMu: writeMu}
+	direct := make([]iceServerConfig, 0, len(servers))
+	for _, server := range servers {
+		filtered := server
+		filtered.URLs = nil
+		for _, endpoint := range server.URLs {
+			if !strings.HasPrefix(strings.ToLower(endpoint), "turn:") && !strings.HasPrefix(strings.ToLower(endpoint), "turns:") {
+				filtered.URLs = append(filtered.URLs, endpoint)
+			}
+		}
+		if len(filtered.URLs) > 0 {
+			direct = append(direct, filtered)
+		}
+	}
+	return &nodeRTCManager{sessions: map[string]*nodeRTCSession{}, config: pionICEConfiguration(direct), conn: conn, writeMu: writeMu}
 }
 
 func (m *nodeRTCManager) handle(sessionID string, payload json.RawMessage) {

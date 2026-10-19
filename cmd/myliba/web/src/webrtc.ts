@@ -176,7 +176,14 @@ export async function connectWebRTC(
   rateListener = onRate;
   emitState("connecting");
   try {
-    const rtc = new RTCPeerConnection({ iceServers });
+    // Content is not allowed through relay candidates, including TURN.
+    const directServers = iceServers.flatMap((server) => {
+      const urls = (Array.isArray(server.urls) ? server.urls : [server.urls]).filter(
+        (url) => typeof url === "string" && !/^(turn|turns):/i.test(url),
+      );
+      return urls.length ? [{ ...server, urls }] : [];
+    });
+    const rtc = new RTCPeerConnection({ iceServers: directServers });
     peer = rtc;
     const socketURL = new URL("/signal", window.location.href);
     socketURL.protocol = socketURL.protocol === "https:" ? "wss:" : "ws:";

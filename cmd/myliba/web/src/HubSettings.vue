@@ -11,6 +11,7 @@ const editingID = ref("");
 const name = ref("");
 const url = ref("");
 const token = ref("");
+const cloudToken = ref("");
 let timer: ReturnType<typeof setInterval> | undefined;
 
 const activeName = () => view.value.profiles.find(profile => profile.id === view.value.activeId)?.name || "未连接";
@@ -26,6 +27,7 @@ function create() {
   name.value = "";
   url.value = "";
   token.value = "";
+  cloudToken.value = "";
   error.value = "";
 }
 
@@ -34,6 +36,7 @@ function edit(profile: HubProfile) {
   name.value = profile.name;
   url.value = profile.url;
   token.value = "";
+  cloudToken.value = "";
   error.value = "";
 }
 
@@ -42,7 +45,7 @@ async function save() {
   busy.value = true;
   error.value = "";
   try {
-    view.value = await saveHubProfile({ id: editingID.value || undefined, name: name.value.trim(), url: url.value.trim(), token: token.value.trim() });
+    view.value = await saveHubProfile({ id: editingID.value || undefined, name: name.value.trim(), url: url.value.trim(), token: token.value.trim(), cloudToken: cloudToken.value.trim() });
     create();
   } catch (cause) { error.value = cause instanceof Error ? cause.message : "保存失败"; }
   finally { busy.value = false; }
@@ -100,6 +103,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
           <label>名称<input v-model="name" maxlength="80" required placeholder="例如：我的 VPS" /></label>
           <label>服务端地址<input v-model="url" type="url" maxlength="2048" required placeholder="wss://example.com/node" autocomplete="url" /></label>
           <label>节点密钥<input v-model="token" type="password" maxlength="4096" :required="!editingID" :placeholder="editingID ? '留空则保持原密钥' : '输入 VPS 上配置的节点密钥'" autocomplete="new-password" /></label>
+          <label>云层密钥<input v-model="cloudToken" type="password" maxlength="4096" :placeholder="editingID ? '留空则保持原云层密钥' : '与 VPS 的 MYLIBA_CLOUD_TOKEN 一致'" autocomplete="new-password" /></label>
           <p>密钥保存在本机资源库，不会在页面中回显。新服务端保存后会立即连接。</p>
           <div class="hub-form-actions"><button v-if="editingID" class="button button-secondary" type="button" @click="create">取消编辑</button><button class="button button-primary" type="submit" :disabled="busy"><LoaderCircle v-if="busy" class="spin" :size="14" /><Plus v-else :size="14" />{{ editingID ? "保存" : "添加并连接" }}</button></div>
         </form>

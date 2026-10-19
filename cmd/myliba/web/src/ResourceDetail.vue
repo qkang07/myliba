@@ -3,12 +3,12 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { ArrowLeft, Check, CircleAlert, Download, Expand, File, FileText, Image, LoaderCircle, Minimize, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
 import ImagePreview from "./ImagePreview.vue";
 import {
-  addResourceTag, createThumbnailVariant, fileURL, getResource, getResourceThumbnailVariant,
+  addResourceTag, createThumbnailVariant, fileURL, getResource, getResourceFile, getResourceThumbnailVariant, uploadResourceToCloud,
   getTagSuggestions, getTags, getVideoInfo, moveResourcesToFolder, removeResourceTag,
   type Resource, type TagSuggestion, type TagSummary, type VirtualFolder,
 } from "./api";
 
-const props = defineProps<{ id: string; folders: VirtualFolder[] }>();
+const props = defineProps<{ id: string; folders: VirtualFolder[]; remote: boolean }>();
 const emit = defineEmits<{ back: []; tagsChanged: []; folderChanged: [] }>();
 type Size = "small" | "medium" | "large";
 type Capture = { key: string; at: number; label: string };
@@ -16,6 +16,9 @@ const resource = ref<Resource | null>(null);
 const loading = ref(true);
 const error = ref("");
 const previewError = ref("");
+const previewURL = ref("");
+const cloudStatus = ref("");
+const cloudBusy = ref(false);
 const tagInput = ref("");
 const tagBusy = ref(false);
 const folderBusy = ref(false);
@@ -118,6 +121,8 @@ async function generateAllCaptures() {
   } finally { captureBusy.value = false; }
 }
 async function refreshResource() {
+  if (previewURL.value) URL.revokeObjectURL(previewURL.value);
+  previewURL.value = "";
   closeImageViewer();
   closeExpandedPreview();
   const current = ++generation;
@@ -133,6 +138,20 @@ async function refreshResource() {
     if (current !== generation) return;
     resource.value = item;
     loading.value = false;
+    if (props.remote && item.available) {
+      if (item.size > 128 * 1024 * 1024) {
+        previewError.value = "此文件超过直连网页预览的大小限制，请下载后打开。";
+      } else {
+        void getResourceFile(item.id).then(async (response) => {
+          if (!response.ok) throw new Error("直连读取失败");
+          const url = URL.createObjectURL(await response.blob());
+          if (generation !== current) URL.revokeObjectURL(url);
+          else previewURL.value = url;
+        }).catch((cause) => {
+          if (generation === current) previewError.value = cause instanceof Error ? cause.message : "直连不可用";
+        });
+      }
+    }
     void getTags().then((result) => { if (current === generation) tagCatalog.value = result; }).catch(() => {});
     void getTagSuggestions(item.id).then((result) => { if (current === generation) tagSuggestions.value = result; }).catch(() => {});
     if (item.available && item.kind === "image") {
@@ -211,14 +230,38 @@ function onVideoMetadata(event: Event) {
   const current = generation;
   for (const capture of captures.value) void readVariant(capture.key, "medium", capture.at, current);
 }
-function download() {
+async function download() {
   if (!resource.value) return;
+  if (props.remote) {
+    try {
+      const response = await getResourceFile(resource.value.id, true);
+      if (!response.ok) throw new Error(`下载失败 (HTTP ${response.status})`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = resource.value.name;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (cause) { error.value = cause instanceof Error ? cause.message : "直连下载失败"; }
+    return;
+  }
   const link = document.createElement("a");
   link.href = fileURL(resource.value.id, true);
   link.download = resource.value.name;
   document.body.append(link);
   link.click();
   link.remove();
+}
+async function uploadToCloud() {
+  if (!resource.value || cloudBusy.value) return;
+  cloudBusy.value = true;
+  try {
+    await uploadResourceToCloud(resource.value.id);
+    cloudStatus.value = "已加入上传队列，可在云层查看进度";
+  } catch (cause) { cloudStatus.value = cause instanceof Error ? cause.message : "加入云层失败"; }
+  finally { cloudBusy.value = false; }
 }
 function openImageViewer() {
   if (!resource.value?.available || !mimeType.value.startsWith("image/") || previewError.value) return;
@@ -242,6 +285,7 @@ function onPreviewKeydown(event: KeyboardEvent) {
 document.addEventListener("keydown", onPreviewKeydown);
 watch(() => props.id, () => void refreshResource(), { immediate: true });
 onBeforeUnmount(() => {
+  if (previewURL.value) URL.revokeObjectURL(previewURL.value);
   generation++;
   clearImages();
   closeImageViewer();
@@ -260,18 +304,20 @@ onBeforeUnmount(() => {
         <span class="detail-kind-icon"><component :is="fileIcon" :size="25" /></span>
         <div><p class="eyebrow">资源详情 · {{ kindLabel }}</p><h1>{{ resource.name }}</h1><p>{{ resource.available ? "源文件可用" : "源文件暂不可用" }} · {{ formatBytes(resource.size) }}</p></div>
         <button class="button button-secondary" :disabled="!resource.available" @click="download"><Download :size="15" />下载原文件</button>
+        <button v-if="!remote" class="button button-secondary" :disabled="!resource.available || cloudBusy" @click="uploadToCloud">加入云层</button>
       </header>
+      <p v-if="cloudStatus" class="detail-error" role="status">{{ cloudStatus }}</p>
       <p v-if="error" class="detail-error" role="alert"><CircleAlert :size="15" />{{ error }}</p>
       <div class="detail-layout">
         <div class="detail-main">
           <section class="detail-panel detail-preview-panel" :class="{ 'is-preview-expanded': expandedPreview }">
             <div class="detail-panel-heading detail-preview-heading"><h2>文件预览</h2><div class="detail-preview-tools"><span>{{ mimeType || "无法在网页中预览" }}</span><button v-if="resource.available && mimeType.startsWith('image/') && !previewError" class="detail-fullscreen-button" aria-label="查看大图" @click="openImageViewer"><Expand :size="14" />查看大图</button><button v-else-if="resource.available && mimeType && !previewError" class="detail-fullscreen-button" :aria-label="expandedPreview ? '退出窗口预览' : '铺满窗口预览'" @click="toggleExpandedPreview"><Minimize v-if="expandedPreview" :size="14" /><Expand v-else :size="14" />{{ expandedPreview ? '退出窗口预览' : '铺满窗口' }}</button></div></div>
             <div class="detail-preview">
-              <template v-if="resource.available && mimeType && !previewError">
-                <button v-if="mimeType.startsWith('image/')" type="button" class="detail-image-trigger" :aria-label="'预览图片 ' + resource.name" @click="openImageViewer"><img :src="fileURL(resource.id)" :alt="resource.name" @error="previewError = '图片无法加载'" /><span class="detail-image-trigger-hint"><Expand :size="14" />点击查看大图</span></button>
-                <video v-else-if="mimeType.startsWith('video/')" :src="fileURL(resource.id)" controls preload="metadata" @loadedmetadata="onVideoMetadata" @error="previewError = '浏览器无法播放此视频格式'"></video>
-                <audio v-else-if="mimeType.startsWith('audio/')" :src="fileURL(resource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式'"></audio>
-                <iframe v-else sandbox="" :src="fileURL(resource.id)" :title="'预览 ' + resource.name"></iframe>
+              <template v-if="resource.available && mimeType && !previewError && (!remote || previewURL)">
+                <button v-if="mimeType.startsWith('image/')" type="button" class="detail-image-trigger" :aria-label="'预览图片 ' + resource.name" @click="openImageViewer"><img :src="remote ? previewURL : fileURL(resource.id)" :alt="resource.name" @error="previewError = '图片无法加载'" /><span class="detail-image-trigger-hint"><Expand :size="14" />点击查看大图</span></button>
+                <video v-else-if="mimeType.startsWith('video/')" :src="remote ? previewURL : fileURL(resource.id)" controls preload="metadata" @loadedmetadata="onVideoMetadata" @error="previewError = '浏览器无法播放此视频格式'"></video>
+                <audio v-else-if="mimeType.startsWith('audio/')" :src="remote ? previewURL : fileURL(resource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式'"></audio>
+                <iframe v-else sandbox="" :src="remote ? previewURL : fileURL(resource.id)" :title="'预览 ' + resource.name"></iframe>
               </template>
               <div v-else class="detail-preview-fallback"><component :is="fileIcon" :size="30" /><p>{{ !resource.available ? "源文件当前不可用，请重新扫描所在目录" : previewError || "该格式暂不支持网页预览" }}</p><button v-if="resource.available" class="button button-secondary" @click="download"><Download :size="14" />下载查看</button></div>
             </div>
@@ -320,6 +366,6 @@ onBeforeUnmount(() => {
         </aside>
       </div>
     </template>
-    <ImagePreview v-if="imageViewerOpen && resource" :src="fileURL(resource.id)" :name="resource.name" @close="closeImageViewer" @download="download" />
+    <ImagePreview v-if="imageViewerOpen && resource" :src="remote ? previewURL : fileURL(resource.id)" :name="resource.name" @close="closeImageViewer" @download="download" />
   </section>
 </template>

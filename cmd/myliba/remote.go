@@ -245,7 +245,7 @@ func connectNode(parent context.Context, hubURL, token string, iceServers []iceS
 func handleNodeRequest(parent context.Context, conn *websocket.Conn, writeMu *sync.Mutex, input *wireMessage) {
 	ctx, cancel := context.WithTimeout(parent, 2*time.Hour)
 	defer cancel()
-	if !allowedRemoteRequest(input.Method, input.Path) {
+	if !allowedHubRelayRequest(input.Method, input.Path) {
 		_ = writeWire(conn, ctx, writeMu, wireMessage{Type: "start", ID: input.ID, Status: http.StatusForbidden})
 		_ = writeWire(conn, ctx, writeMu, wireMessage{Type: "end", ID: input.ID})
 		return
@@ -359,7 +359,7 @@ func (h *remoteHub) readNode(conn *websocket.Conn) {
 }
 
 func (h *remoteHub) proxy(w http.ResponseWriter, r *http.Request) {
-	if !allowedRemoteRequest(r.Method, r.URL.RequestURI()) {
+	if !allowedHubRelayRequest(r.Method, r.URL.RequestURI()) {
 		writeError(w, http.StatusForbidden, "远程访问不支持此操作")
 		return
 	}
@@ -494,6 +494,14 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return false
 	}
 	switch {
+	case len(parts) == 3 && parts[1] == "cloud" && parts[2] == "files":
+		return method == http.MethodGet
+	case len(parts) == 5 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "file":
+		return method == http.MethodGet
+	case len(parts) == 5 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "versions":
+		return method == http.MethodGet
+	case len(parts) == 7 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "versions" && parts[6] == "file":
+		return method == http.MethodGet
 	case len(parts) == 2 && parts[1] == "preprocess":
 		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "preprocess" && parts[2] == "prioritize":
@@ -537,4 +545,28 @@ func allowedRemoteRequest(method, rawURI string) bool {
 	default:
 		return false
 	}
+}
+
+// The Hub WebSocket is a control-plane fallback. File bytes and generated media
+// must use a direct connection; this check also runs on the receiving node.
+func allowedHubRelayRequest(method, rawURI string) bool {
+	if !allowedRemoteRequest(method, rawURI) {
+		return false
+	}
+	parsed, err := url.ParseRequestURI(rawURI)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) == 4 && parts[0] == "api" && parts[1] == "resources" &&
+		(parts[3] == "file" || parts[3] == "thumbnail") {
+		return false
+	}
+	if len(parts) == 5 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "file" {
+		return false
+	}
+	if len(parts) == 7 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "versions" && parts[6] == "file" {
+		return false
+	}
+	return true
 }

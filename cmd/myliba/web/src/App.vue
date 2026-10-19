@@ -4,6 +4,8 @@ import { closeWebRTC, connectWebRTC } from "./webrtc";
 import ResourceDetail from "./ResourceDetail.vue";
 import ImagePreview from "./ImagePreview.vue";
 import HubSettings from "./HubSettings.vue";
+import CloudPanel from "./CloudPanel.vue";
+import HubCloudDashboard from "./HubCloudDashboard.vue";
 import {
   Check,
   ChevronDown,
@@ -50,6 +52,7 @@ import {
   ApiError,
   fileURL,
   getResourceThumbnail,
+  getResourceFile,
   getPreprocessQueue,
   prioritizePreprocessJobs,
   retryPreprocessJob,
@@ -175,6 +178,7 @@ const toastVisible = ref(false);
 const listMode = ref<"grid" | "list">("grid");
 const detailResourceID = ref(new URLSearchParams(window.location.search).get("resource") || "");
 const previewResource = ref<Resource | null>(null);
+const previewURL = ref("");
 const previewMimeType = ref("");
 const previewError = ref("");
 const previewLoadingNext = ref(false);
@@ -445,9 +449,26 @@ function getPreviewMimeType(resource: Resource) {
 }
 
 function openResourcePreview(resource: Resource) {
+  if (previewURL.value) URL.revokeObjectURL(previewURL.value);
+  previewURL.value = "";
   previewResource.value = resource;
   previewMimeType.value = getPreviewMimeType(resource);
   previewError.value = resource.available ? "" : "源文件当前不可用。";
+  if (remoteMode.value && resource.available) {
+    if (resource.size > 128 * 1024 * 1024) {
+      previewError.value = "此文件超过直连网页预览的大小限制，请下载后打开。";
+    } else {
+      const id = resource.id;
+      void getResourceFile(id).then(async (response) => {
+        if (!response.ok) throw new Error("直连读取失败");
+        const url = URL.createObjectURL(await response.blob());
+        if (previewResource.value?.id !== id) URL.revokeObjectURL(url);
+        else { previewURL.value = url; previewError.value = ""; }
+      }).catch((cause) => {
+        if (previewResource.value?.id === id) previewError.value = cause instanceof Error ? cause.message : "直连不可用";
+      });
+    }
+  }
 }
 
 async function moveResourcePreview(direction: -1 | 1) {
@@ -477,12 +498,29 @@ async function moveResourcePreview(direction: -1 | 1) {
 }
 
 function closeResourcePreview() {
+  if (previewURL.value) URL.revokeObjectURL(previewURL.value);
+  previewURL.value = "";
   previewResource.value = null;
   previewMimeType.value = "";
   previewError.value = "";
 }
 
-function startRelayDownload(resource: Resource) {
+async function startRelayDownload(resource: Resource) {
+  if (remoteMode.value) {
+    try {
+      const response = await getResourceFile(resource.id, true);
+      if (!response.ok) throw new Error(`下载失败 (HTTP ${response.status})`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = resource.name;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (cause) { showError(cause); }
+    return;
+  }
   const link = document.createElement("a");
   link.href = fileURL(resource.id, true);
   link.download = resource.name;
@@ -888,21 +926,21 @@ async function saveCollection() {
     await loadCollections();
     selectedCollectionID.value = item.id;
     closeCollectionEditor();
-    notify(`已保存智能集合「${item.name}」`);
+    notify(`已保存常用查询「${item.name}」`);
   } catch (error) { showError(error); }
   finally { collectionBusy.value = false; }
 }
 
 async function removeCollection() {
   const id = editingCollectionID.value;
-  if (!id || collectionBusy.value || !window.confirm(`删除智能集合「${collectionName.value}」？`)) return;
+  if (!id || collectionBusy.value || !window.confirm(`删除常用查询「${collectionName.value}」？`)) return;
   collectionBusy.value = true;
   try {
     await deleteCollection(id);
     if (selectedCollectionID.value === id) selectedCollectionID.value = "";
     await loadCollections();
     closeCollectionEditor();
-    notify("智能集合已删除");
+    notify("常用查询已删除");
   } catch (error) { showError(error); }
   finally { collectionBusy.value = false; }
 }
@@ -1341,6 +1379,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  if (previewURL.value) URL.revokeObjectURL(previewURL.value);
   window.removeEventListener("myliba:unauthorized", handleUnauthorized);
   window.removeEventListener("keydown", onShortcut);
   window.removeEventListener("popstate", syncDetailRoute);
@@ -1382,14 +1421,14 @@ onBeforeUnmount(() => {
         </nav>
 
         <div class="sidebar-section-label collection-section-title">
-          <span>智能集合</span><button class="sidebar-add" type="button" title="保存当前筛选为集合" aria-label="新建智能集合" @click="openCollectionEditor()"><Plus :size="14" /></button>
+          <span>常用查询</span><button class="sidebar-add" type="button" title="保存当前查询条件" aria-label="新建常用查询" @click="openCollectionEditor()"><Plus :size="14" /></button>
         </div>
-        <nav class="collection-nav" aria-label="智能集合">
+        <nav class="collection-nav" aria-label="常用查询">
           <div v-for="item in visibleCollections" :key="item.id" class="collection-nav-row" :class="{ active: activeCollection?.id === item.id }">
             <button type="button" class="collection-nav-open" @click="chooseCollection(item)"><Bookmark :size="14" /><span>{{ item.name }}</span></button>
-            <button type="button" class="collection-nav-edit" :aria-label="`编辑集合 ${item.name}`" @click="openCollectionEditor(item, true)"><Pencil :size="13" /></button>
+            <button type="button" class="collection-nav-edit" :aria-label="`编辑常用查询 ${item.name}`" @click="openCollectionEditor(item, true)"><Pencil :size="13" /></button>
           </div>
-          <p v-if="!visibleCollections.length" class="sidebar-empty">保存当前文件夹的常用筛选。</p>
+          <p v-if="!visibleCollections.length" class="sidebar-empty">保存当前搜索和筛选条件。</p>
         </nav>
 
         <div v-if="activeFolderID !== 'all'" class="sidebar-section-label tag-section-title">
@@ -1423,19 +1462,21 @@ onBeforeUnmount(() => {
             <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
               <span class="connection-dot"></span><span>Web · HTTPS 接入</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small>
             </span>
-            <span class="connection-badge traffic-badge" :class="{ offline: !nodeOnline }" :title="nodeTransport === 'webrtc' ? 'WebRTC DataChannel 直连；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'turn' ? 'WebRTC DataChannel 通过 TURN 中继；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'connecting' ? '正在协商 WebRTC；直连建立前 API 经 WSS 服务端转发。' : 'WebRTC 不可用，API 经 WSS 服务端转发；↓ 节点发往网页，↑ 网页发往节点。'">
+            <span class="connection-badge traffic-badge" :class="{ offline: !nodeOnline }" :title="nodeTransport === 'webrtc' ? 'WebRTC DataChannel 直连；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'turn' ? 'WebRTC DataChannel 通过 TURN 中继；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'connecting' ? '正在协商 WebRTC；元数据可经 WSS 转发，文件内容等待直连。' : 'WebRTC 不可用；元数据经 WSS 转发，文件内容需要直连。'">
               <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · WebRTC / TURN' : nodeTransport === 'connecting' ? '节点 · WebRTC 连接中' : '节点 · WSS 转发' }}</span><small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small>
             </span>
           </template>
           <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>
           <HubSettings v-if="!remoteMode && authenticated" />
+          <HubCloudDashboard v-if="remoteMode && authenticated" />
+          <CloudPanel v-if="authenticated" :resources="resources" :remote="remoteMode" />
           <button v-if="authenticated" class="button button-secondary preprocess-toggle" type="button" @click="preprocessOpen = true"><Clock3 :size="14" />后台任务 <span v-if="preprocessQueue.counts.pending + preprocessQueue.counts.running">({{ preprocessQueue.counts.pending + preprocessQueue.counts.running }})</span></button>
           <button v-if="remoteMode && authenticated" class="quiet-button signout-button" title="退出登录" @click="signOut"><LogOut :size="15" /><span>退出</span></button>
         </div>
       </header>
 
       <main class="page-content">
-        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
+        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" :remote="remoteMode" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
         <template v-else>
         <section v-if="activeFolderID === null" class="page-intro">
           <div>
@@ -1510,8 +1551,8 @@ onBeforeUnmount(() => {
         <div class="folder-context-bar"><button class="quiet-button" @click="openFolder(null)"><House :size="14" />文件夹首页</button><span>/</span><strong>{{ folderTitle }}</strong><div v-if="activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-context-actions"><button class="quiet-button" @click="editingFolderName = folderTitle; folderEditorOpen = !folderEditorOpen"><Pencil :size="14" />重命名</button><button class="quiet-button" @click="removeFolder"><Trash2 :size="14" />删除</button></div></div>
         <p v-if="activeFolderID === 'unfiled'" class="folder-scope-hint">尚未放入虚拟文件夹的资源会显示在这里；“待整理”指没有手动标签的资源。</p>
         <form v-if="folderEditorOpen && activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-rename-form" @submit.prevent="saveFolderName"><input v-model="editingFolderName" maxlength="80" aria-label="文件夹名称" /><button class="button button-primary" :disabled="folderBusy || !editingFolderName.trim()">保存</button><button type="button" class="button button-secondary" @click="folderEditorOpen = false">取消</button></form>
-        <div v-if="visibleCollections.length" class="mobile-collections" aria-label="智能集合">
-          <span>智能集合</span>
+        <div v-if="visibleCollections.length" class="mobile-collections" aria-label="常用查询">
+          <span>常用查询</span>
           <button v-for="item in visibleCollections" :key="item.id" type="button" :class="{ active: activeCollection?.id === item.id }" @click="chooseCollection(item)"><Bookmark :size="13" />{{ item.name }}</button>
         </div>
 
@@ -1560,10 +1601,10 @@ onBeforeUnmount(() => {
         </div>
 
         <form v-if="collectionEditorOpen" class="collection-editor" @submit.prevent="saveCollection">
-          <div><strong>{{ editingCollectionID ? "编辑智能集合" : "保存当前筛选" }}</strong><p>集合记录当前搜索、手动标签、属性标签、目录和排序条件，资源会随索引变化自动更新。</p></div>
-          <label class="sr-only" for="collection-name">集合名称</label>
-          <input id="collection-name" v-model="collectionName" maxlength="80" placeholder="给集合起个名字" autocomplete="off" />
-          <button class="button button-primary" type="submit" :disabled="collectionBusy || !collectionName.trim()">{{ editingCollectionID ? "保存更改" : "创建集合" }}</button>
+          <div><strong>{{ editingCollectionID ? "编辑常用查询" : "保存为常用查询" }}</strong><p>保存当前搜索、手动标签、属性标签、目录和排序条件；下次打开时按最新资源重新查询。</p></div>
+          <label class="sr-only" for="collection-name">查询名称</label>
+          <input id="collection-name" v-model="collectionName" maxlength="80" placeholder="给查询起个名字" autocomplete="off" />
+          <button class="button button-primary" type="submit" :disabled="collectionBusy || !collectionName.trim()">{{ editingCollectionID ? "保存更改" : "保存查询" }}</button>
           <button class="button button-secondary" type="button" @click="closeCollectionEditor">取消</button>
           <button v-if="editingCollectionID" class="quiet-button collection-delete" type="button" :disabled="collectionBusy" @click="removeCollection"><Trash2 :size="14" />删除</button>
         </form>
@@ -1720,7 +1761,7 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <ImagePreview v-if="previewResource && previewMimeType.startsWith('image/') && !previewError" :key="previewResource.id" :src="fileURL(previewResource.id)" :name="previewResource.name" :position="previewPosition" :total="previewTotal" :can-previous="canPreviewPrevious" :can-next="canPreviewNext" :loading-next="previewLoadingNext" @close="closeResourcePreview" @download="startRelayDownload(previewResource)" @details="openDetail(previewResource); closeResourcePreview()" @previous="moveResourcePreview(-1)" @next="moveResourcePreview(1)" @error="previewError = '无法加载此图片。请检查文件是否仍可访问。'" />
+    <ImagePreview v-if="previewResource && previewMimeType.startsWith('image/') && !previewError && (!remoteMode || previewURL)" :key="previewResource.id" :src="remoteMode ? previewURL : fileURL(previewResource.id)" :name="previewResource.name" :position="previewPosition" :total="previewTotal" :can-previous="canPreviewPrevious" :can-next="canPreviewNext" :loading-next="previewLoadingNext" @close="closeResourcePreview" @download="startRelayDownload(previewResource)" @details="openDetail(previewResource); closeResourcePreview()" @previous="moveResourcePreview(-1)" @next="moveResourcePreview(1)" @error="previewError = '无法加载此图片。请检查文件是否仍可访问。'" />
     <div v-else-if="previewResource" class="resource-preview-backdrop resource-browser-preview" @click.self="closeResourcePreview">
       <section class="resource-preview-dialog" role="dialog" aria-modal="true" :aria-label="'预览 ' + previewResource.name">
         <header class="resource-preview-header">
@@ -1739,9 +1780,9 @@ onBeforeUnmount(() => {
         </header>
         <div class="resource-preview-stage">
           <template v-if="previewMimeType && !previewError">
-            <video v-if="previewMimeType.startsWith('video/')" :src="fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此视频格式。你可以下载后打开。'"></video>
-            <audio v-else-if="previewMimeType.startsWith('audio/')" :src="fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式。你可以下载后打开。'"></audio>
-            <iframe v-else :src="fileURL(previewResource.id)" :title="'预览 ' + previewResource.name"></iframe>
+              <video v-if="previewMimeType.startsWith('video/') && (!remoteMode || previewURL)" :src="remoteMode ? previewURL : fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此视频格式。你可以下载后打开。'"></video>
+              <audio v-else-if="previewMimeType.startsWith('audio/') && (!remoteMode || previewURL)" :src="remoteMode ? previewURL : fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式。你可以下载后打开。'"></audio>
+              <iframe v-else-if="!remoteMode || previewURL" :src="remoteMode ? previewURL : fileURL(previewResource.id)" :title="'预览 ' + previewResource.name"></iframe>
           </template>
           <div v-else-if="previewError" class="resource-preview-message" role="alert"><CircleAlert :size="22" /><p>{{ previewError }}</p><button class="button button-secondary" @click="openResourceFile(previewResource, true)"><Download :size="14" />下载文件</button></div>
           <div v-else class="resource-preview-message"><File :size="24" /><p>此文件格式暂不支持网页预览，可以下载后用本地应用打开。</p><button class="button button-primary" @click="openResourceFile(previewResource, true)"><Download :size="14" />下载文件</button></div>
