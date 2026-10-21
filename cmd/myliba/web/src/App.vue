@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { closeWebRTC, connectWebRTC } from "./webrtc";
 import ResourceDetail from "./ResourceDetail.vue";
 import ImagePreview from "./ImagePreview.vue";
+import StreamingVideo from "./StreamingVideo.vue";
 import HubSettings from "./HubSettings.vue";
 import CloudPanel from "./CloudPanel.vue";
 import HubCloudDashboard from "./HubCloudDashboard.vue";
@@ -47,6 +48,7 @@ import {
   addBatchTag,
   addResourceTag,
   addRoot,
+  addMediaStore,
   createCollection,
   deleteCollection,
   ApiError,
@@ -68,6 +70,7 @@ import {
   deleteFolder,
   moveResourcesToFolder,
   getRoots,
+  getMediaStores,
   getDirectories,
   getSession,
   getTagSuggestions,
@@ -76,6 +79,7 @@ import {
   login,
   logout,
   scanRoot,
+  selectMediaStore,
   updateCollection,
   type DirectoryListing,
   type BatchTagSuggestion,
@@ -84,6 +88,7 @@ import {
   type ResourceSort,
   type Resource,
   type RootSummary,
+  type MediaStore,
   type TagSummary,
   type AttributeTag,
   type TagSuggestion,
@@ -113,6 +118,9 @@ const generatingThumbnailBatch = ref(false);
 const thumbnailRefreshTokens = ref(new Map<string, number>());
 const thumbnailBatchProgress = ref({ done: 0, total: 0 });
 const roots = ref<RootSummary[]>([]);
+const mediaStores = ref<MediaStore[]>([]);
+const mediaStorePath = ref("");
+const mediaStoreBusy = ref(false);
 const tags = ref<TagSummary[]>([]);
 const attributeCatalog = ref<AttributeTag[]>([]);
 const attributeCatalogLoading = ref(false);
@@ -440,7 +448,7 @@ function getPreviewMimeType(resource: Resource) {
   const types: Record<string, string> = {
     avif: "image/avif", bmp: "image/bmp", gif: "image/gif", heic: "image/heic", heif: "image/heif",
     jpeg: "image/jpeg", jpg: "image/jpeg", png: "image/png", tif: "image/tiff", tiff: "image/tiff", webp: "image/webp",
-    mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", webm: "video/webm", ogv: "video/ogg",
+    mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska", avi: "video/x-msvideo", webm: "video/webm", ogv: "video/ogg",
     mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", oga: "audio/ogg", ogg: "audio/ogg", wav: "audio/wav", flac: "audio/flac",
     pdf: "application/pdf", txt: "text/plain",
   };
@@ -454,7 +462,7 @@ function openResourcePreview(resource: Resource) {
   previewResource.value = resource;
   previewMimeType.value = getPreviewMimeType(resource);
   previewError.value = resource.available ? "" : "源文件当前不可用。";
-  if (remoteMode.value && resource.available) {
+  if (remoteMode.value && resource.available && resource.kind !== "video") {
     if (resource.size > 128 * 1024 * 1024) {
       previewError.value = "此文件超过直连网页预览的大小限制，请下载后打开。";
     } else {
@@ -579,6 +587,37 @@ async function loadRoots() {
   } catch (error) { if (generation === authGeneration) showError(error); }
 }
 
+async function loadMediaStores() {
+  if (remoteMode.value) return;
+  const generation = authGeneration;
+  try {
+    const result = await getMediaStores();
+    if (generation === authGeneration) mediaStores.value = result;
+  } catch (error) { if (generation === authGeneration) showError(error); }
+}
+
+async function submitMediaStore() {
+  const path = mediaStorePath.value.trim();
+  if (!path || mediaStoreBusy.value) return;
+  mediaStoreBusy.value = true;
+  try {
+    await addMediaStore(path);
+    mediaStorePath.value = "";
+    await loadMediaStores();
+  } catch (error) { showError(error); }
+  finally { mediaStoreBusy.value = false; }
+}
+
+async function makeDefaultMediaStore(id: string) {
+  if (mediaStoreBusy.value) return;
+  mediaStoreBusy.value = true;
+  try {
+    await selectMediaStore(id);
+    await loadMediaStores();
+  } catch (error) { showError(error); }
+  finally { mediaStoreBusy.value = false; }
+}
+
 async function loadTags() {
   const generation = authGeneration;
   const folderID = activeFolderID.value;
@@ -639,7 +678,7 @@ async function loadCollections() {
 }
 
 async function loadWorkspace() {
-  await Promise.all([loadRoots(), loadFolders(), loadTags(), loadCollections(), loadResources()]);
+  await Promise.all([loadRoots(), loadMediaStores(), loadFolders(), loadTags(), loadCollections(), loadResources()]);
 }
 
 function setDetailRoute(id: string) {
@@ -1525,6 +1564,23 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </div>
+          <div class="panel-heading">
+            <span class="panel-icon"><HardDrive :size="18" /></span>
+            <span class="panel-heading-copy"><strong>生成内容存储位置</strong><small>缩略图和多尺寸视频可保存到多个本机目录；默认位置用于新生成的内容，旧文件保持原位。</small></span>
+          </div>
+          <form class="root-form" @submit.prevent="submitMediaStore">
+            <label class="sr-only" for="media-store-path">媒体存储目录</label>
+            <input id="media-store-path" v-model="mediaStorePath" type="text" placeholder="已有的本机目录路径" autocomplete="off" />
+            <button class="button button-primary" type="submit" :disabled="mediaStoreBusy || !mediaStorePath.trim()"><Plus :size="16" />添加位置</button>
+          </form>
+          <div v-if="mediaStores.length" class="root-list">
+            <div v-for="store in mediaStores" :key="store.id" class="root-row">
+              <span class="root-folder-icon"><HardDrive :size="15" /></span>
+              <span class="root-path" :title="store.path">{{ store.path }}</span>
+              <span class="root-count">{{ store.isDefault ? "新内容默认位置" : "已配置" }}</span>
+              <button v-if="!store.isDefault" class="button button-ghost" type="button" :disabled="mediaStoreBusy" @click="makeDefaultMediaStore(store.id)">设为默认</button>
+            </div>
+          </div>
         </section>
 
         <section v-else-if="activeFolderID === null" class="roots-panel remote-roots-panel">
@@ -1690,7 +1746,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="resource-info">
               <p class="resource-name" :title="resource.path"><button type="button" class="resource-name-button" @click="openResourcePreview(resource)">{{ resource.name }}</button></p>
-              <div class="resource-meta"><span>{{ formatBytes(resource.size) }}</span><span class="meta-dot"></span><span>{{ formatDate(resource.modified) }}</span></div>
+              <div class="resource-meta"><span>{{ formatBytes(resource.contentSize ?? resource.size) }}</span><span class="meta-dot"></span><span>{{ formatDate(resource.modified) }}</span></div>
               <div v-if="resource.available" class="resource-file-actions">
                 <button class="resource-file-action" type="button" @click="openResourcePreview(resource)"><Image :size="13" />预览</button>
                 <button class="resource-file-action" type="button" @click="openResourceFile(resource, false)"><ExternalLink :size="13" />详情</button>
@@ -1780,7 +1836,7 @@ onBeforeUnmount(() => {
         </header>
         <div class="resource-preview-stage">
           <template v-if="previewMimeType && !previewError">
-              <video v-if="previewMimeType.startsWith('video/') && (!remoteMode || previewURL)" :src="remoteMode ? previewURL : fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此视频格式。你可以下载后打开。'"></video>
+              <StreamingVideo v-if="previewMimeType.startsWith('video/')" :key="previewResource.id" :id="previewResource.id" :name="previewResource.name" :remote="remoteMode" />
               <audio v-else-if="previewMimeType.startsWith('audio/') && (!remoteMode || previewURL)" :src="remoteMode ? previewURL : fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式。你可以下载后打开。'"></audio>
               <iframe v-else-if="!remoteMode || previewURL" :src="remoteMode ? previewURL : fileURL(previewResource.id)" :title="'预览 ' + previewResource.name"></iframe>
           </template>

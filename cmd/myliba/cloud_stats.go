@@ -23,6 +23,8 @@ func (d *cloudDisk) stats() (cloudStorageStats, error) {
 			result.Backend = "s3"
 		case *webDAVBackend:
 			result.Backend = "webdav"
+		case *openListBackend:
+			result.Backend = "openlist"
 		}
 		blocks, err := d.backend.List("blocks")
 		if err != nil {

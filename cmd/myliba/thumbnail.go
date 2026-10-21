@@ -78,6 +78,9 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := os.Stat(cachePath); err == nil {
+		if err := s.recordThumbnail(r.PathValue("id"), info, width, at, cachePath); err != nil {
+			log.Printf("thumbnail index %s: %v", filepath.Base(cachePath), err)
+		}
 		if r.Method == http.MethodPost {
 			w.WriteHeader(http.StatusNoContent)
 		} else {
@@ -109,7 +112,8 @@ func (s *server) thumbnailCachePath(id string, info os.FileInfo, width int, at f
 	}
 	digest := sha256.Sum256([]byte(version))
 	hexDigest := hex.EncodeToString(digest[:])
-	return filepath.Join(s.thumbnailDir, hexDigest+".jpg"), fmt.Sprintf("%q", hexDigest)
+	_, path := s.mediaAssetPath(hexDigest, "thumbnail")
+	return path, fmt.Sprintf("%q", hexDigest)
 }
 
 func (s *server) ensureThumbnail(ctx context.Context, id, sourcePath, kind string, info os.FileInfo, width, height int, at float64) error {
@@ -118,13 +122,16 @@ func (s *server) ensureThumbnail(ctx context.Context, id, sourcePath, kind strin
 	lock.Lock()
 	defer lock.Unlock()
 	if _, err := os.Stat(cachePath); err == nil {
-		return nil
+		return s.recordThumbnail(id, info, width, at, cachePath)
 	}
 	content, err := s.generateThumbnail(ctx, sourcePath, kind, width, height, at)
 	if err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(s.thumbnailDir, "thumbnail-*.tmp")
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(cachePath), "thumbnail-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -137,7 +144,10 @@ func (s *server) ensureThumbnail(ctx context.Context, id, sourcePath, kind strin
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tempName, cachePath)
+	if err := os.Rename(tempName, cachePath); err != nil {
+		return err
+	}
+	return s.recordThumbnail(id, info, width, at, cachePath)
 }
 
 func (s *server) thumbnailLock(id string) *sync.Mutex {

@@ -17,7 +17,7 @@ cd "$root"
 GOOS="$target_os" GOARCH="$target_arch" CGO_ENABLED=0 GOCACHE="$root/.runtime/gocache" \
     go build -trimpath -buildvcs=false -o "$output_dir/$name" \
     cmd/myliba/cloud_protocol.go cmd/myliba/cloud_store.go cmd/myliba/cloud_stats.go "cmd/myliba/$space_file" \
-    cmd/myliba/cloud_hub.go cmd/myliba/cloud_node.go \
-    cmd/myliba/cloud_repair.go cmd/myliba/cloud_backend.go \
+    cmd/myliba/cloud_hub.go cmd/myliba/cloud_node.go cmd/myliba/cloud_relay.go \
+    cmd/myliba/cloud_repair.go cmd/myliba/cloud_backend.go cmd/myliba/cloud_openlist.go \
     cmd/myliba/cloud_s3.go cmd/myliba/cloud_storage_entry.go
 printf '%s\n' "$output_dir/$name"

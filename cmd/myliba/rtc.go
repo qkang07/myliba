@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ type nodeRTCManager struct {
 }
 
 type nodeRTCSession struct {
+	shareID    string
 	peer       *webrtc.PeerConnection
 	channel    *webrtc.DataChannel
 	signalMu   sync.Mutex
@@ -60,7 +63,7 @@ func newNodeRTCManager(conn *websocket.Conn, writeMu *sync.Mutex, servers []iceS
 	return &nodeRTCManager{sessions: map[string]*nodeRTCSession{}, config: pionICEConfiguration(direct), conn: conn, writeMu: writeMu}
 }
 
-func (m *nodeRTCManager) handle(sessionID string, payload json.RawMessage) {
+func (m *nodeRTCManager) handle(sessionID, shareID string, payload json.RawMessage) {
 	if sessionID == "" {
 		return
 	}
@@ -71,7 +74,7 @@ func (m *nodeRTCManager) handle(sessionID string, payload json.RawMessage) {
 	switch signal.Type {
 	case "offer":
 		if signal.Description != nil && signal.Description.Type == webrtc.SDPTypeOffer {
-			m.acceptOffer(sessionID, *signal.Description)
+			m.acceptOffer(sessionID, shareID, *signal.Description)
 		}
 	case "candidate":
 		if signal.Candidate == nil {
@@ -88,13 +91,13 @@ func (m *nodeRTCManager) handle(sessionID string, payload json.RawMessage) {
 	}
 }
 
-func (m *nodeRTCManager) acceptOffer(sessionID string, offer webrtc.SessionDescription) {
+func (m *nodeRTCManager) acceptOffer(sessionID, shareID string, offer webrtc.SessionDescription) {
 	peer, err := webrtc.NewPeerConnection(m.config)
 	if err != nil {
 		m.sendSignal(sessionID, rtcSignal{Type: "error"})
 		return
 	}
-	session := &nodeRTCSession{peer: peer, requests: map[string]*rtcRequest{}}
+	session := &nodeRTCSession{peer: peer, shareID: shareID, requests: map[string]*rtcRequest{}}
 	m.mu.Lock()
 	previous := m.sessions[sessionID]
 	m.sessions[sessionID] = session
@@ -235,7 +238,11 @@ func (m *nodeRTCManager) serveRTCRequest(session *nodeRTCSession, channel *webrt
 		}
 		return channel.SendText(string(data))
 	}
-	if !allowedRemoteRequest(input.Method, input.Path) {
+	allowed := allowedRemoteRequest(input.Method, input.Path)
+	if session.shareID != "" {
+		allowed = allowedShareRTCRequest(session.shareID, input)
+	}
+	if !allowed {
 		_ = write(wireMessage{Type: "start", ID: input.ID, Status: http.StatusForbidden})
 		_ = write(wireMessage{Type: "chunk", ID: input.ID, Data: []byte("接口不允许通过远程节点连接")})
 		_ = write(wireMessage{Type: "end", ID: input.ID})
@@ -275,6 +282,35 @@ func (m *nodeRTCManager) serveRTCRequest(session *nodeRTCSession, channel *webrt
 		}
 	}
 	_ = write(wireMessage{Type: "end", ID: input.ID})
+}
+
+func allowedShareRTCRequest(shareID string, input wireMessage) bool {
+	parsed, err := url.ParseRequestURI(input.Path)
+	if !validShareID(shareID) || err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || filteredHeaders(input.Headers, false).Get("X-Myliba-Share-Key") == "" {
+		return false
+	}
+	base := "/api/shares/" + shareID
+	if input.Method == http.MethodGet && parsed.Path == base+"/file" {
+		return true
+	}
+	if !strings.HasPrefix(parsed.Path, base+"/video/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(parsed.Path, base+"/video/"), "/")
+	if len(parts) == 1 {
+		return (input.Method == http.MethodGet || input.Method == http.MethodPost) && videoQualities[parts[0]].width != 0
+	}
+	if videoQualities[parts[0]].width == 0 || input.Method != http.MethodGet {
+		return false
+	}
+	if len(parts) == 2 && parts[1] == "init" {
+		return true
+	}
+	if len(parts) == 3 && parts[1] == "segments" {
+		index, err := strconv.Atoi(parts[2])
+		return err == nil && index >= 0 && index <= 99999
+	}
+	return false
 }
 
 func (m *nodeRTCManager) remove(sessionID string, expected *nodeRTCSession) {

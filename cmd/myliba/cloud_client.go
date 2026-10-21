@@ -29,35 +29,70 @@ type cloudChunk struct {
 	Size int    `json:"size"`
 }
 
-type cloudManifest struct {
+type cloudAssetPart struct {
 	Name      string       `json:"name"`
+	Duration  float64      `json:"duration,omitempty"`
 	Size      int64        `json:"size"`
-	Modified  string       `json:"modified"`
-	History   bool         `json:"history"`
-	SourceID  string       `json:"sourceId,omitempty"`
 	PlainHash string       `json:"plainHash"`
-	DataKey   string       `json:"dataKey"`
 	Chunks    []cloudChunk `json:"chunks"`
 }
 
+type cloudAsset struct {
+	ID      string            `json:"assetId"`
+	Kind    string            `json:"kind"`
+	Spec    string            `json:"spec"`
+	Codec   string            `json:"codec,omitempty"`
+	DataKey string            `json:"dataKey"`
+	Size    int64             `json:"size"`
+	Parts   []cloudAssetPart  `json:"parts"`
+	Local   []indexedLocation `json:"local,omitempty"`
+}
+
+type cloudManifest struct {
+	Name        string            `json:"name"`
+	Size        int64             `json:"size"`
+	Modified    string            `json:"modified"`
+	History     bool              `json:"history"`
+	SourceID    string            `json:"sourceId,omitempty"`
+	PlainHash   string            `json:"plainHash"`
+	DataKey     string            `json:"dataKey"`
+	Chunks      []cloudChunk      `json:"chunks"`
+	Kind        string            `json:"kind,omitempty"`
+	Tags        []string          `json:"tags,omitempty"`
+	Local       []indexedLocation `json:"local,omitempty"`
+	Assets      []cloudAsset      `json:"assets,omitempty"`
+	ContentSize int64             `json:"contentSize,omitempty"`
+	IndexOnly   bool              `json:"indexOnly,omitempty"`
+	LocalIndex  *fileIndexView    `json:"localIndex,omitempty"`
+}
+
 type cloudFileView struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Size        int64  `json:"size"`
-	Modified    string `json:"modified"`
-	History     bool   `json:"history"`
-	SourceID    string `json:"sourceId,omitempty"`
-	Chunks      int    `json:"chunks"`
-	RevisionID  string `json:"revisionId"`
-	MinReplicas int    `json:"minReplicas"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Size         int64    `json:"size"`
+	OriginalSize int64    `json:"originalSize"`
+	Modified     string   `json:"modified"`
+	History      bool     `json:"history"`
+	SourceID     string   `json:"sourceId,omitempty"`
+	Chunks       int      `json:"chunks"`
+	RevisionID   string   `json:"revisionId"`
+	MinReplicas  int      `json:"minReplicas"`
+	Variants     []string `json:"variants"`
 }
 
 type cloudClient struct {
-	runtime *cloudRuntime
-	keyMu   sync.RWMutex
-	key     [32]byte
-	jobsMu  sync.Mutex
-	jobs    map[string]string
+	runtime       *cloudRuntime
+	indexer       *server
+	assetMu       sync.Mutex
+	localDigestMu sync.Mutex
+	localDigests  map[string]string
+	queueMu       sync.Mutex
+	assetPending  map[string]bool
+	assetWake     chan struct{}
+	keyMu         sync.RWMutex
+	key           [32]byte
+	jobsMu        sync.Mutex
+	jobs          map[string]string
 }
 
 func newCloudClient(runtime *cloudRuntime) (*cloudClient, error) {
@@ -87,7 +122,9 @@ func newCloudClient(runtime *cloudRuntime) (*cloudClient, error) {
 	} else {
 		copy(key[:], data)
 	}
-	return &cloudClient{runtime: runtime, key: key, jobs: map[string]string{}}, nil
+	return &cloudClient{runtime: runtime, key: key, jobs: map[string]string{},
+		localDigests: map[string]string{},
+		assetPending: map[string]bool{}, assetWake: make(chan struct{}, 1)}, nil
 }
 
 func (c *cloudClient) libraryID() string {
@@ -121,8 +158,10 @@ func (c *cloudClient) recovery(w http.ResponseWriter, r *http.Request) {
 	}
 	// A fresh client may have already synchronized opaque records from the Hub
 	// before the owner imports the key. Only records readable with the current
-	// key prove that this client has an existing cloud library to protect.
-	records, err := c.validRecords()
+	// key and referencing content blocks prove that this client has an existing
+	// cloud library to protect. Local-only indexes can be republished with the
+	// imported key.
+	records, err := c.contentRecords()
 	if err != nil {
 		writeError(w, 500, "无法读取云层索引")
 		return
@@ -138,6 +177,12 @@ func (c *cloudClient) recovery(w http.ResponseWriter, r *http.Request) {
 	c.keyMu.Lock()
 	copy(c.key[:], raw)
 	c.keyMu.Unlock()
+	c.localDigestMu.Lock()
+	c.localDigests = map[string]string{}
+	c.localDigestMu.Unlock()
+	if c.indexer != nil {
+		go c.indexer.queueAllLocalIndexes()
+	}
 	writeJSON(w, 200, map[string]string{"libraryId": c.libraryID()})
 }
 
@@ -246,13 +291,86 @@ func (c *cloudClient) openManifest(record cloudRecord) (cloudManifest, error) {
 	if err != nil {
 		return manifest, err
 	}
-	if len(manifest.Chunks) != len(record.BlockIDs) {
+	if manifest.IndexOnly {
+		if len(record.BlockIDs) != 0 || manifest.LocalIndex == nil || manifest.LocalIndex.FileID != record.ObjectID ||
+			manifest.LocalIndex.Original.Cloud != nil || manifest.LocalIndex.Original.Size < 0 ||
+			(manifest.LocalIndex.RevisionID != "" && manifest.LocalIndex.RevisionID != record.RevisionID) {
+			return manifest, errors.New("invalid local file index")
+		}
+		index := manifest.LocalIndex
+		total := index.Original.Size
+		for _, location := range index.Original.Local {
+			if location.NodeID != record.AuthorID || location.Path == "" {
+				return manifest, errors.New("invalid local source location")
+			}
+		}
+		seen := map[string]bool{}
+		for _, asset := range index.Assets {
+			if !validCloudHash(asset.ID) || seen[asset.ID] || asset.Content.Cloud != nil || asset.Content.Size < 0 ||
+				total > (1<<63-1)-asset.Content.Size {
+				return manifest, errors.New("invalid local media asset")
+			}
+			seen[asset.ID] = true
+			total += asset.Content.Size
+			for _, location := range asset.Content.Local {
+				if location.NodeID != record.AuthorID || location.Path == "" {
+					return manifest, errors.New("invalid local media location")
+				}
+			}
+		}
+		if total != index.ContentSize {
+			return manifest, errors.New("invalid local file size")
+		}
+		return manifest, nil
+	}
+	position := 0
+	validateChunks := func(chunks []cloudChunk, expectedSize int64) bool {
+		var size int64
+		for _, chunk := range chunks {
+			if position >= len(record.BlockIDs) || chunk.ID != record.BlockIDs[position] ||
+				!validCloudHash(chunk.ID) || chunk.Size <= 0 || chunk.Size > cloudChunkSize {
+				return false
+			}
+			position++
+			size += int64(chunk.Size)
+		}
+		return size == expectedSize
+	}
+	if manifest.Size < 0 || !validateChunks(manifest.Chunks, manifest.Size) {
+		return manifest, errors.New("invalid original chunk index")
+	}
+	total := manifest.Size
+	seenAssets := map[string]bool{}
+	for _, asset := range manifest.Assets {
+		assetKey, keyErr := hex.DecodeString(asset.DataKey)
+		if !validCloudHash(asset.ID) || keyErr != nil || len(assetKey) != 32 || seenAssets[asset.ID] || asset.Size < 0 || len(asset.Parts) == 0 ||
+			(asset.Kind != "thumbnail" && asset.Kind != "video") {
+			return manifest, errors.New("invalid asset index")
+		}
+		seenAssets[asset.ID] = true
+		var assetSize int64
+		seenParts := map[string]bool{}
+		for _, part := range asset.Parts {
+			if part.Name == "" || part.Name == "." || part.Name == ".." || filepath.Base(part.Name) != part.Name ||
+				!validCloudHash(part.PlainHash) || seenParts[part.Name] || part.Size < 0 ||
+				!validateChunks(part.Chunks, part.Size) || assetSize > (1<<63-1)-part.Size {
+				return manifest, errors.New("invalid asset part index")
+			}
+			seenParts[part.Name] = true
+			assetSize += part.Size
+		}
+		if assetSize != asset.Size || total > (1<<63-1)-asset.Size {
+			return manifest, errors.New("invalid asset size")
+		}
+		total += asset.Size
+	}
+	if position != len(record.BlockIDs) {
 		return manifest, errors.New("invalid chunk index")
 	}
-	for i, chunk := range manifest.Chunks {
-		if chunk.ID != record.BlockIDs[i] || !validCloudHash(chunk.ID) || chunk.Size < 0 || chunk.Size > cloudChunkSize {
-			return manifest, errors.New("invalid chunk index")
-		}
+	if manifest.ContentSize == 0 && len(manifest.Assets) == 0 {
+		manifest.ContentSize = manifest.Size // older catalogs only contain an original
+	} else if manifest.ContentSize != total {
+		return manifest, errors.New("invalid content size")
 	}
 	return manifest, nil
 }
@@ -315,8 +433,23 @@ func latestCloudRecords(records []cloudRecord) []cloudRecord {
 	return result
 }
 
-func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
+func (c *cloudClient) contentRecords() ([]cloudRecord, error) {
 	records, err := c.validRecords()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]cloudRecord, 0, len(records))
+	for _, record := range records {
+		manifest, err := c.openManifest(record)
+		if err == nil && !manifest.IndexOnly {
+			result = append(result, record)
+		}
+	}
+	return result, nil
+}
+
+func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
+	records, err := c.contentRecords()
 	if err != nil {
 		writeError(w, 500, "无法读取云层索引")
 		return
@@ -328,12 +461,19 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		minReplicas := 0
-		if len(manifest.Chunks) == 0 {
+		variants := []string{}
+		for _, asset := range manifest.Assets {
+			if asset.Kind == "video" {
+				variants = append(variants, asset.Spec)
+			}
+		}
+		sort.Strings(variants)
+		if len(record.BlockIDs) == 0 {
 			minReplicas = 1
 		}
-		for index, chunk := range manifest.Chunks {
-			count := len(c.runtime.blockLocations(chunk.ID))
-			if c.runtime.disk.has("blocks", chunk.ID) && count == 0 {
+		for index, id := range record.BlockIDs {
+			count := len(c.runtime.blockLocations(id))
+			if c.runtime.disk.has("blocks", id) && count == 0 {
 				count = 1
 			}
 			if index == 0 || count < minReplicas {
@@ -341,10 +481,11 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		items = append(items, cloudFileView{
-			ID: record.ObjectID, Name: manifest.Name, Size: manifest.Size,
+			ID: record.ObjectID, Name: manifest.Name, Size: manifest.ContentSize, OriginalSize: manifest.Size,
 			Modified: manifest.Modified, History: manifest.History,
-			SourceID: manifest.SourceID, Chunks: len(manifest.Chunks),
+			SourceID: manifest.SourceID, Chunks: len(record.BlockIDs),
 			RevisionID: record.RevisionID, MinReplicas: minReplicas,
+			Variants: variants,
 		})
 	}
 	c.jobsMu.Lock()
@@ -432,6 +573,23 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 	manifest := cloudManifest{
 		Name: initial.Name(), Size: initial.Size(), Modified: initial.ModTime().UTC().Format(time.RFC3339Nano),
 		SourceID: objectID, DataKey: hex.EncodeToString(dataKey[:]), Chunks: []cloudChunk{}, History: history,
+		Kind: fileKind(path), ContentSize: initial.Size(),
+	}
+	if c.runtime.db != nil {
+		var rootID string
+		if err := c.runtime.db.QueryRow(`SELECT root_id FROM resources WHERE id=? AND path=?`, objectID, path).Scan(&rootID); err == nil {
+			manifest.Local = []indexedLocation{{NodeID: c.runtime.id, StorageID: rootID, Path: path}}
+		}
+		tags, err := c.runtime.db.Query(`SELECT t.name FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id WHERE rt.resource_id=? ORDER BY t.name`, objectID)
+		if err == nil {
+			for tags.Next() {
+				var tag string
+				if tags.Scan(&tag) == nil {
+					manifest.Tags = append(manifest.Tags, tag)
+				}
+			}
+			tags.Close()
+		}
 	}
 	plainHash := sha256.New()
 	buffer := make([]byte, cloudChunkSize)
@@ -460,6 +618,9 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 		return errors.New("上传期间文件发生变化，请重试")
 	}
 	manifest.PlainHash = hex.EncodeToString(plainHash.Sum(nil))
+	if err := c.appendGeneratedAssets(ctx, &record, &manifest, preprocessVersion(initial)); err != nil {
+		return err
+	}
 	record, err = c.sealManifest(record, manifest)
 	if err != nil {
 		return err
@@ -477,16 +638,23 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 	// The local write commits immediately. Unreachable peers remain background
 	// replication work and never prevent the user from using the file.
 	c.replicateRecord(ctx, record)
+	if err := c.syncNewAssets(ctx, objectID); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (c *cloudClient) replicateRecord(ctx context.Context, record cloudRecord) {
+	c.replicateBlocks(ctx, record.BlockIDs)
+}
+
+func (c *cloudClient) replicateBlocks(ctx context.Context, blockIDs []string) {
 	_, token, err := c.runtime.credentials()
 	if err != nil || token == "" {
 		return
 	}
 	peers := c.runtime.activePeers()
-	for _, id := range record.BlockIDs {
+	for _, id := range blockIDs {
 		file, err := c.runtime.disk.get("blocks", id)
 		if err != nil {
 			continue
@@ -509,7 +677,7 @@ func (c *cloudClient) replicateRecord(ctx context.Context, record cloudRecord) {
 }
 
 func (c *cloudClient) findRecord(objectID string) (cloudRecord, cloudManifest, error) {
-	records, err := c.validRecords()
+	records, err := c.contentRecords()
 	if err != nil {
 		return cloudRecord{}, cloudManifest{}, err
 	}
@@ -536,8 +704,9 @@ func (c *cloudClient) versions(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		items = append(items, cloudFileView{ID: objectID, Name: manifest.Name, Size: manifest.Size,
-			Modified: manifest.Modified, History: true, Chunks: len(manifest.Chunks), RevisionID: record.RevisionID})
+		items = append(items, cloudFileView{ID: objectID, Name: manifest.Name, Size: manifest.ContentSize,
+			OriginalSize: manifest.Size, Modified: manifest.Modified, History: true,
+			Chunks: len(record.BlockIDs), RevisionID: record.RevisionID})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Modified > items[j].Modified })
 	writeJSON(w, 200, items)
@@ -558,7 +727,7 @@ func (c *cloudClient) versionRecord(objectID, revisionID string) (cloudRecord, c
 }
 
 func (c *cloudClient) historyRecords(objectID string) ([]cloudRecord, error) {
-	records, err := c.validRecords()
+	records, err := c.contentRecords()
 	if err != nil {
 		return nil, err
 	}
@@ -578,7 +747,12 @@ func (c *cloudClient) historyRecords(objectID string) ([]cloudRecord, error) {
 		return ordered[i].CreatedAt > ordered[j].CreatedAt
 	})
 	result := make([]cloudRecord, 0, len(ordered))
+	seenRevisions := map[string]bool{}
 	for _, record := range ordered {
+		if seenRevisions[record.RevisionID] {
+			continue
+		}
+		seenRevisions[record.RevisionID] = true
 		manifest, err := c.openManifest(record)
 		if err != nil || !manifest.History {
 			break
@@ -631,6 +805,42 @@ func (c *cloudClient) fetchBlock(ctx context.Context, id string, index int) ([]b
 	return nil, errors.New("没有可用的文件块副本")
 }
 
+// A cloud location and a local path may describe the same logical revision.
+// Check the source bytes before choosing the local path, since a file can change
+// without the library having been rescanned yet.
+func (c *cloudClient) localOriginal(record cloudRecord, manifest cloudManifest) (*os.File, os.FileInfo) {
+	if c.runtime.db == nil || manifest.SourceID == "" || manifest.SourceID != record.ObjectID || !validCloudHash(manifest.PlainHash) {
+		return nil, nil
+	}
+	var path, modified string
+	var size int64
+	var available bool
+	if err := c.runtime.db.QueryRow(`SELECT path,size,modified_at,available FROM resources WHERE id=?`, manifest.SourceID).
+		Scan(&path, &size, &modified, &available); err != nil || !available || size != manifest.Size || modified != manifest.Modified {
+		return nil, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != manifest.Size ||
+		info.ModTime().UTC().Format(time.RFC3339Nano) != manifest.Modified {
+		file.Close()
+		return nil, nil
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil || hex.EncodeToString(hash.Sum(nil)) != manifest.PlainHash {
+		file.Close()
+		return nil, nil
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file.Close()
+		return nil, nil
+	}
+	return file, info
+}
+
 func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	var record cloudRecord
 	var manifest cloudManifest
@@ -642,6 +852,19 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, 404, "云层文件不存在")
+		return
+	}
+	name := manifest.Name
+	contentType := mime.TypeByExtension(filepath.Ext(name))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if file, info := c.localOriginal(record, manifest); file != nil {
+		defer file.Close()
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+		w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+		http.ServeContent(w, r, manifest.Name, info.ModTime(), file)
 		return
 	}
 	dataKey, err := hex.DecodeString(manifest.DataKey)
@@ -658,11 +881,6 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, 500, "文件密钥无效")
 		return
-	}
-	name := manifest.Name
-	contentType := mime.TypeByExtension(filepath.Ext(name))
-	if contentType == "" {
-		contentType = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))

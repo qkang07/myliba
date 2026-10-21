@@ -9,7 +9,7 @@ $outputDir = Join-Path $root ".runtime/storage-build/$TargetOS-$TargetArch"
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 $name = if ($TargetOS -eq 'windows') { 'myliba-storage.exe' } else { 'myliba-storage' }
 $spaceFile = if ($TargetOS -eq 'windows') { 'cloud_space_windows.go' } else { 'cloud_space_unix.go' }
-$files = @('cloud_protocol.go','cloud_store.go','cloud_stats.go',$spaceFile,'cloud_hub.go','cloud_node.go','cloud_repair.go','cloud_backend.go','cloud_s3.go','cloud_storage_entry.go') |
+$files = @('cloud_protocol.go','cloud_store.go','cloud_stats.go',$spaceFile,'cloud_hub.go','cloud_node.go','cloud_relay.go','cloud_repair.go','cloud_backend.go','cloud_openlist.go','cloud_s3.go','cloud_storage_entry.go') |
     ForEach-Object { Join-Path $root "cmd/myliba/$_" }
 
 $env:GOOS = $TargetOS

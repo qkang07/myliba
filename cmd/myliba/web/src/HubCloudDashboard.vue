@@ -60,13 +60,13 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
               <div><strong>{{ overview.reportedBlockCount ?? 0 }}</strong><span>在线块副本数</span></div>
               <div><strong>{{ overview.catalogRecords ?? 0 }}</strong><span>Hub 索引记录数</span></div>
             </div>
-            <p class="hub-cloud-note">空间与块数按在线节点上报相加；同一块的多个备份会分别计入。S3/WebDAV 的容量和占用暂不统计，离线节点也不计入空间汇总。</p>
+            <p class="hub-cloud-note">空间与块数按在线节点上报相加；同一块的多个备份会分别计入。S3/WebDAV/OpenList 的容量和占用暂不统计，离线节点也不计入空间汇总。</p>
             <div class="cloud-heading"><strong>节点（{{ overview.nodes.length }}）</strong><button class="quiet-button" type="button" @click="refresh"><RefreshCw :size="15" />刷新</button></div>
             <p v-if="!overview.nodes.length">还没有节点向 Hub 注册。</p>
             <div v-for="node in overview.nodes" :key="node.id" class="hub-cloud-node">
               <div class="hub-cloud-node-heading"><strong>{{ node.role === "client" ? "客户端" : "存储节点" }} · {{ node.id.slice(0, 12) }}</strong><span :class="['hub-cloud-status', { offline: !node.online }]">{{ node.online ? "在线" : "离线" }}</span></div>
-              <small>{{ node.backend === "s3" ? "S3 / OSS" : node.backend === "webdav" ? "WebDAV / 云盘" : "本地磁盘" }} · 最近上报 {{ time(node.seenAt) }}</small>
-              <small class="hub-cloud-endpoint">{{ node.endpoint || "未公开直连地址" }}</small>
+              <small>{{ node.backend === "s3" ? "S3 / OSS" : node.backend === "openlist" ? "OpenList / 云盘" : node.backend === "webdav" ? "WebDAV / 云盘" : "本地磁盘" }} · {{ node.relayed ? (node.endpoint ? "经存储节点中继" : "中继未连接") : "直连" }} · 最近上报 {{ time(node.seenAt) }}</small>
+              <small class="hub-cloud-endpoint">{{ node.endpoint || "当前无访问地址" }}</small>
               <div class="hub-cloud-node-metrics"><span>{{ node.statsReady ? node.blockCount : "未知" }} 块</span><span>副本占用 {{ size(node.blockBytes) }}</span><span>可用 {{ size(node.availableBytes) }} / {{ size(node.capacityBytes) }}</span><span>{{ node.statsReady ? node.catalogCount : "未知" }} 条索引</span></div>
             </div>
           </template>

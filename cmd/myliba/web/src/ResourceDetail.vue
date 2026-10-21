@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { ArrowLeft, Check, CircleAlert, Download, Expand, File, FileText, Image, LoaderCircle, Minimize, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
+import { ArrowLeft, Check, CircleAlert, Copy, Download, Expand, File, FileText, Image, Link2, LoaderCircle, Minimize, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
 import ImagePreview from "./ImagePreview.vue";
+import StreamingVideo from "./StreamingVideo.vue";
 import {
-  addResourceTag, createThumbnailVariant, fileURL, getResource, getResourceFile, getResourceThumbnailVariant, uploadResourceToCloud,
+  addResourceTag, createFileShare, createThumbnailVariant, fileURL, getResource, getResourceFile, getResourceThumbnailVariant, listFileShares, revokeFileShare, uploadResourceToCloud,
   getTagSuggestions, getTags, getVideoInfo, moveResourcesToFolder, removeResourceTag,
-  type Resource, type TagSuggestion, type TagSummary, type VirtualFolder,
+  type FileShare, type Resource, type TagSuggestion, type TagSummary, type VirtualFolder,
 } from "./api";
 
 const props = defineProps<{ id: string; folders: VirtualFolder[]; remote: boolean }>();
@@ -19,6 +20,11 @@ const previewError = ref("");
 const previewURL = ref("");
 const cloudStatus = ref("");
 const cloudBusy = ref(false);
+const shares = ref<FileShare[]>([]);
+const shareHours = ref(168);
+const shareBusy = ref(false);
+const shareURL = ref("");
+const shareError = ref("");
 const tagInput = ref("");
 const tagBusy = ref(false);
 const folderBusy = ref(false);
@@ -38,7 +44,7 @@ const mimeType = computed(() => {
   const types: Record<string, string> = {
     avif: "image/avif", bmp: "image/bmp", gif: "image/gif", jpeg: "image/jpeg", jpg: "image/jpeg",
     png: "image/png", tif: "image/tiff", tiff: "image/tiff", webp: "image/webp",
-    mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", webm: "video/webm", ogv: "video/ogg",
+    mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska", avi: "video/x-msvideo", webm: "video/webm", ogv: "video/ogg",
     mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", oga: "audio/ogg", ogg: "audio/ogg",
     wav: "audio/wav", flac: "audio/flac", pdf: "application/pdf", txt: "text/plain",
   };
@@ -132,13 +138,17 @@ async function refreshResource() {
   duration.value = 0;
   durationError.value = "";
   resource.value = null;
+  shares.value = [];
+  shareError.value = "";
   clearImages();
   try {
     const item = await getResource(props.id);
     if (current !== generation) return;
     resource.value = item;
     loading.value = false;
-    if (props.remote && item.available) {
+    shareURL.value = "";
+    void listFileShares(item.id).then((items) => { if (current === generation) shares.value = items; }).catch(() => { if (current === generation) shares.value = []; });
+    if (props.remote && item.available && item.kind !== "video") {
       if (item.size > 128 * 1024 * 1024) {
         previewError.value = "此文件超过直连网页预览的大小限制，请下载后打开。";
       } else {
@@ -222,10 +232,9 @@ async function changeFolder(event: Event) {
     target.value = resource.value?.folderId || "";
   } finally { folderBusy.value = false; }
 }
-function onVideoMetadata(event: Event) {
-  const video = event.target;
-  if (!(video instanceof HTMLVideoElement) || !Number.isFinite(video.duration) || video.duration <= 0 || duration.value) return;
-  duration.value = video.duration;
+function onVideoMetadata(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0 || duration.value) return;
+  duration.value = seconds;
   durationError.value = "";
   const current = generation;
   for (const capture of captures.value) void readVariant(capture.key, "medium", capture.at, current);
@@ -262,6 +271,37 @@ async function uploadToCloud() {
     cloudStatus.value = "已加入上传队列，可在云层查看进度";
   } catch (cause) { cloudStatus.value = cause instanceof Error ? cause.message : "加入云层失败"; }
   finally { cloudBusy.value = false; }
+}
+async function createShare() {
+  if (!resource.value || shareBusy.value) return;
+  shareBusy.value = true;
+  shareError.value = "";
+  try {
+    const result = await createFileShare(resource.value.id, shareHours.value);
+    shareURL.value = result.url;
+    shares.value = [result.share, ...shares.value];
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(result.url).catch(() => { /* The visible URL can be copied manually. */ });
+  } catch (cause) { shareError.value = cause instanceof Error ? cause.message : "创建分享失败"; }
+  finally { shareBusy.value = false; }
+}
+async function copyShare() {
+  if (!shareURL.value) return;
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+    await navigator.clipboard.writeText(shareURL.value);
+  }
+  catch { shareError.value = "无法自动复制，请手动复制上方链接"; }
+}
+async function revokeShare(id: string) {
+  if (shareBusy.value) return;
+  shareBusy.value = true;
+  shareError.value = "";
+  try {
+    await revokeFileShare(id);
+    shares.value = shares.value.map((item) => item.id === id ? { ...item, revokedAt: new Date().toISOString() } : item);
+    if (shareURL.value.includes(`/s/${id}#`)) shareURL.value = "";
+  } catch (cause) { shareError.value = cause instanceof Error ? cause.message : "撤销分享失败"; }
+  finally { shareBusy.value = false; }
 }
 function openImageViewer() {
   if (!resource.value?.available || !mimeType.value.startsWith("image/") || previewError.value) return;
@@ -302,20 +342,27 @@ onBeforeUnmount(() => {
     <template v-else>
       <header class="detail-heading">
         <span class="detail-kind-icon"><component :is="fileIcon" :size="25" /></span>
-        <div><p class="eyebrow">资源详情 · {{ kindLabel }}</p><h1>{{ resource.name }}</h1><p>{{ resource.available ? "源文件可用" : "源文件暂不可用" }} · {{ formatBytes(resource.size) }}</p></div>
+        <div><p class="eyebrow">资源详情 · {{ kindLabel }}</p><h1>{{ resource.name }}</h1><p>{{ resource.available ? "源文件可用" : "源文件暂不可用" }} · 文件总大小 {{ formatBytes(resource.contentSize ?? resource.size) }}</p></div>
         <button class="button button-secondary" :disabled="!resource.available" @click="download"><Download :size="15" />下载原文件</button>
         <button v-if="!remote" class="button button-secondary" :disabled="!resource.available || cloudBusy" @click="uploadToCloud">加入云层</button>
       </header>
       <p v-if="cloudStatus" class="detail-error" role="status">{{ cloudStatus }}</p>
+      <section class="detail-panel share-panel" aria-label="外链分享">
+        <div class="detail-panel-heading"><h2><Link2 :size="17" />外链分享</h2><span>仅此文件 · 节点在线时直传</span></div>
+        <div class="share-create"><label>有效期 <select v-model.number="shareHours"><option :value="24">1 天</option><option :value="168">7 天</option><option :value="720">30 天</option></select></label><button class="button button-secondary" :disabled="!resource.available || shareBusy" @click="createShare">创建分享链接</button></div>
+        <div v-if="shareURL" class="share-created"><p>链接已创建，密钥仅显示这一次。可直接粘贴发送给接收者。</p><div><input :value="shareURL" readonly aria-label="分享链接" @focus="($event.target as HTMLInputElement).select()" /><button class="button button-secondary" @click="copyShare"><Copy :size="14" />复制</button></div></div>
+        <p v-if="shareError" class="detail-error" role="alert">{{ shareError }}</p>
+        <div v-if="shares.length" class="share-list"><div v-for="share in shares" :key="share.id" class="share-row"><span>{{ share.revokedAt ? '已撤销' : new Date(share.expiresAt) <= new Date() ? '已过期' : '有效至 ' + new Date(share.expiresAt).toLocaleString() }}</span><button v-if="!share.revokedAt && new Date(share.expiresAt) > new Date()" class="quiet-button" :disabled="shareBusy" @click="revokeShare(share.id)"><Trash2 :size="14" />撤销</button></div></div>
+      </section>
       <p v-if="error" class="detail-error" role="alert"><CircleAlert :size="15" />{{ error }}</p>
       <div class="detail-layout">
         <div class="detail-main">
           <section class="detail-panel detail-preview-panel" :class="{ 'is-preview-expanded': expandedPreview }">
             <div class="detail-panel-heading detail-preview-heading"><h2>文件预览</h2><div class="detail-preview-tools"><span>{{ mimeType || "无法在网页中预览" }}</span><button v-if="resource.available && mimeType.startsWith('image/') && !previewError" class="detail-fullscreen-button" aria-label="查看大图" @click="openImageViewer"><Expand :size="14" />查看大图</button><button v-else-if="resource.available && mimeType && !previewError" class="detail-fullscreen-button" :aria-label="expandedPreview ? '退出窗口预览' : '铺满窗口预览'" @click="toggleExpandedPreview"><Minimize v-if="expandedPreview" :size="14" /><Expand v-else :size="14" />{{ expandedPreview ? '退出窗口预览' : '铺满窗口' }}</button></div></div>
             <div class="detail-preview">
-              <template v-if="resource.available && mimeType && !previewError && (!remote || previewURL)">
+              <template v-if="resource.available && mimeType && !previewError && (resource.kind === 'video' || !remote || previewURL)">
                 <button v-if="mimeType.startsWith('image/')" type="button" class="detail-image-trigger" :aria-label="'预览图片 ' + resource.name" @click="openImageViewer"><img :src="remote ? previewURL : fileURL(resource.id)" :alt="resource.name" @error="previewError = '图片无法加载'" /><span class="detail-image-trigger-hint"><Expand :size="14" />点击查看大图</span></button>
-                <video v-else-if="mimeType.startsWith('video/')" :src="remote ? previewURL : fileURL(resource.id)" controls preload="metadata" @loadedmetadata="onVideoMetadata" @error="previewError = '浏览器无法播放此视频格式'"></video>
+                <StreamingVideo v-else-if="mimeType.startsWith('video/')" :id="resource.id" :name="resource.name" :remote="remote" @metadata="onVideoMetadata" />
                 <audio v-else-if="mimeType.startsWith('audio/')" :src="remote ? previewURL : fileURL(resource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式'"></audio>
                 <iframe v-else sandbox="" :src="remote ? previewURL : fileURL(resource.id)" :title="'预览 ' + resource.name"></iframe>
               </template>
@@ -346,7 +393,7 @@ onBeforeUnmount(() => {
         <aside class="detail-side">
           <section class="detail-panel">
             <div class="detail-panel-heading"><h2>文件信息</h2></div>
-            <dl class="detail-facts"><div><dt>名称</dt><dd>{{ resource.name }}</dd></div><div><dt>类型</dt><dd>{{ kindLabel }}</dd></div><div><dt>大小</dt><dd>{{ formatBytes(resource.size) }}</dd></div><div><dt>修改时间</dt><dd>{{ new Date(resource.modified).toLocaleString('zh-CN') }}</dd></div><div><dt>原始路径</dt><dd class="detail-path">{{ resource.path }}</dd></div><div><dt>资源 ID</dt><dd class="detail-path">{{ resource.id }}</dd></div></dl>
+            <dl class="detail-facts"><div><dt>名称</dt><dd>{{ resource.name }}</dd></div><div><dt>类型</dt><dd>{{ kindLabel }}</dd></div><div><dt>文件总大小</dt><dd>{{ formatBytes(resource.contentSize ?? resource.size) }}</dd></div><div><dt>原件大小</dt><dd>{{ formatBytes(resource.size) }}</dd></div><div><dt>修改时间</dt><dd>{{ new Date(resource.modified).toLocaleString('zh-CN') }}</dd></div><div><dt>原始路径</dt><dd class="detail-path">{{ resource.path }}</dd></div><div><dt>资源 ID</dt><dd class="detail-path">{{ resource.id }}</dd></div></dl>
           </section>
           <section class="detail-panel">
             <div class="detail-panel-heading"><h2>所属文件夹</h2></div>

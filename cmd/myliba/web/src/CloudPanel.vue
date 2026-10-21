@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref, watch } from "vue";
-import { Cloud, Download, LoaderCircle, RefreshCw, Upload, X } from "@lucide/vue";
+import { Cloud, Download, LoaderCircle, Play, RefreshCw, Upload, X } from "@lucide/vue";
+import StreamingVideo from "./StreamingVideo.vue";
 import {
   getCloudFile, getCloudFiles, getCloudRecovery, getCloudVersions, importCloudRecovery,
   uploadResourceToCloud, type CloudFile, type CloudView, type Resource,
@@ -14,6 +15,7 @@ const view = ref<CloudView>({ files: [], jobs: {}, nodeId: "", libraryId: "", pe
 const recoveryKey = ref("");
 const importKey = ref("");
 const activeDownload = ref("");
+const activeVideo = ref("");
 const historyChoices = ref<Record<string, boolean>>({});
 const versions = ref<Record<string, CloudFile[]>>({});
 let timer: ReturnType<typeof setInterval> | undefined;
@@ -97,17 +99,22 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
         <div class="hub-settings-body cloud-panel-body">
           <p v-if="error" class="form-error" role="alert">{{ error }}</p>
           <p class="hub-current">当前节点 {{ view.nodeId || "未连接" }} · 已发现 {{ view.peers.length }} 个其他在线节点</p>
-          <p v-if="!remote && !view.directEndpoint">本客户端尚未配置直连公开地址；可主动上传到其他节点，但其他设备不能直接从本客户端取块。</p>
+          <p v-if="!remote && view.peers.length === 0">当前是单节点云层：文件仍会在本机分块、加密、保存索引并可随时读取。只有一份副本时会提示保护不足，不影响使用。</p>
+          <p v-if="!remote && !view.directEndpoint && view.peers.length > 0">本客户端尚未配置直连公开地址；可主动上传到其他节点，但其他设备不能直接从本客户端取块。</p>
           <div class="cloud-heading"><strong>云层文件</strong><button class="quiet-button" type="button" @click="refresh"><RefreshCw :size="15" />刷新</button></div>
           <p v-if="loading">正在读取云层索引…</p>
           <p v-else-if="!view.files.length">云层里还没有可用文件。</p>
-          <div v-for="file in view.files" :key="file.id" class="hub-profile-row">
-            <div><strong>{{ file.name }}</strong><small>{{ formatSize(file.size) }} · {{ file.chunks }} 块 · 最少 {{ file.minReplicas }}/3 份在线副本 · {{ file.history ? "保留历史" : "无历史" }}</small></div>
+          <template v-for="file in view.files" :key="file.id">
+          <div class="hub-profile-row">
+            <div><strong>{{ file.name }}</strong><small>文件总大小 {{ formatSize(file.size) }} · 原件 {{ formatSize(file.originalSize ?? file.size) }} · {{ file.chunks }} 块 · 最少 {{ file.minReplicas }}/3 份在线副本 · {{ file.history ? "保留历史" : "无历史" }}</small></div>
+            <button v-if="file.variants?.length" class="button button-secondary" type="button" @click="activeVideo = activeVideo === file.id ? '' : file.id"><Play :size="14" />{{ activeVideo === file.id ? "收起" : "播放" }}</button>
             <button v-if="file.history" class="button button-secondary" type="button" @click="toggleVersions(file.id)">历史</button>
             <button class="button button-secondary" type="button" :disabled="!!activeDownload" @click="download(file.id, file.name)">
               <LoaderCircle v-if="activeDownload === file.id" class="spin" :size="14" /><Download v-else :size="14" />下载
             </button>
           </div>
+          <div v-if="activeVideo === file.id" class="cloud-video-preview"><StreamingVideo :id="file.id" :name="file.name" :remote="remote" cloud :qualities="file.variants" /></div>
+          </template>
           <div v-for="file in view.files.filter((item) => versions[item.id])" :key="file.id + '-history'" class="cloud-history">
             <div v-for="version in versions[file.id]" :key="version.revisionId" class="hub-profile-row">
               <div><strong>{{ version.name }}</strong><small>{{ version.modified }} · {{ formatSize(version.size) }}</small></div>
@@ -118,7 +125,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
             <div class="cloud-heading"><strong>将当前页面的本地文件加入云层</strong></div>
             <p v-if="!resources.length">进入资源列表后，可从这里选择文件上传。</p>
             <div v-for="resource in resources" :key="resource.id" class="hub-profile-row">
-              <div><strong>{{ resource.name }}</strong><small>{{ formatSize(resource.size) }} · {{ view.jobs[resource.id] || "仅本地" }}</small><label class="cloud-history-choice"><input v-model="historyChoices[resource.id]" type="checkbox" />保留后续历史版本</label></div>
+              <div><strong>{{ resource.name }}</strong><small>{{ formatSize(resource.contentSize ?? resource.size) }} · {{ view.jobs[resource.id] || "仅本地" }}</small><label class="cloud-history-choice"><input v-model="historyChoices[resource.id]" type="checkbox" />保留后续历史版本</label></div>
               <button class="button button-secondary" type="button" :disabled="!resource.available || view.jobs[resource.id] === '上传中'" @click="upload(resource)">
                 <Upload :size="14" />{{ view.jobs[resource.id] === "上传中" ? "上传中" : "加入云层" }}
               </button>

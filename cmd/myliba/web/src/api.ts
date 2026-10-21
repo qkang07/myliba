@@ -1,13 +1,14 @@
 import { webRTCConnected, webRTCFetch } from "./webrtc";
 
 let remoteSession = false;
-const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail)|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file))(?:\?|$)/;
+const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail|video\/[^/]+\/(?:init|segments\/\d+))|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file|assets\/[^/]+\/parts\/[^/]+|video\/[^/]+\/(?:init|segments\/\d+)))(?:\?|$)/;
 
 export interface Resource {
   id: string;
   name: string;
   path: string;
   size: number;
+  contentSize: number;
   modified: string;
   kind: string;
   available: boolean;
@@ -15,6 +16,28 @@ export interface Resource {
   folderId: string;
   tags: string[];
   attributeTags: AttributeTag[];
+}
+
+export interface FileShare {
+  id: string;
+  resourceId: string;
+  createdAt: string;
+  expiresAt: string;
+  revokedAt?: string;
+}
+
+export function listFileShares(resourceId: string) {
+  return request<FileShare[]>(`/api/resources/${encodeURIComponent(resourceId)}/shares`);
+}
+
+export function createFileShare(resourceId: string, expiresInHours: number) {
+  return request<{ share: FileShare; url: string }>(`/api/resources/${encodeURIComponent(resourceId)}/shares`, {
+    method: "POST", body: JSON.stringify({ expiresInHours }),
+  });
+}
+
+export function revokeFileShare(id: string) {
+  return request<{ ok: boolean }>(`/api/shares/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export type ResourceSort = "modified_desc" | "modified_asc" | "name_asc" | "name_desc" | "size_desc";
@@ -51,6 +74,28 @@ export interface RootSummary {
   addedAt: string;
   lastScanAt: string;
   count: number;
+}
+
+export interface MediaStore {
+  id: string;
+  path: string;
+  isDefault: boolean;
+}
+
+export function getMediaStores() {
+  return request<MediaStore[]>("/api/media-stores", { headers: { "X-Myliba-Local": "1" } });
+}
+
+export function addMediaStore(path: string) {
+  return request<{ id: string; path: string; existing?: boolean }>("/api/media-stores", {
+    method: "POST", body: JSON.stringify({ path }), headers: { "X-Myliba-Local": "1" },
+  });
+}
+
+export function selectMediaStore(id: string) {
+  return request<void>(`/api/media-stores/${encodeURIComponent(id)}/default`, {
+    method: "PUT", body: "{}", headers: { "X-Myliba-Local": "1" },
+  });
 }
 
 export interface VirtualFolder {
@@ -203,17 +248,20 @@ export interface CloudFile {
   id: string;
   name: string;
   size: number;
+  originalSize: number;
   modified: string;
   history: boolean;
   sourceId?: string;
   chunks: number;
   revisionId: string;
   minReplicas: number;
+  variants: VideoQuality[];
 }
 
 export interface CloudNode {
   id: string;
   endpoint: string;
+  relayed?: boolean;
   role: "client" | "storage";
   seenAt: string;
 }
@@ -221,7 +269,7 @@ export interface CloudNode {
 export interface HubCloudNode extends CloudNode {
   online: boolean;
   statsReady?: boolean;
-  backend?: "disk" | "s3" | "webdav";
+  backend?: "disk" | "s3" | "webdav" | "openlist";
   blockCount: number;
   blockBytes?: number;
   catalogCount: number;
@@ -423,6 +471,37 @@ export function getResource(id: string) {
 
 export function getVideoInfo(id: string) {
   return request<{ duration: number }>(`/api/resources/${encodeURIComponent(id)}/video-info`);
+}
+
+export type VideoQuality = "360p" | "720p" | "1080p";
+export interface VideoManifest {
+  status: "missing" | "processing" | "failed" | "ready";
+  error?: string;
+  codec?: string;
+  duration?: number;
+  segments?: number[];
+}
+export function videoVariantURL(id: string, quality: VideoQuality) {
+  return `/api/resources/${encodeURIComponent(id)}/video/${quality}`;
+}
+export function getVideoVariant(id: string, quality: VideoQuality) {
+  return request<VideoManifest>(videoVariantURL(id, quality));
+}
+export function createVideoVariant(id: string, quality: VideoQuality) {
+  return request<VideoManifest>(videoVariantURL(id, quality), { method: "POST" });
+}
+export function getVideoPart(id: string, quality: VideoQuality, part: "init" | number) {
+  return apiFetch(`${videoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}`);
+}
+
+export function cloudVideoVariantURL(id: string, quality: VideoQuality) {
+  return `/api/cloud/files/${encodeURIComponent(id)}/video/${quality}`;
+}
+export function getCloudVideoVariant(id: string, quality: VideoQuality) {
+  return request<VideoManifest>(cloudVideoVariantURL(id, quality));
+}
+export function getCloudVideoPart(id: string, quality: VideoQuality, part: "init" | number) {
+  return apiFetch(`${cloudVideoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}`);
 }
 
 export function removeResourceTag(id: string, tagID: string) {

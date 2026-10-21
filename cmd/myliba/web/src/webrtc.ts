@@ -170,6 +170,7 @@ export async function connectWebRTC(
   iceServers: RTCIceServer[],
   onState: (state: "connecting" | "webrtc" | "turn" | "relay") => void,
   onRate: (rate: TrafficRate) => void,
+  share?: { id: string; token: string },
 ) {
   cleanup(false);
   stateListener = onState;
@@ -185,11 +186,28 @@ export async function connectWebRTC(
     });
     const rtc = new RTCPeerConnection({ iceServers: directServers });
     peer = rtc;
-    const socketURL = new URL("/signal", window.location.href);
+    const socketURL = new URL(share ? "/share/signal" : "/signal", window.location.href);
     socketURL.protocol = socketURL.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(socketURL);
     signalSocket = socket;
     await waitForSocket(socket);
+    if (share) {
+      socket.send(JSON.stringify({ type: "authorize", id: share.id, token: share.token }));
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => { cleanup(false); reject(new Error("分享授权超时")); }, 10000);
+        const onMessage = (event: MessageEvent) => {
+          try {
+            if (JSON.parse(String(event.data)).type === "authorized") {
+              clearTimeout(timeout);
+              socket.removeEventListener("message", onMessage);
+              resolve();
+            }
+          } catch { /* Ignore malformed signaling messages. */ }
+        };
+        socket.addEventListener("message", onMessage);
+        socket.addEventListener("close", () => { clearTimeout(timeout); reject(new Error("分享授权失败")); }, { once: true });
+      });
+    }
 
     const dataChannel = rtc.createDataChannel("myliba-api", { ordered: true });
     channel = dataChannel;

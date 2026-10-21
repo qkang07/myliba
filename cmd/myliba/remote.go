@@ -31,6 +31,7 @@ type wireMessage struct {
 	Status    int             `json:"status,omitempty"`
 	Data      []byte          `json:"data,omitempty"`
 	SessionID string          `json:"sessionId,omitempty"`
+	ShareID   string          `json:"shareId,omitempty"`
 	Signal    json.RawMessage `json:"signal,omitempty"`
 }
 
@@ -45,6 +46,7 @@ type remoteHub struct {
 	sessions          map[string]time.Time
 	loginTries        int
 	loginBlockedUntil time.Time
+	shareChecks       int
 	webTraffic        trafficMeter
 	nodeTraffic       trafficMeter
 	iceServers        []iceServerConfig
@@ -237,7 +239,7 @@ func connectNode(parent context.Context, hubURL, token string, iceServers []iceS
 				go handleNodeRequest(ctx, conn, writeMu, &request)
 			}
 		case "rtc-signal":
-			rtc.handle(request.SessionID, request.Signal)
+			rtc.handle(request.SessionID, request.ShareID, request.Signal)
 		}
 	}
 }
@@ -446,14 +448,17 @@ func (h *remoteHub) send(conn *websocket.Conn, message wireMessage) error {
 }
 
 func filteredHeaders(headers http.Header, response bool) http.Header {
-	allowed := []string{"Content-Type", "Range", "If-Modified-Since", "If-None-Match"}
+	allowed := map[string]bool{"Content-Type": true, "Range": true, "If-Modified-Since": true, "If-None-Match": true, "X-Myliba-Share-Key": true}
 	if response {
-		allowed = []string{"Content-Type", "Content-Disposition", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag", "Cache-Control", "Content-Security-Policy"}
+		allowed = map[string]bool{"Content-Type": true, "Content-Disposition": true, "Content-Length": true, "Content-Range": true, "Accept-Ranges": true, "Last-Modified": true, "Etag": true, "Cache-Control": true, "Content-Security-Policy": true}
 	}
 	result := make(http.Header)
-	for _, name := range allowed {
-		for _, value := range headers.Values(name) {
-			result.Add(name, value)
+	for name, values := range headers {
+		canonical := http.CanonicalHeaderKey(name)
+		if allowed[canonical] {
+			for _, value := range values {
+				result.Add(canonical, value)
+			}
 		}
 	}
 	return result
@@ -494,9 +499,31 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return false
 	}
 	switch {
+	case len(parts) == 4 && parts[1] == "shares" && parts[3] == "redeem":
+		return method == http.MethodPost
+	case len(parts) == 4 && parts[1] == "shares" && parts[3] == "file":
+		return method == http.MethodGet
+	case len(parts) == 5 && parts[1] == "shares" && parts[3] == "video":
+		return method == http.MethodGet || method == http.MethodPost
+	case len(parts) == 6 && parts[1] == "shares" && parts[3] == "video" && parts[5] == "init":
+		return method == http.MethodGet
+	case len(parts) == 7 && parts[1] == "shares" && parts[3] == "video" && parts[5] == "segments":
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "shares":
+		return method == http.MethodDelete
+	case len(parts) == 4 && parts[1] == "resources" && parts[3] == "shares":
+		return method == http.MethodGet || method == http.MethodPost
 	case len(parts) == 3 && parts[1] == "cloud" && parts[2] == "files":
 		return method == http.MethodGet
 	case len(parts) == 5 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "file":
+		return method == http.MethodGet
+	case len(parts) == 8 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "assets" && parts[6] == "parts":
+		return method == http.MethodGet
+	case len(parts) == 6 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "video":
+		return method == http.MethodGet
+	case len(parts) == 7 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "video" && parts[6] == "init":
+		return method == http.MethodGet
+	case len(parts) == 8 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "video" && parts[6] == "segments":
 		return method == http.MethodGet
 	case len(parts) == 5 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "versions":
 		return method == http.MethodGet
@@ -528,7 +555,13 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "resources" && parts[2] == "tags":
 		return method == http.MethodPost
-	case len(parts) == 4 && parts[1] == "resources" && (parts[3] == "file" || parts[3] == "tag-suggestions" || parts[3] == "video-info"):
+	case len(parts) == 4 && parts[1] == "resources" && (parts[3] == "file" || parts[3] == "index" || parts[3] == "tag-suggestions" || parts[3] == "video-info"):
+		return method == http.MethodGet
+	case len(parts) == 5 && parts[1] == "resources" && parts[3] == "video":
+		return method == http.MethodGet || method == http.MethodPost
+	case len(parts) == 6 && parts[1] == "resources" && parts[3] == "video" && parts[5] == "init":
+		return method == http.MethodGet
+	case len(parts) == 7 && parts[1] == "resources" && parts[3] == "video" && parts[5] == "segments":
 		return method == http.MethodGet
 	case len(parts) == 4 && parts[1] == "resources" && parts[3] == "tags":
 		return method == http.MethodPost
@@ -562,7 +595,20 @@ func allowedHubRelayRequest(method, rawURI string) bool {
 		(parts[3] == "file" || parts[3] == "thumbnail") {
 		return false
 	}
+	if len(parts) >= 6 && parts[0] == "api" && parts[1] == "resources" && parts[3] == "video" {
+		return false
+	}
+	if len(parts) == 4 && parts[0] == "api" && parts[1] == "shares" && parts[3] == "file" {
+		return false
+	}
+	if len(parts) >= 6 && parts[0] == "api" && parts[1] == "shares" && parts[3] == "video" {
+		return false
+	}
 	if len(parts) == 5 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "file" {
+		return false
+	}
+	if len(parts) >= 7 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" &&
+		(parts[4] == "assets" || parts[4] == "video") {
 		return false
 	}
 	if len(parts) == 7 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "versions" && parts[6] == "file" {

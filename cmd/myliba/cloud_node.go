@@ -17,22 +17,28 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type cloudRuntime struct {
-	disk      *cloudDisk
-	id        string
-	role      string
-	endpoint  string
-	db        *sql.DB
-	hubURL    string
-	token     string
-	mu        sync.RWMutex
-	peers     []cloudNode
-	bootstrap []cloudNode
-	locations map[string][]cloudNode
-	client    *http.Client
+	disk       *cloudDisk
+	id         string
+	role       string
+	endpoint   string
+	db         *sql.DB
+	hubURL     string
+	token      string
+	mu         sync.RWMutex
+	peers      []cloudNode
+	bootstrap  []cloudNode
+	locations  map[string][]cloudNode
+	client     *http.Client
+	relayURL   string
+	relayOn    bool
+	relayMu    sync.RWMutex
+	relays     map[string]*cloudRelayConn
+	relayReady atomic.Bool
 }
 
 func cloudDataDir(storageOnly bool) (string, error) {
@@ -53,7 +59,7 @@ func readOrCreateCloudID(dir string) (string, error) {
 	path := filepath.Join(dir, "node-id")
 	if raw, err := os.ReadFile(path); err == nil {
 		id := strings.TrimSpace(string(raw))
-		if len(id) == 32 {
+		if len(id) == 32 && cloudRelayEndpointID("https://relay.invalid/cloud/relay/"+id) == id {
 			return id, nil
 		}
 	}
@@ -88,6 +94,13 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 		return nil, err
 	}
 	endpoint := strings.TrimRight(strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_PUBLIC_URL")), "/")
+	relayURL := strings.TrimRight(strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_RELAY_URL")), "/")
+	if relayURL != "" && (!validCloudEndpoint(relayURL) || strings.Contains(relayURL, "/cloud/relay/")) {
+		return nil, errors.New("MYLIBA_CLOUD_RELAY_URL must be a storage node HTTPS root URL")
+	}
+	if endpoint == "" && relayURL != "" {
+		endpoint = relayURL + "/cloud/relay/" + id
+	}
 	if !validCloudEndpoint(endpoint) {
 		return nil, errors.New("MYLIBA_CLOUD_PUBLIC_URL must be HTTPS, or loopback HTTP for development")
 	}
@@ -98,10 +111,11 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 	rt := &cloudRuntime{
 		disk: disk, id: id, role: role, endpoint: endpoint, db: db,
 		client: &http.Client{
-			Timeout:       45 * time.Second,
+			Timeout:       90 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		locations: map[string][]cloudNode{},
+		locations: map[string][]cloudNode{}, relayURL: relayURL,
+		relayOn: os.Getenv("MYLIBA_CLOUD_RELAY_ENABLED") == "1", relays: map[string]*cloudRelayConn{},
 	}
 	if raw := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_BOOTSTRAP_URLS")); raw != "" {
 		var endpoints []string
@@ -340,8 +354,18 @@ func (c *cloudRuntime) refreshLocations(ctx context.Context, token string, peers
 
 func (c *cloudRuntime) syncOnce(ctx context.Context) error {
 	wsURL, token, err := c.credentials()
-	if err != nil || len(token) < 32 {
+	if err != nil {
 		return err
+	}
+	if wsURL == "" && len(c.bootstrap) == 0 {
+		c.mu.Lock()
+		c.peers = nil
+		c.mu.Unlock()
+		c.refreshLocations(ctx, "", nil)
+		return nil
+	}
+	if len(token) < 32 {
+		return errors.New("cloud peers require MYLIBA_CLOUD_TOKEN")
 	}
 	peers := c.activePeers()
 	known := map[string]bool{}
@@ -399,7 +423,11 @@ func (c *cloudRuntime) hubPeers(ctx context.Context, hub, token string) ([]cloud
 	if err != nil {
 		log.Printf("Cloud storage stats unavailable: %v", err)
 	}
-	data, _ := json.Marshal(cloudNode{ID: c.id, Endpoint: c.endpoint, Role: c.role, cloudStorageStats: stats})
+	endpoint := c.endpoint
+	if c.relayURL != "" && cloudRelayEndpointID(endpoint) != "" && !c.relayReady.Load() {
+		endpoint = ""
+	}
+	data, _ := json.Marshal(cloudNode{ID: c.id, Endpoint: endpoint, Relayed: cloudRelayEndpointID(c.endpoint) != "", Role: c.role, cloudStorageStats: stats})
 	response, err := c.request(ctx, http.MethodPost, hub, "/cloud/nodes/heartbeat", token, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -432,6 +460,9 @@ func (c *cloudRuntime) hubPeers(ctx context.Context, hub, token string) ([]cloud
 }
 
 func (c *cloudRuntime) run(ctx context.Context) {
+	if c.relayURL != "" && strings.Contains(c.endpoint, "/cloud/relay/") {
+		go c.runRelayTunnel(ctx)
+	}
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -463,6 +494,9 @@ func (c *cloudRuntime) serveDirect() error {
 		}
 		inner := http.NewServeMux()
 		c.disk.routes(inner, token)
+		if c.relayOn {
+			c.relayRoutes(inner, token)
+		}
 		inner.ServeHTTP(w, r)
 	}))
 	log.Printf("Cloud direct endpoint listening on %s", addr)

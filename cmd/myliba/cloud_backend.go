@@ -31,8 +31,10 @@ func newCloudBackendFromEnv() (cloudObjectBackend, error) {
 		return newWebDAVBackend()
 	case "s3":
 		return newS3Backend()
+	case "openlist":
+		return newOpenListBackend()
 	default:
-		return nil, errors.New("MYLIBA_CLOUD_BACKEND must be disk, webdav, or s3")
+		return nil, errors.New("MYLIBA_CLOUD_BACKEND must be disk, webdav, s3, or openlist")
 	}
 }
 
@@ -66,7 +68,11 @@ func newWebDAVBackend() (*webDAVBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	backend := &webDAVBackend{root: root, user: os.Getenv("MYLIBA_WEBDAV_USER"), pass: os.Getenv("MYLIBA_WEBDAV_PASSWORD"), client: cloudBackendHTTPClient()}
+	return newWebDAVBackendAt(root, os.Getenv("MYLIBA_WEBDAV_USER"), os.Getenv("MYLIBA_WEBDAV_PASSWORD"))
+}
+
+func newWebDAVBackendAt(root *url.URL, user, pass string) (*webDAVBackend, error) {
+	backend := &webDAVBackend{root: root, user: user, pass: pass, client: cloudBackendHTTPClient()}
 	for _, kind := range []string{"blocks", "catalog"} {
 		response, err := backend.request("MKCOL", kind+"/", nil, nil)
 		if err != nil {

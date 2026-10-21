@@ -109,6 +109,56 @@ func serveCloudTestNode(t *testing.T, runtime *cloudRuntime, token string) *http
 	return server
 }
 
+func TestCloudSingleLocalNodeWithoutHubOrToken(t *testing.T) {
+	t.Setenv("MYLIBA_CLOUD_TOKEN", "")
+	dir := t.TempDir()
+	t.Setenv("MYLIBA_CLOUD_DATA_DIR", filepath.Join(dir, "node"))
+	t.Setenv("MYLIBA_CLOUD_PUBLIC_URL", "")
+	t.Setenv("MYLIBA_CLOUD_RELAY_URL", "")
+	runtime, err := newCloudRuntime(nil, false)
+	if err != nil || runtime.endpoint != "" {
+		t.Fatalf("local runtime: %+v, %v", runtime, err)
+	}
+	client, err := newCloudClient(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := []byte("one local node is a complete encrypted cloud")
+	path := filepath.Join(dir, "single.txt")
+	if err := os.WriteFile(path, plain, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.uploadFile(context.Background(), "single-file", path, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.syncOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	records, err := client.validRecords()
+	if err != nil || len(records) != 1 || len(records[0].BlockIDs) != 1 {
+		t.Fatalf("local catalog: %+v, %v", records, err)
+	}
+	blockID := records[0].BlockIDs[0]
+	if !runtime.disk.valid("blocks", blockID) || len(runtime.blockLocations(blockID)) != 1 || len(runtime.activePeers()) != 0 {
+		t.Fatal("local block must be indexed as one replica without peers")
+	}
+	reopenedRuntime, err := newCloudRuntime(nil, false)
+	if err != nil || reopenedRuntime.id != runtime.id {
+		t.Fatalf("reopened node: %+v, %v", reopenedRuntime, err)
+	}
+	reopened, err := newCloudClient(reopenedRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/cloud/files/single-file/file", nil)
+	request.SetPathValue("id", "single-file")
+	response := httptest.NewRecorder()
+	reopened.download(response, request)
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), plain) {
+		t.Fatalf("local download: status=%d bytes=%d", response.Code, response.Body.Len())
+	}
+}
+
 func TestCloudEncryptedUploadReplicasAndRecovery(t *testing.T) {
 	token := "0123456789abcdef0123456789abcdef"
 	dir := t.TempDir()

@@ -29,11 +29,16 @@ var assets embed.FS
 
 type server struct {
 	db             *sql.DB
+	cloud          *cloudClient
 	thumbnailDir   string
+	videoDir       string
 	ffmpegPath     string
 	ffprobePath    string
 	thumbnailMu    sync.Mutex
 	thumbnailLocks map[string]*sync.Mutex
+	videoMu        sync.Mutex
+	videoJobs      map[string]*videoJob
+	videoSlots     chan struct{}
 	jobsWake       chan struct{}
 	jobsStop       chan struct{}
 }
@@ -43,6 +48,7 @@ type resource struct {
 	Name          string         `json:"name"`
 	Path          string         `json:"path"`
 	Size          int64          `json:"size"`
+	ContentSize   int64          `json:"contentSize"`
 	Modified      string         `json:"modified"`
 	Kind          string         `json:"kind"`
 	Available     bool           `json:"available"`
@@ -89,9 +95,13 @@ func main() {
 	if err := os.MkdirAll(thumbnailDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
+	videoDir := filepath.Join(dataDir, "videos")
+	if err := os.MkdirAll(videoDir, 0o700); err != nil {
+		log.Fatal(err)
+	}
 	ffmpegPath := mediaToolPath("ffmpeg")
 	ffprobePath := mediaToolPath("ffprobe")
-	app := &server{db: db, thumbnailDir: thumbnailDir, ffmpegPath: ffmpegPath, ffprobePath: ffprobePath, thumbnailLocks: map[string]*sync.Mutex{}, jobsWake: make(chan struct{}, 1)}
+	app := &server{db: db, thumbnailDir: thumbnailDir, videoDir: videoDir, ffmpegPath: ffmpegPath, ffprobePath: ffprobePath, thumbnailLocks: map[string]*sync.Mutex{}, videoJobs: map[string]*videoJob{}, videoSlots: make(chan struct{}, 1), jobsWake: make(chan struct{}, 1)}
 	iceServers, err := loadICEServers()
 	if err != nil {
 		log.Fatal(err)
@@ -100,6 +110,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	shares := &shareService{db: db, hubs: hubs, app: app}
 	cloudRuntime, err := newCloudRuntime(db, false)
 	if err != nil {
 		log.Fatal(err)
@@ -108,19 +119,36 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	app.cloud = cloud
+	cloud.indexer = app
+	if err := app.ensureDefaultMediaStore(dataDir); err != nil {
+		log.Fatal(err)
+	}
+	if err := cloud.primeLocalDigests(); err != nil {
+		log.Printf("local index startup: %v", err)
+	}
 	go cloudRuntime.run(context.Background())
-	go func() {
-		if err := cloudRuntime.serveDirect(); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	go cloud.assetSyncWorker(context.Background())
+	if cloudRuntime.endpoint != "" {
+		go func() {
+			if err := cloudRuntime.serveDirect(); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
 	if err := app.startPreprocessing(); err != nil {
 		log.Fatal(err)
 	}
+	go app.backfillMediaAssets()
+	go app.queueAllLocalIndexes()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/cloud/files", cloud.list)
 	mux.HandleFunc("GET /api/cloud/files/{id}/file", cloud.download)
+	mux.HandleFunc("GET /api/cloud/files/{id}/assets/{asset}/parts/{part}", cloud.cloudAssetPart)
+	mux.HandleFunc("GET /api/cloud/files/{id}/video/{quality}", cloud.cloudVideo)
+	mux.HandleFunc("GET /api/cloud/files/{id}/video/{quality}/init", cloud.cloudVideoPart)
+	mux.HandleFunc("GET /api/cloud/files/{id}/video/{quality}/segments/{segment}", cloud.cloudVideoPart)
 	mux.HandleFunc("GET /api/cloud/files/{id}/versions", cloud.versions)
 	mux.HandleFunc("GET /api/cloud/files/{id}/versions/{revision}/file", cloud.download)
 	mux.HandleFunc("POST /api/cloud/resources/{id}/upload", cloud.upload)
@@ -138,11 +166,28 @@ func main() {
 	mux.HandleFunc("GET /api/resources", app.listResources)
 	mux.HandleFunc("GET /api/resources/selection", app.listResourceSelection)
 	mux.HandleFunc("GET /api/resources/{id}", app.getResource)
+	mux.HandleFunc("GET /api/resources/{id}/index", app.fileIndex)
+	mux.HandleFunc("GET /api/media-stores", app.mediaStores)
+	mux.HandleFunc("POST /api/media-stores", app.addMediaStore)
+	mux.HandleFunc("PUT /api/media-stores/{id}/default", app.selectMediaStore)
 	mux.HandleFunc("GET /api/resources/{id}/video-info", app.videoInfo)
+	mux.HandleFunc("GET /api/resources/{id}/video/{quality}", app.videoVariant)
+	mux.HandleFunc("POST /api/resources/{id}/video/{quality}", app.videoVariant)
+	mux.HandleFunc("GET /api/resources/{id}/video/{quality}/init", app.videoInit)
+	mux.HandleFunc("GET /api/resources/{id}/video/{quality}/segments/{segment}", app.videoSegment)
 	mux.HandleFunc("POST /api/resources/tags", app.addTagBatch)
 	mux.HandleFunc("GET /api/resources/{id}/tag-suggestions", app.tagSuggestions)
 	mux.HandleFunc("GET /api/tag-batch-suggestions", app.tagBatchSuggestions)
 	mux.HandleFunc("GET /api/resources/{id}/file", app.serveFile)
+	mux.HandleFunc("GET /api/resources/{id}/shares", shares.list)
+	mux.HandleFunc("POST /api/resources/{id}/shares", shares.create)
+	mux.HandleFunc("DELETE /api/shares/{id}", shares.revoke)
+	mux.HandleFunc("POST /api/shares/{id}/redeem", shares.redeem)
+	mux.HandleFunc("GET /api/shares/{id}/file", shares.file)
+	mux.HandleFunc("GET /api/shares/{id}/video/{quality}", shares.video)
+	mux.HandleFunc("POST /api/shares/{id}/video/{quality}", shares.video)
+	mux.HandleFunc("GET /api/shares/{id}/video/{quality}/init", shares.video)
+	mux.HandleFunc("GET /api/shares/{id}/video/{quality}/segments/{segment}", shares.video)
 	mux.HandleFunc("GET /api/resources/{id}/thumbnail", app.serveThumbnail)
 	mux.HandleFunc("POST /api/resources/{id}/thumbnail", app.serveThumbnail)
 	mux.HandleFunc("GET /api/preprocess", app.listPreprocessJobs)
@@ -253,6 +298,40 @@ CREATE TABLE IF NOT EXISTS preprocess_jobs (
     PRIMARY KEY(resource_id, operation)
 );
 CREATE INDEX IF NOT EXISTS preprocess_jobs_queue_idx ON preprocess_jobs(status, priority DESC, priority_at DESC, created_at);
+CREATE TABLE IF NOT EXISTS file_shares (
+    id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    modified_ns INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS file_shares_resource_idx ON file_shares(resource_id, created_at);
+CREATE TABLE IF NOT EXISTS media_stores (
+    id TEXT PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    added_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_assets (
+    id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    version_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    codec TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS file_assets_resource_idx ON file_assets(resource_id, version_key);
+CREATE TABLE IF NOT EXISTS file_asset_locations (
+    asset_id TEXT NOT NULL REFERENCES file_assets(id) ON DELETE CASCADE,
+    storage_id TEXT NOT NULL REFERENCES media_stores(id),
+    path TEXT NOT NULL,
+    PRIMARY KEY(asset_id,storage_id,path)
+);
 `)
 	if err != nil {
 		return err
@@ -440,6 +519,9 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
+		if s.cloud != nil {
+			s.cloud.queueLocalIndex(id)
+		}
 		count++
 		return nil
 	})
@@ -466,6 +548,9 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 		for _, id := range missing {
 			_, _ = s.db.Exec(`UPDATE resources SET available=0 WHERE id=?`, id)
 			_, _ = s.db.Exec(`DELETE FROM preprocess_jobs WHERE resource_id=? AND status IN ('pending','running')`, id)
+			if s.cloud != nil {
+				s.cloud.queueLocalIndex(id)
+			}
 		}
 	}
 	_, err = s.db.Exec(`UPDATE roots SET last_scan_at=? WHERE id=?`, now(), rootID)
@@ -661,6 +746,7 @@ func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for i := range items {
+		items[i].ContentSize = s.mediaContentSize(items[i].ID, items[i].Size, items[i].Modified)
 		tagRows, err := s.db.Query(`SELECT t.name FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id WHERE rt.resource_id=? ORDER BY t.name COLLATE NOCASE`, items[i].ID)
 		if err == nil {
 			for tagRows.Next() {
@@ -709,6 +795,7 @@ func (s *server) getResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	item.Tags = []string{}
+	item.ContentSize = s.mediaContentSize(item.ID, item.Size, item.Modified)
 	item.AttributeTags = resourceAttributeTags(item.Name, item.Kind, item.Size)
 	rows, err := s.db.Query(`SELECT t.name FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id WHERE rt.resource_id=? ORDER BY t.name COLLATE NOCASE`, item.ID)
 	if err != nil {
@@ -840,6 +927,9 @@ func (s *server) addTag(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if s.cloud != nil {
+		s.cloud.queueLocalIndex(resourceID)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -889,14 +979,23 @@ func (s *server) addTagBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if s.cloud != nil {
+		for _, id := range input.IDs {
+			s.cloud.queueLocalIndex(id)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": len(input.IDs), "tag": name})
 }
 
 func (s *server) removeTag(w http.ResponseWriter, r *http.Request) {
-	_, err := s.db.Exec(`DELETE FROM resource_tags WHERE resource_id=? AND tag_id=?`, r.PathValue("id"), r.PathValue("tagID"))
+	resourceID := r.PathValue("id")
+	_, err := s.db.Exec(`DELETE FROM resource_tags WHERE resource_id=? AND tag_id=?`, resourceID, r.PathValue("tagID"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if s.cloud != nil {
+		s.cloud.queueLocalIndex(resourceID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1005,7 +1104,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; media-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

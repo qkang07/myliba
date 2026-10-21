@@ -37,14 +37,18 @@ public final class MainActivity extends Activity {
     private LinearLayout shell,header,content,navigation,batchDock;
     private ListView files;private ResourceAdapter adapter;private FrameLayout resultArea;
     private TextView resultLabel,footerLabel;private EditText search;
-    private boolean home,grid,loading,selecting,busy,scanning,destroyed,needsLogin;
+    private TextView nodeTitle,nodeStatus,nodeCounts,nodeCapacity,nodeAccess,nodeConfigure,nodeStop;
+    private boolean displayedNodeRunning;
+    private boolean home,grid,loading,selecting,busy,scanning,destroyed,needsLogin,storageOnly;
     private int tab,generation,total; private String error="",scanMessage="",activeCollection;
     private final Runnable searchTask=()->reload(false,false);
     private final Runnable transferRefresh=new Runnable(){@Override public void run(){if(!destroyed&&tab==3){renderTransfers();handler.postDelayed(this,1000);}}};
+    private final Runnable nodeRefresh=new Runnable(){@Override public void run(){if(!destroyed&&storageOnly){if(displayedNodeRunning!=CloudStorageService.running)render();else updateStorageOnlyStatus();handler.postDelayed(this,3000);}}};
 
     @Override public void onCreate(Bundle saved){
         super.onCreate(saved);ui=new MobileUi(this);db=new LocalLibrary(this);localStore=new LibraryStore(db,null);
         prefs=getPreferences(MODE_PRIVATE);thumbs=new ThumbnailLoader(this);grid=prefs.getBoolean("view_grid",false);
+        storageOnly=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE).getBoolean("storage_only",false);
         String server=prefs.getString("server_url","");if(!server.isEmpty())hubStore=new LibraryStore(db,new RemoteClient(server,prefs));
         if(saved!=null){home=saved.getBoolean("home");tab=saved.getInt("tab");try{localFilters=LocalFilters.parse(saved.getString("local","{}"));hubFilters=LocalFilters.parse(saved.getString("hub","{}"));}catch(Exception ignored){}activeCollection=saved.getString("collection");}
         getWindow().setStatusBarColor(BG);getWindow().setNavigationBarColor(PAPER);
@@ -53,9 +57,9 @@ public final class MainActivity extends Activity {
         header=ui.col();shell.addView(header);content=ui.col();shell.addView(content,new LinearLayout.LayoutParams(-1,0,1));batchDock=ui.col();shell.addView(batchDock);navigation=ui.row();shell.addView(navigation);
         if(Build.VERSION.SDK_INT>=30){getWindow().setDecorFitsSystemWindows(false);shell.setOnApplyWindowInsetsListener((v,insets)->{
             android.graphics.Insets bars=insets.getInsets(WindowInsets.Type.systemBars()),ime=insets.getInsets(WindowInsets.Type.ime());
-            shell.setPadding(bars.left,bars.top,bars.right,Math.max(bars.bottom,ime.bottom));navigation.setVisibility(ime.bottom>bars.bottom?View.GONE:View.VISIBLE);return insets;});}
+            shell.setPadding(bars.left,bars.top,bars.right,Math.max(bars.bottom,ime.bottom));navigation.setVisibility(storageOnly||ime.bottom>bars.bottom?View.GONE:View.VISIBLE);return insets;});}
         if(Build.VERSION.SDK_INT>=33)getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,this::handleBack);
-        render();if(tab==3)handler.postDelayed(transferRefresh,1000);else reload(false,true);
+        render();if(storageOnly)handler.postDelayed(nodeRefresh,3000);else if(tab==3)handler.postDelayed(transferRefresh,1000);else reload(false,true);
     }
     private LibraryStore store(){return home?hubStore:localStore;}
     private LocalFilters f(){return home?hubFilters:localFilters;}
@@ -67,6 +71,8 @@ public final class MainActivity extends Activity {
     private void navigate(int page){if(tab==page)return;hideKeyboard();handler.removeCallbacks(searchTask);handler.removeCallbacks(transferRefresh);generation++;loading=false;tab=page;selected.clear();selecting=false;error="";render();if(tab==3)handler.postDelayed(transferRefresh,1000);else reload(false,true);}
     private void render(){
         header.removeAllViews();content.removeAllViews();files=null;adapter=null;search=null;resultArea=null;resultLabel=null;
+        if(storageOnly){renderStorageOnly();return;}
+        navigation.setVisibility(View.VISIBLE);batchDock.setVisibility(View.VISIBLE);
         header.setPadding(ui.d(22),ui.d(14),ui.d(18),ui.d(14));
         TextView brand=ui.text("MYLIBA",10,GREEN,true);brand.setLetterSpacing(.18f);header.addView(brand);
         LinearLayout title=ui.row();String[] titles={"资源库","文件夹","来源","传输列表"};title.addView(ui.text(titles[tab],28,INK,true),ui.weight());
@@ -74,6 +80,47 @@ public final class MainActivity extends Activity {
         header.addView(title,ui.top(7));
         if(tab==0)renderLibrary();else if(tab==1)renderFolders();else if(tab==2)renderSources();else renderTransfers();
         renderNav();renderBatch();
+    }
+    private void enterStorageMode(){
+        storageOnly=true;generation++;handler.removeCallbacks(transferRefresh);getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE).edit().putBoolean("storage_only",true).apply();
+        render();handler.removeCallbacks(nodeRefresh);handler.postDelayed(nodeRefresh,3000);
+    }
+    private void leaveStorageMode(){
+        storageOnly=false;handler.removeCallbacks(nodeRefresh);getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE).edit().putBoolean("storage_only",false).apply();
+        home=false;tab=2;render();reload(false,true);
+    }
+    private void renderStorageOnly(){
+        navigation.setVisibility(View.GONE);batchDock.setVisibility(View.GONE);
+        displayedNodeRunning=CloudStorageService.running;
+        header.setPadding(ui.d(22),ui.d(18),ui.d(18),ui.d(14));
+        header.addView(ui.text("MYLIBA",10,GREEN,true));header.addView(ui.text("存储节点",28,INK,true),ui.top(8));
+        ScrollView scroll=new ScrollView(this);scroll.setVerticalScrollBarEnabled(false);LinearLayout body=ui.col();body.setPadding(ui.d(20),ui.d(8),ui.d(20),ui.d(28));scroll.addView(body);content.addView(scroll,new LinearLayout.LayoutParams(-1,-1));
+        android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
+        boolean openlist="openlist".equals(settings.getString("backend","disk"));
+        LinearLayout card=ui.card();nodeTitle=ui.text("",20,INK,true);card.addView(nodeTitle);
+        nodeStatus=ui.text("",13,GREEN,false);card.addView(nodeStatus,ui.top(8));
+        card.addView(ui.text("云层块存储："+(openlist?"OpenList · "+settings.getString("openlist_mount",""):"本手机的应用存储空间"),12,MUTED,false),ui.top(15));
+        String access=settings.getString("url","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"公网直连";
+        nodeAccess=ui.text("访问："+access,12,MUTED,false);card.addView(nodeAccess,ui.top(6));
+        nodeCounts=ui.text("",13,INK,false);card.addView(nodeCounts,ui.top(15));
+        nodeCapacity=ui.text("",12,MUTED,false);card.addView(nodeCapacity,ui.top(5));
+        body.addView(card);
+        nodeConfigure=ui.button("",true,this::cloudStorageSheet);body.addView(nodeConfigure,ui.top(18));
+        nodeStop=ui.button("停止存储节点",false,()->{stopService(new Intent(this,CloudStorageService.class));handler.postDelayed(this::render,350);});body.addView(nodeStop,ui.top(9));
+        body.addView(ui.button("切换到完整客户端",false,this::leaveStorageMode),ui.top(22));
+        body.addView(ui.text("这台手机作为云层存储节点，供其他节点备份和读取加密块。关闭界面后，前台服务仍会继续运行。",12,MUTED,false),ui.top(17));
+        updateStorageOnlyStatus();
+    }
+    private void updateStorageOnlyStatus(){
+        if(nodeTitle==null)return;
+        boolean active=CloudStorageService.running;
+        nodeTitle.setText(active?"节点运行中":"节点未运行");nodeStatus.setText(CloudStorageService.status);nodeStatus.setTextColor(active?GREEN:MUTED);
+        nodeCounts.setText("加密块 "+CloudStorageService.blockCount+" · 索引 "+CloudStorageService.catalogCount);
+        nodeCapacity.setVisibility(CloudStorageService.capacityBytes>0?View.VISIBLE:View.GONE);
+        if(CloudStorageService.capacityBytes>0)nodeCapacity.setText("可用 "+size(CloudStorageService.availableBytes)+" / "+size(CloudStorageService.capacityBytes));
+        android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
+        nodeAccess.setText("访问："+(settings.getString("url","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"公网直连"));
+        nodeConfigure.setText(active?"配置并重启":"配置并启动");nodeStop.setVisibility(active?View.VISIBLE:View.GONE);
     }
     private void renderNav(){
         navigation.removeAllViews();navigation.setBackgroundColor(PAPER);navigation.setPadding(ui.d(14),ui.d(8),ui.d(14),ui.d(8));
@@ -231,7 +278,7 @@ public final class MainActivity extends Activity {
         LinearLayout body=scrollBody();body.addView(ui.text("连接文件所在的地方。",13,MUTED,false));
         LinearLayout current=ui.card();LinearLayout head=ui.row();ImageView symbol=ui.icon(home?"server":"phone",44,GREEN);ui.pad(symbol,10,10);symbol.setBackground(ui.shape(SOFT,14,0));head.addView(symbol);LinearLayout copy=ui.col();copy.setPadding(ui.d(12),0,0,0);copy.addView(ui.text(home?"家中资源库":"这台手机",17,INK,true));copy.addView(ui.text(home?(hubStore==null?"尚未连接":needsLogin?"需要登录":error.isEmpty()?(meta.online?"节点在线":"等待家中节点"):"连接中断"):"本地索引 · 离线可用",11,MUTED,false),ui.top(5));head.addView(copy,ui.weight());current.addView(head);current.addView(ui.text(home?(hubStore==null?"添加服务端地址，在手机上浏览家中资源。":hubStore.client.base):"只访问你授权的文件夹，不移动原文件。",12,MUTED,false),ui.top(15));
         if(home){current.addView(ui.button(hubStore==null?"连接服务端":"连接设置",true,this::connectSheet),ui.top(16));if(hubStore!=null)current.addView(ui.button("退出登录",false,this::logout),ui.top(8));}else current.addView(ui.button(scanning?"正在扫描…":"添加索引目录",true,this::pickTree),ui.top(16));body.addView(current,ui.top(20));
-        if(!home){section(body,"云层存储节点",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"用这台手机存储加密块",CloudStorageService.running?"端口 4319 · "+CloudStorageService.status:"需要可直达手机的 HTTPS 地址",this::cloudStorageSheet),ui.top(10));}
+        if(!home){section(body,"云层存储节点",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"用这台手机存储加密块",CloudStorageService.running?"端口 4319 · "+CloudStorageService.status:"可用公网 HTTPS 地址或存储中继",this::cloudStorageSheet),ui.top(10));body.addView(ui.item("shield","切换为仅存储模式","保留同一 APK，只显示节点运行与配置",this::enterStorageMode),ui.top(9));}
         if(!scanMessage.isEmpty()&&!home)body.addView(ui.text(scanMessage,12,GREEN,false),ui.top(12));if(!error.isEmpty())body.addView(errorCard(),ui.top(12));
         section(body,"索引目录",meta.roots.size()+" 个",null);
         if(meta.roots.isEmpty())body.addView(ui.text(home?"连接后可查看服务端已配置的目录。":"在这里添加照片、下载或工作资料文件夹。",12,MUTED,false),ui.top(10));
@@ -242,21 +289,42 @@ public final class MainActivity extends Activity {
     private View connectionCard(){return ui.item("server",hubStore==null?"连接家中资源库":"打开家中资源库",hubStore==null?"通过你的 Myliba 服务端访问家中文件":Uri.parse(hubStore.client.base).getHost(),()->{if(hubStore==null||needsLogin)connectSheet();else if(home)navigate(0);else{tab=0;switchSource(true);}});}
     private void cloudStorageSheet(){
         android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
-        MobileUi.Sheet sheet=ui.sheet("手机云层存储节点","只保存加密文件块。需将 HTTPS 网关直接指向这台手机的 4319 端口。");
+        String storedToken,storedPassword;try{storedToken=CloudSecretStore.read(settings,"token");storedPassword=CloudSecretStore.read(settings,"openlist_password");}catch(Exception ex){toast("云层凭据读取失败，请重新配置节点");storedToken="";storedPassword="";}
+        MobileUi.Sheet sheet=ui.sheet("手机云层存储节点","同一应用可浏览文件或只运行存储节点。节点只处理已加密的文件块。");
+        sheet.body.addView(ui.text("存储位置",12,INK,true));
+        Spinner backendChoice=new Spinner(this);ArrayAdapter<String> choices=new ArrayAdapter<>(this,android.R.layout.simple_spinner_item,new String[]{"本手机存储（云层节点）","OpenList 云盘（可选后端）"});choices.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);backendChoice.setAdapter(choices);
+        backendChoice.setSelection("openlist".equals(settings.getString("backend","disk"))?1:0);sheet.body.addView(backendChoice,ui.top(7));
+        LinearLayout openlistFields=ui.col();
+        openlistFields.addView(ui.text("OpenList HTTPS 地址",12,INK,true));EditText openlistURL=ui.input("https://openlist.example.com",settings.getString("openlist_url",""));openlistFields.addView(openlistURL,ui.top(7));
+        openlistFields.addView(ui.text("可写挂载路径",12,INK,true),ui.top(16));EditText mount=ui.input("例如 aliyun 或 quark",settings.getString("openlist_mount",""));openlistFields.addView(mount,ui.top(7));
+        openlistFields.addView(ui.text("OpenList 用户名",12,INK,true),ui.top(16));EditText user=ui.input("有 WebDAV 管理权限的用户",settings.getString("openlist_user",""));openlistFields.addView(user,ui.top(7));
+        openlistFields.addView(ui.text("OpenList 密码",12,INK,true),ui.top(16));EditText password=ui.input("OpenList 用户密码",storedPassword);password.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);openlistFields.addView(password,ui.top(7));
+        openlistFields.addView(ui.text("云盘账号由 OpenList 管理；这里通过 /dav/挂载路径 存取加密块。请在 OpenList 中选择可写驱动，并启用 WebDAV 本机代理。",12,MUTED,false),ui.top(9));
+        sheet.body.addView(openlistFields,ui.top(17));openlistFields.setVisibility(backendChoice.getSelectedItemPosition()==1?View.VISIBLE:View.GONE);
+        backendChoice.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){public void onNothingSelected(android.widget.AdapterView<?> parent){}public void onItemSelected(android.widget.AdapterView<?> parent,View view,int position,long id){openlistFields.setVisibility(position==1?View.VISIBLE:View.GONE);}});
         sheet.body.addView(ui.text("Hub HTTPS 地址",12,INK,true));EditText hub=ui.input("https://hub.example.com",settings.getString("hub",""));sheet.body.addView(hub,ui.top(7));
         sheet.body.addView(ui.text("手机的直连 HTTPS 地址",12,INK,true),ui.top(16));EditText endpoint=ui.input("https://phone.example.com",settings.getString("url",""));sheet.body.addView(endpoint,ui.top(7));
-        sheet.body.addView(ui.text("云层令牌",12,INK,true),ui.top(16));EditText secret=ui.input("与 Hub 的 MYLIBA_CLOUD_TOKEN 相同",settings.getString("token",""));secret.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);sheet.body.addView(secret,ui.top(7));
-        TextView validation=ui.text("手机和网关之间请使用受信任的网络。",12,MUTED,false);sheet.body.addView(validation,ui.top(14));
+        sheet.body.addView(ui.text("存储中继 HTTPS 地址（直连不可用时填写）",12,INK,true),ui.top(16));EditText relay=ui.input("https://storage.example.com",settings.getString("relay",""));sheet.body.addView(relay,ui.top(7));
+        sheet.body.addView(ui.text("云层令牌",12,INK,true),ui.top(16));EditText secret=ui.input("与 Hub 的 MYLIBA_CLOUD_TOKEN 相同",storedToken);secret.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);sheet.body.addView(secret,ui.top(7));
+        TextView validation=ui.text("没有手机公网地址时，只填存储中继地址。中继节点需启用 MYLIBA_CLOUD_RELAY_ENABLED=1。",12,MUTED,false);sheet.body.addView(validation,ui.top(14));
         sheet.footer.addView(ui.button(CloudStorageService.running?"保存并重启节点":"启动存储节点",true,()->{
-            String h=hub.getText().toString().trim(),u=endpoint.getText().toString().trim(),t=secret.getText().toString();
-            if(!h.startsWith("https://")||!u.startsWith("https://")||t.length()<32){validation.setText("需要两个 HTTPS 地址和至少 32 字符的云层令牌");validation.setTextColor(RED);return;}
-            settings.edit().putString("hub",h.replaceAll("/+$","")).putString("url",u.replaceAll("/+$","")).putString("token",t).apply();
+            String h=hub.getText().toString().trim(),u=endpoint.getText().toString().trim(),r=relay.getText().toString().trim(),t=secret.getText().toString();
+            if(!validCloudAddress(h)||(!u.isEmpty()&&!validCloudAddress(u))||(!r.isEmpty()&&!validCloudAddress(r))||(u.isEmpty()&&r.isEmpty())||t.length()<32||t.contains("\r")||t.contains("\n")){validation.setText("需要有效的 Hub、直连或中继 HTTPS 地址，以及至少 32 字符的云层令牌");validation.setTextColor(RED);return;}
+            String backend=backendChoice.getSelectedItemPosition()==1?"openlist":"disk";
+            String address=openlistURL.getText().toString().trim(),mountPath=mount.getText().toString().trim(),username=user.getText().toString().trim(),pass=password.getText().toString();
+            if(backend.equals("openlist"))try{new CloudOpenListBackend(address,mountPath,username,pass);}catch(Exception ex){validation.setText(message(ex));validation.setTextColor(RED);return;}
+            String protectedToken,protectedPassword;try{protectedToken=CloudSecretStore.protect(t);protectedPassword=CloudSecretStore.protect(pass);}catch(Exception ex){validation.setText("无法安全保存云层凭据："+message(ex));validation.setTextColor(RED);return;}
+            settings.edit().putString("hub",h.replaceAll("/+$","")).putString("url",u.replaceAll("/+$","")).putString("relay",r.replaceAll("/+$","")).putString("token",protectedToken)
+                .putString("backend",backend).putString("openlist_url",address.replaceAll("/+$","")).putString("openlist_mount",mountPath).putString("openlist_user",username).putString("openlist_password",protectedPassword).apply();
             stopService(new Intent(this,CloudStorageService.class));
-            handler.postDelayed(()->{startForegroundService(new Intent(this,CloudStorageService.class));if(tab==2)handler.postDelayed(this::render,500);},250);
+            handler.postDelayed(()->{startForegroundService(new Intent(this,CloudStorageService.class));if(storageOnly||tab==2)handler.postDelayed(this::render,500);},400);
             sheet.close();
         }));
         if(CloudStorageService.running)sheet.footer.addView(ui.button("停止存储节点",false,()->{stopService(new Intent(this,CloudStorageService.class));sheet.close();handler.postDelayed(this::render,300);}),ui.top(9));
         sheet.show();
+    }
+    private static boolean validCloudAddress(String address){
+        try{java.net.URI uri=new java.net.URI(address);return "https".equalsIgnoreCase(uri.getScheme())&&uri.getHost()!=null&&uri.getUserInfo()==null&&uri.getRawQuery()==null&&uri.getRawFragment()==null&&(uri.getPath().isEmpty()||uri.getPath().equals("/"));}catch(Exception ex){return false;}
     }
     private View errorCard(){LinearLayout card=ui.card();card.addView(ui.text(error,13,RED,false));card.addView(ui.button(needsLogin?"登录":"重试",false,needsLogin?this::connectSheet:()->reload(false,true)),ui.top(12));return card;}
     private LinearLayout scrollBody(){ScrollView scroll=new ScrollView(this);scroll.setVerticalScrollBarEnabled(false);LinearLayout body=ui.col();body.setPadding(ui.d(20),0,ui.d(20),ui.d(24));scroll.addView(body);content.addView(scroll,new LinearLayout.LayoutParams(-1,-1));return body;}
@@ -436,7 +504,7 @@ public final class MainActivity extends Activity {
     private static String message(Exception e){if(e instanceof java.net.SocketTimeoutException)return "连接超时，请检查网络后重试。";if(e instanceof java.net.UnknownHostException)return "找不到服务端，请检查地址。";String s=e.getMessage();return s==null||s.isEmpty()?"操作失败，请稍后重试":s;}
     private void toast(String s){if(!destroyed)Toast.makeText(this,s,Toast.LENGTH_SHORT).show();}
     private void hideKeyboard(){View v=getCurrentFocus();if(v!=null){((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(v.getWindowToken(),0);v.clearFocus();}}
-    private void handleBack(){if(selecting){selected.clear();selecting=false;updateResults();}else if(tab!=0)navigate(0);else if(!f().folderId.equals("all"))openFolder("all");else finish();}
+    private void handleBack(){if(storageOnly){finish();return;}if(selecting){selected.clear();selecting=false;updateResults();}else if(tab!=0)navigate(0);else if(!f().folderId.equals("all"))openFolder("all");else finish();}
     // API 33+ uses the platform back dispatcher registered in onCreate; this is the older-device fallback.
     @android.annotation.SuppressLint("GestureBackNavigation")
     @Override public void onBackPressed(){handleBack();}

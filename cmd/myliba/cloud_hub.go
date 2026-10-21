@@ -17,17 +17,18 @@ import (
 type cloudNode struct {
 	ID       string    `json:"id"`
 	Endpoint string    `json:"endpoint"`
+	Relayed  bool      `json:"relayed,omitempty"`
 	Role     string    `json:"role"`
 	SeenAt   time.Time `json:"seenAt"`
 	cloudStorageStats
 }
 
 type cloudHub struct {
-	mu           sync.Mutex
-	nodes        map[string]cloudNode
-	disk         *cloudDisk
-	registryPath string
-	startedAt    time.Time
+	mu            sync.Mutex
+	nodes         map[string]cloudNode
+	heartbeatSeen map[string]bool
+	disk          *cloudDisk
+	registryPath  string
 }
 
 func newCloudHub() (*cloudHub, error) {
@@ -43,7 +44,7 @@ func newCloudHub() (*cloudHub, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &cloudHub{nodes: map[string]cloudNode{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json"), startedAt: time.Now().UTC()}
+	c := &cloudHub{nodes: map[string]cloudNode{}, heartbeatSeen: map[string]bool{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json")}
 	if data, err := os.ReadFile(c.registryPath); err == nil {
 		var saved []cloudNode
 		if err := json.Unmarshal(data, &saved); err != nil {
@@ -62,9 +63,12 @@ func newCloudHub() (*cloudHub, error) {
 }
 
 func validCloudNode(node cloudNode) bool {
+	if relayID := cloudRelayEndpointID(node.Endpoint); (relayID != "" && node.ID != relayID) || (node.Relayed && node.Endpoint != "" && relayID == "") {
+		return false
+	}
 	return node.ID != "" && len(node.ID) <= 128 && validCloudEndpoint(node.Endpoint) &&
 		(node.Role == "client" || node.Role == "storage") &&
-		(node.Backend == "" || node.Backend == "disk" || node.Backend == "s3" || node.Backend == "webdav") &&
+		(node.Backend == "" || node.Backend == "disk" || node.Backend == "s3" || node.Backend == "webdav" || node.Backend == "openlist") &&
 		node.BlockCount >= 0 && node.CatalogCount >= 0 &&
 		(node.BlockBytes == nil || *node.BlockBytes >= 0) &&
 		(node.CapacityBytes == nil || node.AvailableBytes == nil || *node.AvailableBytes <= *node.CapacityBytes)
@@ -106,7 +110,7 @@ func (c *cloudHub) saveNodesLocked() error {
 const cloudOnlineWindow = 45 * time.Second
 
 func (c *cloudHub) online(node cloudNode, now time.Time) bool {
-	return node.SeenAt.After(c.startedAt) && now.Sub(node.SeenAt) <= cloudOnlineWindow
+	return c.heartbeatSeen[node.ID] && now.Sub(node.SeenAt) <= cloudOnlineWindow
 }
 
 func (c *cloudHub) overview(w http.ResponseWriter, r *http.Request) {
@@ -168,7 +172,7 @@ func validCloudEndpoint(raw string) bool {
 		return true
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/" && cloudRelayEndpointID(raw) == "") {
 		return false
 	}
 	if u.Scheme == "https" {
@@ -187,9 +191,13 @@ func (c *cloudHub) routes(mux *http.ServeMux, token string) {
 			http.Error(w, "invalid node", 400)
 			return
 		}
+		if cloudRelayEndpointID(node.Endpoint) != "" {
+			node.Relayed = true
+		}
 		node.SeenAt = time.Now().UTC()
 		c.mu.Lock()
 		c.nodes[node.ID] = node
+		c.heartbeatSeen[node.ID] = true
 		err := c.saveNodesLocked()
 		c.mu.Unlock()
 		if err != nil {
