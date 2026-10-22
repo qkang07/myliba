@@ -2,7 +2,7 @@
 
 Myliba is a local-first personal resource library. Local mode indexes files in place, keeping originals where they are. Remote mode serves the same responsive web app from a self-hosted VPS and forwards authenticated API requests through an outbound connection from the home node.
 
-An Android first version lives in [`android/`](android/README.md). It indexes folders chosen on the phone and connects to an existing HTTPS Hub.
+The native Android app lives in [`android/`](android/README.md). It indexes folders chosen on the phone, connects to an existing HTTPS Hub, and can register its indexed library as a resource node.
 
 ## Local use
 
@@ -30,7 +30,7 @@ After `pnpm install --frozen-lockfile`, the script builds the web app and Go ser
 
 ## Remote web access
 
-The same executable runs as a local client, a Hub, or a storage-only cloud node. The home client keeps its local HTTP service bound to `127.0.0.1:4317`; it maintains an outbound WebSocket connection to the Hub for signaling and metadata requests. After login, the browser negotiates a WebRTC DataChannel with the home client. File bytes and generated media require a direct DataChannel; they never fall back to the Hub WebSocket. Metadata requests can still use the Hub relay.
+The same executable runs as a local client, a Hub, or a storage-only cloud node. The home client keeps its local HTTP service bound to `127.0.0.1:4317`; it maintains an outbound WebSocket connection to the Hub for signaling and metadata requests. Multiple desktop and Android resource nodes can register with the same Hub. Each signed-in web or app session selects a resource node. File bytes and generated media require a direct WebRTC DataChannel; they never fall back to the Hub WebSocket. Metadata requests can still use the Hub relay.
 
 ### 1. Build on the VPS
 
@@ -65,7 +65,9 @@ On the computer that runs the local Myliba index, start the app and open <http:/
 go run -tags sqlite_fts5 ./cmd/myliba
 ```
 
-The home node still opens its local interface at <http://127.0.0.1:4317>. From a phone, open `https://library.example.com` and sign in with the web password. The remote page can search, tag, and organize while the home node is online. Opening, previewing, and downloading file content requires a direct WebRTC DataChannel. Set `MYLIBA_ICE_SERVERS` to STUN servers on the Hub and home node when needed; the default is `stun:stun.l.google.com:19302`. TURN relay candidates are ignored for content transfer. The remote page does not let a phone add a new home filesystem path.
+The home node still opens its local interface at <http://127.0.0.1:4317>. From a phone, open `https://library.example.com` and sign in with the web password. The remote page lists registered resource nodes; select one to search, tag, organize, preview, and download its indexed files. The Android app has the same selector under **家中 → 来源**. Opening, previewing, and downloading file content requires a direct WebRTC DataChannel. Set `MYLIBA_ICE_SERVERS` to STUN servers on the Hub when needed; the default is `stun:stun.l.google.com:19302`. TURN relay candidates are ignored for content transfer. Remote clients cannot add an index root to a node.
+
+To expose the phone library, first index folders in the native Android app, then open **本机 → 来源 → 手机资源节点**. Enter the Hub HTTPS root URL and the same `MYLIBA_NODE_TOKEN` configured on the Hub, then start the foreground service. The Hub lists the phone as a separate resource node. Hub web sessions and native app sessions can select it and access its indexed library. This resource node is separate from the encrypted cloud storage node. The phone needs a usable WebRTC route to the viewer; Hub registration alone does not confirm media connectivity. The phone's web video preview currently loads an original file of at most 256 MB before playback; larger videos can be downloaded or streamed with ranges in the native app. Public sharing and desktop video variants are not available for phone resources yet.
 
 The hub requires a web session for every remote API call, and both the hub and home node enforce the same remote API allowlist. The WebRTC DataChannel is created for an authenticated signaling session and can carry only allowlisted API requests. Adding a new index root and browsing the home filesystem remain local-only operations. Browser-active file types such as HTML, SVG, and JavaScript are downloaded rather than opened inside the authenticated app origin.
 

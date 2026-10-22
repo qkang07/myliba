@@ -9,11 +9,19 @@
         android:label="Myliba"
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/AppTheme"
-        android:usesCleartextTraffic="false">
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config">
         <activity android:name=".PreviewActivity" android:exported="false" />
         <service android:name=".CloudStorageService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User started private encrypted storage node" />
         </service>
+        <service android:name=".ResourceNodeService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User started private library resource node" />
+        </service>
+        <service android:name=".ResourceTransferService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User started direct resource transfer" />
+        </service>
+        <provider android:name=".ResourceDownloadProvider" android:authorities="com.myliba.android.downloads" android:exported="false" android:grantUriPermissions="true" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

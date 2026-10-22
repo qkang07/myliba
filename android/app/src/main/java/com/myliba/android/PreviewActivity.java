@@ -45,6 +45,7 @@ public final class PreviewActivity extends Activity {
     private MobileUi ui;
     private boolean remote;
     private File remoteCache;
+    private RtcMediaProxy mediaProxy;
     private LinearLayout toolbar, browserNav;
     private ArrayList<String> browseIds, browseNames, browseMimes;
     private int browseIndex;
@@ -117,7 +118,7 @@ public final class PreviewActivity extends Activity {
     }
 
     private void loadRemote() {
-        RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE));
+        RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE), this);
         if (mime.startsWith("video/") || mime.startsWith("audio/")) {
             showVideo();
             return;
@@ -129,11 +130,10 @@ public final class PreviewActivity extends Activity {
         showMessage("正在读取原文件…");
         worker.execute(() -> {
             try {
-                byte[] data = client.bytes("GET", "/api/resources/" + RemoteClient.enc(getIntent().getStringExtra("resource")) + "/file", null, 24 * 1024 * 1024);
                 remoteCache = File.createTempFile("preview-", ".bin", getCacheDir());
-                try (FileOutputStream out = new FileOutputStream(remoteCache)) { out.write(data); }
+                try (FileOutputStream out = new FileOutputStream(remoteCache)) { client.download("/api/resources/" + RemoteClient.enc(getIntent().getStringExtra("resource")) + "/file", out); }
                 runOnUiThread(() -> { if (!closing) { fileUri = Uri.fromFile(remoteCache); openPreview(); } });
-            } catch (Exception error) { fail(error); }
+            } catch (Exception error) { fail(error); }finally{client.close();}
         });
     }
 
@@ -258,10 +258,11 @@ public final class PreviewActivity extends Activity {
         controls.setAnchorView(video);
         video.setMediaController(controls);
         if (remote) {
-            RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE));
-            java.util.Map<String, String> headers = new java.util.HashMap<>();
-            headers.put("Cookie", client.cookie());
-            video.setVideoURI(fileUri, headers);
+            try{
+                RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE), this);
+                mediaProxy=new RtcMediaProxy(client,getIntent().getStringExtra("resource"));
+                video.setVideoURI(Uri.parse(mediaProxy.url()));
+            }catch(Exception ex){showMessage("无法启动 WebRTC 媒体播放："+ex.getMessage());return;}
         } else video.setVideoURI(fileUri);
         content.addView(video, new LinearLayout.LayoutParams(-1, -1));
         video.setOnErrorListener((player, what, extra) -> { showMessage("视频无法播放，可用其他应用打开。"); return true; });
@@ -314,6 +315,7 @@ public final class PreviewActivity extends Activity {
     @Override protected void onDestroy() {
         closing = true;
         if (video != null) video.stopPlayback();
+        if (mediaProxy != null) mediaProxy.close();
         clearContent();
         worker.execute(() -> {
             if (pdf != null) pdf.close();

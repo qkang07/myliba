@@ -48,7 +48,7 @@ func (h *remoteHub) validateShare(ctx context.Context, shareID, token string) (j
 		return nil, http.StatusServiceUnavailable, nil
 	}
 	id := newID()
-	waiter := &remoteWaiter{channel: make(chan wireMessage, 8), done: make(chan struct{})}
+	waiter := &remoteWaiter{channel: make(chan wireMessage, 8), done: make(chan struct{}), node: conn}
 	h.waiters[id] = waiter
 	h.shareChecks++
 	h.mu.Unlock()
@@ -179,7 +179,7 @@ func (h *remoteHub) shareSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID := newID()
 	h.signalMu.Lock()
-	h.signalSessions[sessionID] = conn
+	h.signalSessions[sessionID] = signalSession{Client: conn, Node: node}
 	h.signalMu.Unlock()
 	defer func() {
 		h.signalMu.Lock()

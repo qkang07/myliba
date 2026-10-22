@@ -9,7 +9,7 @@ import {
   type FileShare, type Resource, type TagSuggestion, type TagSummary, type VirtualFolder,
 } from "./api";
 
-const props = defineProps<{ id: string; folders: VirtualFolder[]; remote: boolean }>();
+const props = defineProps<{ id: string; folders: VirtualFolder[]; remote: boolean; phoneNode?: boolean }>();
 const emit = defineEmits<{ back: []; tagsChanged: []; folderChanged: [] }>();
 type Size = "small" | "medium" | "large";
 type Capture = { key: string; at: number; label: string };
@@ -147,7 +147,7 @@ async function refreshResource() {
     resource.value = item;
     loading.value = false;
     shareURL.value = "";
-    void listFileShares(item.id).then((items) => { if (current === generation) shares.value = items; }).catch(() => { if (current === generation) shares.value = []; });
+    if (!props.phoneNode) void listFileShares(item.id).then((items) => { if (current === generation) shares.value = items; }).catch(() => { if (current === generation) shares.value = []; });
     if (props.remote && item.available && item.kind !== "video") {
       if (item.size > 128 * 1024 * 1024) {
         previewError.value = "此文件超过直连网页预览的大小限制，请下载后打开。";
@@ -347,7 +347,7 @@ onBeforeUnmount(() => {
         <button v-if="!remote" class="button button-secondary" :disabled="!resource.available || cloudBusy" @click="uploadToCloud">加入云层</button>
       </header>
       <p v-if="cloudStatus" class="detail-error" role="status">{{ cloudStatus }}</p>
-      <section class="detail-panel share-panel" aria-label="外链分享">
+      <section v-if="!phoneNode" class="detail-panel share-panel" aria-label="外链分享">
         <div class="detail-panel-heading"><h2><Link2 :size="17" />外链分享</h2><span>仅此文件 · 节点在线时直传</span></div>
         <div class="share-create"><label>有效期 <select v-model.number="shareHours"><option :value="24">1 天</option><option :value="168">7 天</option><option :value="720">30 天</option></select></label><button class="button button-secondary" :disabled="!resource.available || shareBusy" @click="createShare">创建分享链接</button></div>
         <div v-if="shareURL" class="share-created"><p>链接已创建，密钥仅显示这一次。可直接粘贴发送给接收者。</p><div><input :value="shareURL" readonly aria-label="分享链接" @focus="($event.target as HTMLInputElement).select()" /><button class="button button-secondary" @click="copyShare"><Copy :size="14" />复制</button></div></div>
@@ -362,7 +362,7 @@ onBeforeUnmount(() => {
             <div class="detail-preview">
               <template v-if="resource.available && mimeType && !previewError && (resource.kind === 'video' || !remote || previewURL)">
                 <button v-if="mimeType.startsWith('image/')" type="button" class="detail-image-trigger" :aria-label="'预览图片 ' + resource.name" @click="openImageViewer"><img :src="remote ? previewURL : fileURL(resource.id)" :alt="resource.name" @error="previewError = '图片无法加载'" /><span class="detail-image-trigger-hint"><Expand :size="14" />点击查看大图</span></button>
-                <StreamingVideo v-else-if="mimeType.startsWith('video/')" :id="resource.id" :name="resource.name" :remote="remote" @metadata="onVideoMetadata" />
+                <StreamingVideo v-else-if="mimeType.startsWith('video/')" :id="resource.id" :name="resource.name" :remote="remote" :phone-node="phoneNode" @metadata="onVideoMetadata" />
                 <audio v-else-if="mimeType.startsWith('audio/')" :src="remote ? previewURL : fileURL(resource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式'"></audio>
                 <iframe v-else sandbox="" :src="remote ? previewURL : fileURL(resource.id)" :title="'预览 ' + resource.name"></iframe>
               </template>
@@ -379,7 +379,7 @@ onBeforeUnmount(() => {
               </article>
             </div>
           </section>
-          <section v-if="resource.available && resource.kind === 'video'" class="detail-panel">
+          <section v-if="resource.available && resource.kind === 'video' && !phoneNode" class="detail-panel">
             <div class="detail-panel-heading"><div><h2>分段截图</h2><p>{{ duration ? `视频时长 ${formatTime(duration)}，均分为 6 段并截取每段中点。` : durationError || "正在读取视频时长…" }}</p></div><button v-if="captures.length" class="button button-secondary" :disabled="captureBusy" @click="generateAllCaptures"><LoaderCircle v-if="captureBusy" class="spin" :size="14" /><Image v-else :size="14" />生成全部</button></div>
             <div v-if="captures.length" class="detail-captures">
               <article v-for="capture in captures" :key="capture.key" class="detail-variant">

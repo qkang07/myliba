@@ -79,6 +79,7 @@ import {
   login,
   logout,
   scanRoot,
+  selectResourceNode,
   selectMediaStore,
   updateCollection,
   type DirectoryListing,
@@ -94,11 +95,15 @@ import {
   type TagSuggestion,
   type VirtualFolder,
   type TrafficRate,
+  type HubResourceNode,
 } from "./api";
 
 const remoteMode = ref(false);
 const authenticated = ref(true);
 const nodeOnline = ref(false);
+const resourceNodes = ref<HubResourceNode[]>([]);
+const selectedResourceNodeID = ref("");
+const selectedResourceNodeKind = computed(() => resourceNodes.value.find((node) => node.id === selectedResourceNodeID.value)?.kind);
 const nodeTransport = ref<"connecting" | "webrtc" | "turn" | "relay">("relay");
 const webTraffic = ref<TrafficRate>({ downloadBps: 0, uploadBps: 0 });
 const nodeTraffic = ref<TrafficRate>({ downloadBps: 0, uploadBps: 0 });
@@ -1220,6 +1225,19 @@ async function establishWebRTC(iceServers: RTCIceServer[] = []) {
   await connectWebRTC(iceServers, applyTransportState, (rate) => { nodeTraffic.value = rate; });
 }
 
+async function changeResourceNode(event: Event) {
+  const id = (event.target as HTMLSelectElement).value;
+  if (!id || id === selectedResourceNodeID.value) return;
+  try {
+    await selectResourceNode(id);
+    closeWebRTC();
+    window.location.reload();
+  } catch (error) {
+    (event.target as HTMLSelectElement).value = selectedResourceNodeID.value;
+    showError(error);
+  }
+}
+
 function openResourceFile(resource: Resource, download: boolean) {
   if (!download) {
     openDetail(resource);
@@ -1237,6 +1255,8 @@ async function submitLogin() {
     authGeneration++;
     authenticated.value = session.authenticated;
     nodeOnline.value = session.nodeOnline;
+    resourceNodes.value = session.nodes ?? [];
+    selectedResourceNodeID.value = session.selectedNodeId ?? "";
     webTraffic.value = session.webTraffic ?? webTraffic.value;
     password.value = "";
     if (session.nodeOnline) await establishWebRTC(session.iceServers);
@@ -1253,6 +1273,8 @@ function clearRemoteSession() {
   requestGeneration++;
   authenticated.value = false;
   nodeOnline.value = false;
+  resourceNodes.value = [];
+  selectedResourceNodeID.value = "";
   password.value = "";
   resources.value = [];
   roots.value = [];
@@ -1306,6 +1328,8 @@ async function refreshNodeStatus() {
         clearRemoteSession();
       }
       nodeOnline.value = session.nodeOnline;
+      resourceNodes.value = session.nodes ?? [];
+      selectedResourceNodeID.value = session.selectedNodeId ?? "";
       webTraffic.value = session.webTraffic ?? { downloadBps: 0, uploadBps: 0 };
       if (nodeTransport.value !== "webrtc" && nodeTransport.value !== "turn") {
         nodeTraffic.value = { downloadBps: session.nodeTraffic?.uploadBps ?? 0, uploadBps: session.nodeTraffic?.downloadBps ?? 0 };
@@ -1403,6 +1427,8 @@ onMounted(async () => {
       remoteMode.value = true;
       authenticated.value = session.authenticated;
       nodeOnline.value = session.nodeOnline;
+      resourceNodes.value = session.nodes ?? [];
+      selectedResourceNodeID.value = session.selectedNodeId ?? "";
       webTraffic.value = session.webTraffic ?? webTraffic.value;
       nodeTraffic.value = session.nodeTraffic ?? nodeTraffic.value;
     }
@@ -1486,7 +1512,7 @@ onBeforeUnmount(() => {
           <span class="node-status-icon" :class="{ offline: remoteMode && !nodeOnline }">
             <component :is="remoteMode && !nodeOnline ? WifiOff : remoteMode ? Wifi : HardDrive" :size="17" />
           </span>
-          <span class="node-status-copy"><strong>{{ remoteMode ? "家中节点" : "本机节点" }}</strong><small>{{ remoteMode ? (nodeOnline ? "在线 · 可访问资源" : "离线 · 暂不可访问") : "索引保存在此设备" }}</small></span>
+          <span class="node-status-copy"><strong>{{ remoteMode ? (resourceNodes.find((node) => node.id === selectedResourceNodeID)?.name || "资源节点") : "本机节点" }}</strong><small>{{ remoteMode ? (nodeOnline ? "在线 · 可访问资源" : "离线 · 暂不可访问") : "索引保存在此设备" }}</small></span>
           <span class="status-dot" :class="{ offline: remoteMode && !nodeOnline }"></span>
         </div>
         <p class="sidebar-note"><span class="privacy-mark">◆</span> 原文件保留在原位置</p>
@@ -1498,6 +1524,12 @@ onBeforeUnmount(() => {
         <div class="breadcrumbs"><button type="button" class="breadcrumb-home" @click="openFolder(null)">我的资源</button><span class="breadcrumb-divider">/</span><strong>{{ detailResourceID ? "资源详情" : activeFolderID === null ? "文件夹" : pageTitle }}</strong></div>
         <div class="topbar-actions">
           <template v-if="remoteMode">
+            <label v-if="authenticated" class="resource-node-picker">资源节点
+              <select :value="selectedResourceNodeID" aria-label="选择资源节点" @change="changeResourceNode">
+                <option v-if="!resourceNodes.length" value="">暂无节点</option>
+                <option v-for="node in resourceNodes" :key="node.id" :value="node.id">{{ node.name }}{{ node.kind === "android" ? " · 手机" : " · 桌面" }}{{ node.online ? "" : " · 离线" }}</option>
+              </select>
+            </label>
             <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
               <span class="connection-dot"></span><span>Web · HTTPS 接入</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small>
             </span>
@@ -1515,7 +1547,7 @@ onBeforeUnmount(() => {
       </header>
 
       <main class="page-content">
-        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" :remote="remoteMode" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
+        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" :remote="remoteMode" :phone-node="selectedResourceNodeKind === 'android'" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
         <template v-else>
         <section v-if="activeFolderID === null" class="page-intro">
           <div>
@@ -1586,7 +1618,7 @@ onBeforeUnmount(() => {
         <section v-else-if="activeFolderID === null" class="roots-panel remote-roots-panel">
           <div class="panel-heading">
             <span class="panel-icon"><HardDrive :size="18" /></span>
-            <span class="panel-heading-copy"><strong>家中索引目录</strong><small>目录保存在家中节点。远程访问时可以更新索引。</small></span>
+            <span class="panel-heading-copy"><strong>{{ selectedResourceNodeKind === "android" ? "手机索引目录" : "家中索引目录" }}</strong><small>{{ selectedResourceNodeKind === "android" ? "目录由手机 App 管理，可在手机上重新扫描。" : "目录保存在家中节点。远程访问时可以更新索引。" }}</small></span>
             <span class="remote-root-count">{{ roots.length }} 个目录</span>
           </div>
           <div v-if="roots.length" class="root-list">
@@ -1594,7 +1626,7 @@ onBeforeUnmount(() => {
               <span class="root-folder-icon"><FolderOpen :size="15" /></span>
               <span class="root-path" :title="root.path">{{ root.path }}</span>
               <span class="root-count">{{ root.count.toLocaleString("zh-CN") }} 个文件</span>
-              <button class="button button-ghost rescan-button" :disabled="scanningRootID === root.id || !nodeOnline" @click="rescanRoot(root)">
+              <button v-if="selectedResourceNodeKind !== 'android'" class="button button-ghost rescan-button" :disabled="scanningRootID === root.id || !nodeOnline" @click="rescanRoot(root)">
                 <LoaderCircle v-if="scanningRootID === root.id" class="spin" :size="15" /><FolderSync v-else :size="15" /><span>重新扫描</span>
               </button>
             </div>
@@ -1836,7 +1868,7 @@ onBeforeUnmount(() => {
         </header>
         <div class="resource-preview-stage">
           <template v-if="previewMimeType && !previewError">
-              <StreamingVideo v-if="previewMimeType.startsWith('video/')" :key="previewResource.id" :id="previewResource.id" :name="previewResource.name" :remote="remoteMode" />
+              <StreamingVideo v-if="previewMimeType.startsWith('video/')" :key="previewResource.id" :id="previewResource.id" :name="previewResource.name" :remote="remoteMode" :phone-node="selectedResourceNodeKind === 'android'" />
               <audio v-else-if="previewMimeType.startsWith('audio/') && (!remoteMode || previewURL)" :src="remoteMode ? previewURL : fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式。你可以下载后打开。'"></audio>
               <iframe v-else-if="!remoteMode || previewURL" :src="remoteMode ? previewURL : fileURL(previewResource.id)" :title="'预览 ' + previewResource.name"></iframe>
           </template>

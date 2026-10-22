@@ -22,22 +22,58 @@ import (
 const remoteChunkSize = 32 << 10
 
 type wireMessage struct {
-	Type      string          `json:"type"`
-	ID        string          `json:"id,omitempty"`
-	Method    string          `json:"method,omitempty"`
-	Path      string          `json:"path,omitempty"`
-	Headers   http.Header     `json:"headers,omitempty"`
-	Body      []byte          `json:"body,omitempty"`
-	Status    int             `json:"status,omitempty"`
-	Data      []byte          `json:"data,omitempty"`
-	SessionID string          `json:"sessionId,omitempty"`
-	ShareID   string          `json:"shareId,omitempty"`
-	Signal    json.RawMessage `json:"signal,omitempty"`
+	Type       string            `json:"type"`
+	ID         string            `json:"id,omitempty"`
+	Method     string            `json:"method,omitempty"`
+	Path       string            `json:"path,omitempty"`
+	Headers    http.Header       `json:"headers,omitempty"`
+	Body       []byte            `json:"body,omitempty"`
+	Status     int               `json:"status,omitempty"`
+	Data       []byte            `json:"data,omitempty"`
+	SessionID  string            `json:"sessionId,omitempty"`
+	ShareID    string            `json:"shareId,omitempty"`
+	Signal     json.RawMessage   `json:"signal,omitempty"`
+	ICEServers []iceServerConfig `json:"iceServers,omitempty"`
+}
+
+// Browser RTC requests serialize Headers values as strings, while Go's
+// WebSocket messages use string arrays. Accept both wire forms.
+func (m *wireMessage) UnmarshalJSON(data []byte) error {
+	type plain wireMessage
+	var decoded struct {
+		*plain
+		Headers map[string]json.RawMessage `json:"headers"`
+	}
+	decoded.plain = (*plain)(m)
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if decoded.Headers != nil {
+		m.Headers = make(http.Header, len(decoded.Headers))
+		for name, value := range decoded.Headers {
+			var values []string
+			if len(value) > 0 && value[0] == '[' {
+				if err := json.Unmarshal(value, &values); err != nil {
+					return err
+				}
+			} else {
+				var single string
+				if err := json.Unmarshal(value, &single); err != nil {
+					return err
+				}
+				values = []string{single}
+			}
+			m.Headers[http.CanonicalHeaderKey(name)] = values
+		}
+	}
+	return nil
 }
 
 type remoteHub struct {
 	mu                sync.Mutex
 	conn              *websocket.Conn
+	nodes             map[string]*remoteNode
+	selectedNodes     map[string]string
 	sendMu            sync.Mutex
 	waiters           map[string]*remoteWaiter
 	online            bool
@@ -51,7 +87,19 @@ type remoteHub struct {
 	nodeTraffic       trafficMeter
 	iceServers        []iceServerConfig
 	signalMu          sync.Mutex
-	signalSessions    map[string]*websocket.Conn
+	signalSessions    map[string]signalSession
+}
+
+type remoteNode struct {
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Kind string          `json:"kind"`
+	Conn *websocket.Conn `json:"-"`
+}
+
+type signalSession struct {
+	Client *websocket.Conn
+	Node   *websocket.Conn
 }
 
 type trafficSlot struct {
@@ -148,19 +196,20 @@ type remoteWaiter struct {
 	channel chan wireMessage
 	done    chan struct{}
 	once    sync.Once
+	node    *websocket.Conn
 }
 
 func (w *remoteWaiter) finish() {
 	w.once.Do(func() { close(w.done) })
 }
 
-func runNodeAgent(ctx context.Context, hubURL, token string, iceServers []iceServerConfig, setStatus func(string)) {
+func runNodeAgent(ctx context.Context, hubURL, token, nodeID, nodeName string, iceServers []iceServerConfig, setStatus func(string)) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		setStatus("connecting")
-		if err := connectNode(ctx, hubURL, token, iceServers, func() { setStatus("connected") }); err != nil && ctx.Err() == nil {
+		if err := connectNode(ctx, hubURL, token, nodeID, nodeName, iceServers, func() { setStatus("connected") }); err != nil && ctx.Err() == nil {
 			log.Printf("Remote hub connection ended: %v", err)
 		}
 		if ctx.Err() != nil {
@@ -183,7 +232,7 @@ func validateHubURL(hubURL string) error {
 	return nil
 }
 
-func connectNode(parent context.Context, hubURL, token string, iceServers []iceServerConfig, connected func()) error {
+func connectNode(parent context.Context, hubURL, token, nodeID, nodeName string, iceServers []iceServerConfig, connected func()) error {
 	parsed, err := url.Parse(hubURL)
 	if err != nil || parsed.Scheme != "wss" || parsed.Host == "" {
 		return errors.New("MYLIBA_HUB_URL must be a wss:// URL")
@@ -191,6 +240,11 @@ func connectNode(parent context.Context, hubURL, token string, iceServers []iceS
 	if parsed.Path == "" || parsed.Path == "/" {
 		parsed.Path = "/node"
 	}
+	query := parsed.Query()
+	query.Set("id", nodeID)
+	query.Set("name", nodeName)
+	query.Set("kind", "desktop")
+	parsed.RawQuery = query.Encode()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	headers := http.Header{"Authorization": []string{"Bearer " + token}}
@@ -306,27 +360,50 @@ func writeWire(conn websocketWriter, ctx context.Context, lock *sync.Mutex, mess
 }
 
 func (h *remoteHub) attach(conn *websocket.Conn) {
-	h.mu.Lock()
-	previous := h.conn
-	h.conn = conn
-	h.online = true
-	h.mu.Unlock()
-	if previous != nil && previous != conn {
-		_ = previous.Close(websocket.StatusPolicyViolation, "replaced by a newer node connection")
-	}
-	go h.readNode(conn)
+	h.attachNode(conn, "legacy", "家中客户端", "desktop")
 }
 
-func (h *remoteHub) readNode(conn *websocket.Conn) {
+func (h *remoteHub) attachNode(conn *websocket.Conn, id, name, kind string) {
+	h.mu.Lock()
+	if h.nodes == nil {
+		h.nodes = map[string]*remoteNode{}
+	}
+	previous := h.nodes[id]
+	h.nodes[id] = &remoteNode{ID: id, Name: name, Kind: kind, Conn: conn}
+	if kind == "desktop" && (h.conn == nil || id == "legacy") {
+		h.conn = conn
+		h.online = true
+	}
+	h.mu.Unlock()
+	if previous != nil && previous.Conn != nil && previous.Conn != conn {
+		_ = previous.Conn.Close(websocket.StatusPolicyViolation, "replaced by a newer connection for this node")
+	}
+	go h.readNode(id, conn)
+	_ = h.send(conn, wireMessage{Type: "node-config", ICEServers: h.directICEServers()})
+}
+
+func (h *remoteHub) readNode(id string, conn *websocket.Conn) {
 	defer func() {
 		h.mu.Lock()
+		if node := h.nodes[id]; node != nil && node.Conn == conn {
+			node.Conn = nil
+		}
 		if h.conn == conn {
 			h.conn = nil
 			h.online = false
-			for _, waiter := range h.waiters {
-				waiter.finish()
+			for _, node := range h.nodes {
+				if node.Conn != nil && node.Kind == "desktop" {
+					h.conn = node.Conn
+					h.online = true
+					break
+				}
 			}
-			h.waiters = map[string]*remoteWaiter{}
+		}
+		for key, waiter := range h.waiters {
+			if waiter.node == conn {
+				waiter.finish()
+				delete(h.waiters, key)
+			}
 		}
 		h.mu.Unlock()
 		_ = conn.Close(websocket.StatusNormalClosure, "node disconnected")
@@ -342,7 +419,7 @@ func (h *remoteHub) readNode(conn *websocket.Conn) {
 			continue
 		}
 		if message.Type == "rtc-signal" {
-			h.forwardRTCSignal(message.SessionID, message.Signal)
+			h.forwardRTCSignal(conn, message.SessionID, message.Signal)
 			continue
 		}
 		if message.ID == "" {
@@ -351,7 +428,7 @@ func (h *remoteHub) readNode(conn *websocket.Conn) {
 		h.mu.Lock()
 		waiter := h.waiters[message.ID]
 		h.mu.Unlock()
-		if waiter != nil {
+		if waiter != nil && waiter.node == conn {
 			select {
 			case waiter.channel <- message:
 			case <-waiter.done:
@@ -371,14 +448,14 @@ func (h *remoteHub) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mu.Lock()
-	conn := h.conn
+	conn := h.selectedNodeLocked(r)
 	if conn == nil {
 		h.mu.Unlock()
 		writeError(w, http.StatusServiceUnavailable, "家中资源节点当前离线")
 		return
 	}
 	id := newID()
-	waiter := &remoteWaiter{channel: make(chan wireMessage, 8), done: make(chan struct{})}
+	waiter := &remoteWaiter{channel: make(chan wireMessage, 8), done: make(chan struct{}), node: conn}
 	h.waiters[id] = waiter
 	h.mu.Unlock()
 	defer func() {

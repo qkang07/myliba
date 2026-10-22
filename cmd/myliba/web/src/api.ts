@@ -155,6 +155,21 @@ export interface SessionInfo {
   webTraffic?: TrafficRate;
   nodeTraffic?: TrafficRate;
   iceServers?: RTCIceServer[];
+  selectedNodeId?: string;
+  nodes?: HubResourceNode[];
+}
+
+export interface HubResourceNode {
+  id: string;
+  name: string;
+  kind: "desktop" | "android";
+  online: boolean;
+}
+
+export function selectResourceNode(id: string) {
+  return request<{ nodes: HubResourceNode[]; selectedId: string }>("/api/hub/nodes/active", {
+    method: "PUT", body: JSON.stringify({ id }),
+  });
 }
 
 export interface HubProfile {

@@ -3,13 +3,13 @@ import { nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { createVideoVariant, fileURL, getCloudVideoPart, getCloudVideoVariant, getVideoPart, getVideoVariant, type VideoManifest, type VideoQuality } from "./api";
 import { webRTCConnected, webRTCFetch } from "./webrtc";
 
-const props = defineProps<{ id: string; name: string; remote: boolean; shareKey?: string; cloud?: boolean; qualities?: VideoQuality[] }>();
+const props = defineProps<{ id: string; name: string; remote: boolean; phoneNode?: boolean; shareKey?: string; cloud?: boolean; qualities?: VideoQuality[] }>();
 const emit = defineEmits<{ metadata: [duration: number] }>();
 type Selection = VideoQuality | "original";
 type NetworkInfo = { downlink?: number; effectiveType?: string };
 const connection = (navigator as Navigator & { connection?: NetworkInfo }).connection;
 const preferredQuality: VideoQuality = connection?.downlink && connection.downlink < 2 || connection?.effectiveType === "2g" ? "360p" : "720p";
-const selected = ref<Selection>(props.cloud ? (props.qualities?.includes(preferredQuality) ? preferredQuality : props.qualities?.[0] ?? preferredQuality)
+const selected = ref<Selection>(props.phoneNode ? "original" : props.cloud ? (props.qualities?.includes(preferredQuality) ? preferredQuality : props.qualities?.[0] ?? preferredQuality)
   : props.remote || !!props.shareKey || !/\.(mp4|m4v|webm)$/i.test(props.name) ? preferredQuality : "original");
 const video = ref<HTMLVideoElement | null>(null);
 const message = ref("");
@@ -72,6 +72,44 @@ async function start() {
   loading.value = false;
   if (!currentVideo) return;
   if (selected.value === "original") {
+    if (props.phoneNode) {
+      loading.value = true;
+      message.value = "正在通过 WebRTC 读取手机视频原片…";
+      try {
+        if (!webRTCConnected()) throw new Error("手机节点直连不可用");
+        const response = await webRTCFetch(fileURL(props.id));
+        if (!response.ok) throw new Error(`读取手机视频失败 (${response.status})`);
+        const maxPreviewBytes = 256 * 1024 * 1024;
+        const length = Number(response.headers.get("Content-Length") || 0);
+        if (length > maxPreviewBytes) { await response.body?.cancel(); throw new Error("网页原片预览目前限 256 MB；可下载原片，手机 App 支持分段读取。"); }
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("无法读取手机视频流");
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            received += value.byteLength;
+            if (received > maxPreviewBytes) throw new Error("网页原片预览目前限 256 MB；可下载原片，手机 App 支持分段读取。");
+            chunks.push(value);
+          }
+        } catch (cause) {
+          await reader.cancel().catch(() => {});
+          throw cause;
+        } finally { reader.releaseLock(); }
+        const blob = new Blob(chunks as BlobPart[], { type: response.headers.get("Content-Type") || "video/mp4" });
+        if (current !== generation) return;
+        mediaURL = URL.createObjectURL(blob);
+        currentVideo.src = mediaURL;
+        currentVideo.load();
+        loading.value = false;
+        message.value = "";
+      } catch (cause) {
+        if (current === generation) { loading.value = false; message.value = cause instanceof Error ? cause.message : "无法预览原片"; }
+      }
+      return;
+    }
     currentVideo.src = fileURL(props.id);
     currentVideo.load();
     return;
@@ -208,7 +246,7 @@ function onMetadata(event: Event) {
 
 watch(() => props.id, () => { restorePosition = 0; resumePlayback = false; });
 watch([() => props.id, selected], async () => { await nextTick(); void start(); }, { immediate: true, flush: "post" });
-watch(() => props.remote, () => { if (props.remote && selected.value === "original") selected.value = "720p"; });
+watch(() => props.remote, () => { if (props.remote && !props.phoneNode && selected.value === "original") selected.value = "720p"; });
 onBeforeUnmount(dispose);
 </script>
 
@@ -217,14 +255,14 @@ onBeforeUnmount(dispose);
     <div class="stream-video-controls">
       <label>清晰度
         <select :value="selected" @change="changeQuality">
-          <option v-if="!remote && !shareKey && !cloud" value="original">原片</option>
-          <option v-if="!cloud || qualities?.includes('360p')" value="360p">360p · 省流量</option>
-          <option v-if="!cloud || qualities?.includes('720p')" value="720p">720p · 标清</option>
-          <option v-if="!cloud || qualities?.includes('1080p')" value="1080p">1080p · 高清</option>
+          <option v-if="phoneNode || (!remote && !shareKey && !cloud)" value="original">{{ phoneNode ? "原片 · RTC" : "原片" }}</option>
+          <option v-if="!phoneNode && (!cloud || qualities?.includes('360p'))" value="360p">360p · 省流量</option>
+          <option v-if="!phoneNode && (!cloud || qualities?.includes('720p'))" value="720p">720p · 标清</option>
+          <option v-if="!phoneNode && (!cloud || qualities?.includes('1080p'))" value="1080p">1080p · 高清</option>
         </select>
       </label>
       <span v-if="loading || message" role="status">{{ message }}</span>
     </div>
-    <video ref="video" controls preload="metadata" playsinline @timeupdate="pump" @seeking="pump" @waiting="pump" @loadedmetadata="onMetadata" @error="selected === 'original' && (message = '原片格式无法播放，请选择压缩清晰度。')"></video>
+    <video ref="video" controls preload="metadata" playsinline @timeupdate="pump" @seeking="pump" @waiting="pump" @loadedmetadata="onMetadata" @error="selected === 'original' && (message = phoneNode ? '浏览器无法播放此原片格式，请下载查看。' : '原片格式无法播放，请选择压缩清晰度。')"></video>
   </div>
 </template>

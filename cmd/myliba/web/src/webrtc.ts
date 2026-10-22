@@ -64,7 +64,7 @@ function decodeBytes(value: string): Uint8Array {
 }
 
 function handleDataMessage(raw: string) {
-  let message: { type: string; id?: string; status?: number; headers?: Record<string, string[]>; data?: string };
+  let message: { type: string; id?: string; status?: number; headers?: Record<string, string[]>; data?: string; error?: string };
   try { message = JSON.parse(raw); } catch { return; }
   if (!message.id) return;
   const request = pending.get(message.id);
@@ -89,6 +89,13 @@ function handleDataMessage(raw: string) {
   }
   if (message.type === "chunk" && message.data && request.controller) {
     request.controller.enqueue(decodeBytes(message.data));
+    return;
+  }
+  if (message.type === "error") {
+    const error = new Error(message.error || "WebRTC 文件传输中断");
+    if (request.started) request.controller?.error(error);
+    else request.reject(error);
+    pending.delete(message.id);
     return;
   }
   if (message.type === "end") {

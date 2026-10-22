@@ -216,6 +216,15 @@ final class LocalLibrary extends SQLiteOpenHelper {
         return new Page(items, total);
     }
 
+    Item item(String uri) {
+        try (Cursor cursor = getReadableDatabase().rawQuery(
+                "SELECT i.uri, i.root_uri, i.name, i.path, i.mime, i.size, i.modified, " +
+                "COALESCE((SELECT group_concat(t.name, ' · ') FROM tags t WHERE t.item_uri=i.uri), ''), i.folder_id " +
+                "FROM items i WHERE i.uri=?", new String[]{uri})) {
+            return cursor.moveToFirst() ? new Item(cursor) : null;
+        }
+    }
+
     private static String where(LocalFilters filters, ArrayList<String> args) {
         ArrayList<String> clauses = new ArrayList<>();
         String query = filters.query.trim();

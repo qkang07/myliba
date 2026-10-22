@@ -63,7 +63,7 @@ func (h *remoteHub) signal(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(1 << 20)
 	h.mu.Lock()
-	node := h.conn
+	node := h.selectedNodeLocked(r)
 	h.mu.Unlock()
 	if node == nil {
 		_ = conn.Close(websocket.StatusTryAgainLater, "remote node is offline")
@@ -72,9 +72,9 @@ func (h *remoteHub) signal(w http.ResponseWriter, r *http.Request) {
 	sessionID := newID()
 	h.signalMu.Lock()
 	if h.signalSessions == nil {
-		h.signalSessions = map[string]*websocket.Conn{}
+		h.signalSessions = map[string]signalSession{}
 	}
-	h.signalSessions[sessionID] = conn
+	h.signalSessions[sessionID] = signalSession{Client: conn, Node: node}
 	h.signalMu.Unlock()
 	defer func() {
 		h.signalMu.Lock()
@@ -113,15 +113,15 @@ func (h *remoteHub) signal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *remoteHub) forwardRTCSignal(sessionID string, payload json.RawMessage) {
+func (h *remoteHub) forwardRTCSignal(node *websocket.Conn, sessionID string, payload json.RawMessage) {
 	h.signalMu.Lock()
-	conn := h.signalSessions[sessionID]
+	session := h.signalSessions[sessionID]
 	h.signalMu.Unlock()
-	if conn == nil {
+	if session.Client == nil || session.Node != node {
 		return
 	}
 	ctx := context.Background()
-	if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
-		_ = conn.CloseNow()
+	if err := session.Client.Write(ctx, websocket.MessageText, payload); err != nil {
+		_ = session.Client.CloseNow()
 	}
 }

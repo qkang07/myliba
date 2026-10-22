@@ -37,7 +37,7 @@ func runHub() error {
 	if err != nil {
 		return err
 	}
-	hub := &remoteHub{waiters: map[string]*remoteWaiter{}, password: password, secure: os.Getenv("MYLIBA_HUB_COOKIE_SECURE") != "0", sessions: map[string]time.Time{}, iceServers: iceServers, signalSessions: map[string]*websocket.Conn{}}
+	hub := &remoteHub{waiters: map[string]*remoteWaiter{}, nodes: map[string]*remoteNode{}, selectedNodes: map[string]string{}, password: password, secure: os.Getenv("MYLIBA_HUB_COOKIE_SECURE") != "0", sessions: map[string]time.Time{}, iceServers: iceServers, signalSessions: map[string]signalSession{}}
 	mux := http.NewServeMux()
 	cloudToken := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_TOKEN"))
 	var cloud *cloudHub
@@ -56,12 +56,23 @@ func runHub() error {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		id, name, kind := r.URL.Query().Get("id"), strings.TrimSpace(r.URL.Query().Get("name")), r.URL.Query().Get("kind")
+		if id == "" {
+			id, name, kind = "legacy", "家中客户端", "desktop"
+		}
+		if !validRemoteNodeID(id) || len([]rune(name)) > 80 || (kind != "desktop" && kind != "android") {
+			http.Error(w, "invalid node identity", http.StatusBadRequest)
+			return
+		}
+		if name == "" {
+			name = id
+		}
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		conn.SetReadLimit(4 << 20)
-		hub.attach(conn)
+		hub.attachNode(conn, id, name, kind)
 	})
 	mux.HandleFunc("GET /signal", hub.signal)
 	mux.HandleFunc("GET /share/signal", hub.shareSignal)
@@ -70,6 +81,8 @@ func runHub() error {
 	mux.HandleFunc("GET /api/session", hub.sessionStatus)
 	mux.HandleFunc("POST /api/session", hub.login)
 	mux.HandleFunc("DELETE /api/session", hub.logout)
+	mux.Handle("GET /api/hub/nodes", hub.requireSession(http.HandlerFunc(hub.listNodes)))
+	mux.Handle("PUT /api/hub/nodes/active", hub.requireSession(http.HandlerFunc(hub.selectNode)))
 	mux.Handle("GET /api/hub/cloud/overview", hub.requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if cloud == nil {
 			w.Header().Set("Cache-Control", "no-store")
@@ -99,9 +112,12 @@ func (h *remoteHub) sessionStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mu.Lock()
-	online := h.online
+	selectedID := h.selectedIDLocked(r)
+	node := h.nodes[selectedID]
+	online := node != nil && node.Conn != nil
+	nodes := h.nodesViewLocked()
 	h.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online, "webTraffic": h.webTraffic.rate(), "nodeTraffic": h.nodeTraffic.rate(), "iceServers": h.iceServers})
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online, "selectedNodeId": selectedID, "nodes": nodes, "webTraffic": h.webTraffic.rate(), "nodeTraffic": h.nodeTraffic.rate(), "iceServers": h.iceServers})
 }
 
 func (h *remoteHub) login(w http.ResponseWriter, r *http.Request) {
@@ -142,10 +158,14 @@ func (h *remoteHub) login(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	h.sessions[token] = time.Now().Add(30 * 24 * time.Hour)
-	online := h.online
+	selectedID := h.selectedIDLocked(r)
+	h.selectedNodes[token] = selectedID
+	node := h.nodes[selectedID]
+	online := node != nil && node.Conn != nil
+	nodes := h.nodesViewLocked()
 	h.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: hubSessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteStrictMode, Expires: time.Now().Add(30 * 24 * time.Hour)})
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online, "iceServers": h.iceServers})
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "nodeOnline": online, "selectedNodeId": selectedID, "nodes": nodes, "iceServers": h.iceServers})
 }
 
 func (h *remoteHub) logout(w http.ResponseWriter, r *http.Request) {
@@ -156,6 +176,7 @@ func (h *remoteHub) logout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(hubSessionCookie); err == nil {
 		h.mu.Lock()
 		delete(h.sessions, cookie.Value)
+		delete(h.selectedNodes, cookie.Value)
 		h.mu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{Name: hubSessionCookie, Value: "", Path: "/", HttpOnly: true, Secure: h.secure, SameSite: http.SameSiteStrictMode, MaxAge: -1})
@@ -189,6 +210,7 @@ func (h *remoteHub) hasSession(r *http.Request) bool {
 	}
 	if time.Now().After(expires) {
 		delete(h.sessions, cookie.Value)
+		delete(h.selectedNodes, cookie.Value)
 		return false
 	}
 	return true

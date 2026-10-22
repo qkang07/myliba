@@ -28,6 +28,8 @@ type hubProfilesView struct {
 type hubProfiles struct {
 	db         *sql.DB
 	iceServers []iceServerConfig
+	nodeID     string
+	nodeName   string
 	mu         sync.Mutex
 	activeID   string
 	status     string
@@ -73,7 +75,22 @@ func newHubProfiles(db *sql.DB, iceServers []iceServerConfig) (*hubProfiles, err
 			return nil, err
 		}
 	}
-	profiles := &hubProfiles{db: db, iceServers: iceServers, status: "disabled"}
+	var nodeID string
+	err = db.QueryRow(`SELECT value FROM hub_settings WHERE key='node_id'`).Scan(&nodeID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if nodeID == "" {
+		nodeID = newID()
+		if _, err := db.Exec(`INSERT INTO hub_settings(key,value) VALUES('node_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, nodeID); err != nil {
+			return nil, err
+		}
+	}
+	nodeName, _ := os.Hostname()
+	if nodeName == "" {
+		nodeName = "桌面客户端"
+	}
+	profiles := &hubProfiles{db: db, iceServers: iceServers, nodeID: nodeID, nodeName: nodeName, status: "disabled"}
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM hub_profiles`).Scan(&count); err != nil {
 		return nil, err
@@ -150,7 +167,7 @@ func (h *hubProfiles) activate(id string) error {
 		h.cancel = cancel
 		h.status = "connecting"
 		generation := h.generation
-		go runNodeAgent(ctx, hubURL, token, h.iceServers, func(status string) { h.setStatus(generation, status) })
+		go runNodeAgent(ctx, hubURL, token, h.nodeID, h.nodeName, h.iceServers, func(status string) { h.setStatus(generation, status) })
 	}
 	return nil
 }
