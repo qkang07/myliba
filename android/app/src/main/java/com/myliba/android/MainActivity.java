@@ -25,7 +25,7 @@ import static com.myliba.android.MobileUi.*;
 
 /** A single mobile library experience, backed by either SAF/SQLite or the Hub API. */
 public final class MainActivity extends Activity {
-    private static final int PICK_TREE=41;
+    private static final int PICK_TREE=41,EXPORT_LOG=42;
     private final ExecutorService io=Executors.newSingleThreadExecutor();
     private final Handler handler=new Handler(Looper.getMainLooper());
     private final Set<String> selected=new LinkedHashSet<>();
@@ -109,6 +109,7 @@ public final class MainActivity extends Activity {
         nodeConfigure=ui.button("",true,this::cloudStorageSheet);body.addView(nodeConfigure,ui.top(18));
         nodeStop=ui.button("停止存储节点",false,()->{stopService(new Intent(this,CloudStorageService.class));handler.postDelayed(this::render,350);});body.addView(nodeStop,ui.top(9));
         body.addView(ui.button("切换到完整客户端",false,this::leaveStorageMode),ui.top(22));
+        body.addView(ui.button("查看诊断日志",false,this::diagnosticsSheet),ui.top(9));
         body.addView(ui.text("这台手机作为云层存储节点，供其他节点备份和读取加密块。关闭界面后，前台服务仍会继续运行。",12,MUTED,false),ui.top(17));
         updateStorageOnlyStatus();
     }
@@ -217,7 +218,12 @@ public final class MainActivity extends Activity {
         if(hubStore!=null){JSONArray nodes=hubStore.client.nodes;for(int i=0;i<nodes.length();i++){JSONObject node=nodes.optJSONObject(i);if(node==null)continue;String id=node.optString("id");
             s.body.addView(ui.item("android".equals(node.optString("kind"))?"phone":"server",node.optString("name",id),node.optBoolean("online")?(id.equals(hubStore.client.selectedNodeId)?"当前节点 · 在线":"在线 · 点击切换"):"离线",()->{
                 s.close();LibraryStore current=hubStore;io.execute(()->{try{current.client.selectNode(id);runOnUiThread(()->{if(destroyed||hubStore!=current)return;home=true;tab=0;hubFilters=new LocalFilters();activeCollection=null;generation++;entries.clear();meta=new LibraryStore.Meta();render();reload(false,true);});}catch(Exception ex){runOnUiThread(()->toast("切换节点失败："+message(ex)));}});
-            }),ui.top(8));}}
+            }),ui.top(8));
+            if(!node.optBoolean("online"))s.body.addView(ui.button("移除离线节点 · "+node.optString("name",id),false,()->{
+                s.close();confirm("移除离线节点？","仅从 Hub 列表移除；节点重新连接后会再次出现。",()->{
+                    LibraryStore current=hubStore;io.execute(()->{try{current.client.json("DELETE","/api/hub/nodes/"+RemoteClient.enc(id),null);current.client.json("GET","/api/session",null);runOnUiThread(()->{if(destroyed||hubStore!=current)return;toast("已移除离线节点");render();if(home)reload(false,true);});}catch(Exception ex){runOnUiThread(()->toast("移除节点失败："+message(ex)));}});
+                });
+            }),ui.top(4));}}
         s.show();
     }
     private String selectedNodeName(){if(hubStore==null)return "Hub";JSONArray nodes=hubStore.client.nodes;for(int i=0;i<nodes.length();i++){JSONObject node=nodes.optJSONObject(i);if(node!=null&&hubStore.client.selectedNodeId.equals(node.optString("id")))return node.optString("name","Hub");}return "Hub";}
@@ -296,7 +302,23 @@ public final class MainActivity extends Activity {
         if(meta.roots.isEmpty())body.addView(ui.text(home?"连接后可查看服务端已配置的目录。":"在这里添加照片、下载或工作资料文件夹。",12,MUTED,false),ui.top(10));
         for(LibraryStore.Group r:meta.roots){LinearLayout row=ui.item("folder",shortPath(r.name),r.count+" 个文件"+(home?" · "+r.name:""),()->{LocalFilters next=new LocalFilters();next.rootUri=r.id;setFilters(next);activeCollection=null;tab=0;refreshScreen(false);});if(!home){row.removeViewAt(row.getChildCount()-1);row.addView(ui.iconButton("more",r.name+"的操作",()->rootMenu(r)));}body.addView(row,ui.top(9));}
         if(!home){section(body,"家中资源库",null,null);body.addView(connectionCard(),ui.top(12));}
+        section(body,"诊断",null,null);body.addView(ui.item("file","查看诊断日志","直连状态、异常记录和导出诊断包",this::diagnosticsSheet),ui.top(10));
         LinearLayout note=ui.row();note.addView(ui.icon("shield",18,MUTED));TextView message=ui.text("本机与服务端的标签、文件夹分别保存。",11,MUTED,false);message.setPadding(ui.d(8),0,0,0);note.addView(message,ui.weight());body.addView(note,ui.top(24));
+    }
+    private void diagnosticsSheet(){
+        MobileUi.Sheet sheet=ui.sheet("诊断日志","日志保存在本机；导出时可选择手机上的保存位置。原生崩溃记录会在下次启动后尝试收集。");
+        TextView content=ui.text(AppLog.recent(),11,INK,false);content.setTypeface(android.graphics.Typeface.MONOSPACE);content.setTextIsSelectable(true);
+        sheet.body.addView(content);
+        sheet.footer.addView(ui.button("导出诊断包",true,()->{sheet.close();exportDiagnostics();}));
+        sheet.show();
+    }
+    private void exportDiagnostics(){
+        AppLog.info("Diagnostic export requested");
+        Intent intent=new Intent(Intent.ACTION_CREATE_DOCUMENT);intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/zip");
+        String stamp=new SimpleDateFormat("yyyyMMdd-HHmmss",Locale.ROOT).format(new Date());
+        intent.putExtra(Intent.EXTRA_TITLE,"myliba-diagnostics-"+stamp+".zip");
+        try{startActivityForResult(intent,EXPORT_LOG);}catch(ActivityNotFoundException ex){toast("设备没有可用的文件保存器");}
     }
     private View connectionCard(){return ui.item("server",hubStore==null?"连接家中资源库":"打开家中资源库",hubStore==null?"通过你的 Myliba 服务端访问家中文件":Uri.parse(hubStore.client.base).getHost(),()->{if(hubStore==null||needsLogin)connectSheet();else if(home)navigate(0);else{tab=0;switchSource(true);}});}
     private void resourceNodeSheet(){
@@ -305,7 +327,7 @@ public final class MainActivity extends Activity {
         MobileUi.Sheet sheet=ui.sheet("手机资源节点","共享这台手机已索引的资源库。其他客户端在 Hub 选择本手机后通过 WebRTC 直连读取文件。");
         sheet.body.addView(ui.text("节点名称",12,INK,true));EditText name=ui.input("例如：我的手机",settings.getString("name",android.os.Build.MODEL));sheet.body.addView(name,ui.top(7));
         sheet.body.addView(ui.text("Hub HTTPS 地址",12,INK,true),ui.top(16));EditText hub=ui.input("https://hub.example.com",settings.getString("hub",prefs.getString("server_url","")));sheet.body.addView(hub,ui.top(7));
-        sheet.body.addView(ui.text("资源节点密钥",12,INK,true),ui.top(16));EditText secret=ui.input("与 Hub 的 MYLIBA_NODE_TOKEN 相同",savedToken);secret.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);sheet.body.addView(secret,ui.top(7));
+        sheet.body.addView(ui.text("资源节点密钥",12,INK,true),ui.top(16));EditText secret=ui.input("与 Hub 的 MYLIBA_NODE_TOKEN 相同",savedToken);secret.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);addClearablePassword(sheet.body,secret,7);
         TextView state=ui.text(ResourceNodeService.status,12,MUTED,false);sheet.body.addView(state,ui.top(13));
         sheet.footer.addView(ui.button(ResourceNodeService.running?"保存并重启资源节点":"启动资源节点",true,()->{
             String h=hub.getText().toString().trim(),n=name.getText().toString().trim(),t=secret.getText().toString();
@@ -329,14 +351,14 @@ public final class MainActivity extends Activity {
         openlistFields.addView(ui.text("OpenList HTTPS 地址",12,INK,true));EditText openlistURL=ui.input("https://openlist.example.com",settings.getString("openlist_url",""));openlistFields.addView(openlistURL,ui.top(7));
         openlistFields.addView(ui.text("可写挂载路径",12,INK,true),ui.top(16));EditText mount=ui.input("例如 aliyun 或 quark",settings.getString("openlist_mount",""));openlistFields.addView(mount,ui.top(7));
         openlistFields.addView(ui.text("OpenList 用户名",12,INK,true),ui.top(16));EditText user=ui.input("有 WebDAV 管理权限的用户",settings.getString("openlist_user",""));openlistFields.addView(user,ui.top(7));
-        openlistFields.addView(ui.text("OpenList 密码",12,INK,true),ui.top(16));EditText password=ui.input("OpenList 用户密码",storedPassword);password.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);openlistFields.addView(password,ui.top(7));
+        openlistFields.addView(ui.text("OpenList 密码",12,INK,true),ui.top(16));EditText password=ui.input("OpenList 用户密码",storedPassword);password.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);addClearablePassword(openlistFields,password,7);
         openlistFields.addView(ui.text("云盘账号由 OpenList 管理；这里通过 /dav/挂载路径 存取加密块。请在 OpenList 中选择可写驱动，并启用 WebDAV 本机代理。",12,MUTED,false),ui.top(9));
         sheet.body.addView(openlistFields,ui.top(17));openlistFields.setVisibility(backendChoice.getSelectedItemPosition()==1?View.VISIBLE:View.GONE);
         backendChoice.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){public void onNothingSelected(android.widget.AdapterView<?> parent){}public void onItemSelected(android.widget.AdapterView<?> parent,View view,int position,long id){openlistFields.setVisibility(position==1?View.VISIBLE:View.GONE);}});
         sheet.body.addView(ui.text("Hub HTTPS 地址",12,INK,true));EditText hub=ui.input("https://hub.example.com",settings.getString("hub",""));sheet.body.addView(hub,ui.top(7));
         sheet.body.addView(ui.text("手机的直连 HTTPS 地址（可选）",12,INK,true),ui.top(16));EditText endpoint=ui.input("https://phone.example.com",settings.getString("url",""));sheet.body.addView(endpoint,ui.top(7));
         sheet.body.addView(ui.text("存储中继 HTTPS 地址（可选）",12,INK,true),ui.top(16));EditText relay=ui.input("https://storage.example.com",settings.getString("relay",""));sheet.body.addView(relay,ui.top(7));
-        sheet.body.addView(ui.text("云层令牌",12,INK,true),ui.top(16));EditText secret=ui.input("与 Hub 的 MYLIBA_CLOUD_TOKEN 相同",storedToken);secret.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);sheet.body.addView(secret,ui.top(7));
+        sheet.body.addView(ui.text("云层令牌",12,INK,true),ui.top(16));EditText secret=ui.input("与 Hub 的 MYLIBA_CLOUD_TOKEN 相同",storedToken);secret.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);addClearablePassword(sheet.body,secret,7);
         TextView validation=ui.text("两个可选地址都留空时，Hub 只负责信令，文件块由节点 WebRTC 直连传输。若网络无法建立直连，可另配存储中继。",12,MUTED,false);sheet.body.addView(validation,ui.top(14));
         sheet.footer.addView(ui.button(CloudStorageService.running?"保存并重启节点":"启动存储节点",true,()->{
             String h=hub.getText().toString().trim(),u=endpoint.getText().toString().trim(),r=relay.getText().toString().trim(),t=secret.getText().toString();
@@ -361,15 +383,25 @@ public final class MainActivity extends Activity {
     private LinearLayout scrollBody(){ScrollView scroll=new ScrollView(this);scroll.setVerticalScrollBarEnabled(false);LinearLayout body=ui.col();body.setPadding(ui.d(20),0,ui.d(20),ui.d(24));scroll.addView(body);content.addView(scroll,new LinearLayout.LayoutParams(-1,-1));return body;}
     private void section(LinearLayout parent,String label,String action,Runnable run){LinearLayout row=ui.row();row.addView(ui.text(label,15,INK,true),ui.weight());if(action!=null){TextView t=ui.text(action,12,GREEN,true);ui.pad(t,4,8);if(run!=null)t.setOnClickListener(v->run.run());row.addView(t);}parent.addView(row,ui.top(24));}
     private void rootMenu(LibraryStore.Group g){MobileUi.Sheet s=ui.sheet(g.name,g.count+" 个已索引文件");s.body.addView(ui.item("refresh","重新扫描","读取新增或已修改的文件",()->{s.close();scan(Uri.parse(g.id));}));s.body.addView(ui.item("trash","移除索引目录","移除本地索引和标签，原文件仍保留",()->{s.close();confirm("移除这个目录？","此目录的本地索引和标签将删除，原文件不受影响。",()->mutate(localStore,()->{db.removeRoot(g.id);try{getContentResolver().releasePersistableUriPermission(Uri.parse(g.id),Intent.FLAG_GRANT_READ_URI_PERMISSION);}catch(SecurityException ignored){}},"已移除目录",()->{if(localFilters.rootUri.equals(g.id))localFilters.rootUri="";}));}));s.show();}
+    private void addClearablePassword(LinearLayout parent,EditText field,int top){
+        LinearLayout row=ui.row();row.setGravity(Gravity.CENTER_VERTICAL);
+        row.addView(field,new LinearLayout.LayoutParams(0,-2,1));
+        TextView clear=ui.button("清空",false,()->{field.setText("");field.requestFocus();});
+        clear.setContentDescription("清空密码输入框");
+        LinearLayout.LayoutParams action=new LinearLayout.LayoutParams(-2,-2);action.leftMargin=ui.d(8);row.addView(clear,action);
+        parent.addView(row,ui.top(top));
+    }
     private void connectSheet(){
-        MobileUi.Sheet s=ui.sheet("连接家中资源库","填写 Myliba 服务端的 HTTPS 地址与访问密码。");s.body.addView(ui.icon("server",42,GREEN));s.body.addView(ui.text("服务端地址",12,INK,true),ui.top(22));EditText address=ui.input("https://library.example.com",hubStore==null?"":hubStore.client.base);address.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_URI);s.body.addView(address,ui.top(9));s.body.addView(ui.text("访问密码",12,INK,true),ui.top(18));EditText password=ui.input("与 Web 端使用相同的密码","");password.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);s.body.addView(password,ui.top(9));TextView status=ui.text("密码不会保存在手机上。",12,MUTED,false);s.body.addView(status,ui.top(14));TextView connect=ui.button("连接资源库",true,()->{});s.footer.addView(connect);
+        MobileUi.Sheet s=ui.sheet("连接家中资源库","填写 Myliba 服务端的 HTTPS 地址与访问密码。");s.body.addView(ui.icon("server",42,GREEN));s.body.addView(ui.text("服务端地址",12,INK,true),ui.top(22));EditText address=ui.input("https://library.example.com",hubStore==null?"":hubStore.client.base);address.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_URI);s.body.addView(address,ui.top(9));s.body.addView(ui.text("访问密码",12,INK,true),ui.top(18));EditText password=ui.input("与 Web 端使用相同的密码","");password.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);addClearablePassword(s.body,password,9);TextView status=ui.text("密码不会保存在手机上。",12,MUTED,false);s.body.addView(status,ui.top(14));TextView connect=ui.button("连接资源库",true,()->{});s.footer.addView(connect);
         connect.setOnClickListener(v->{if(busy)return;final String base;try{base=RemoteClient.normalize(address.getText().toString());}catch(Exception e){status.setText(message(e));status.setTextColor(RED);return;}String pass=password.getText().toString();RemoteClient candidate=new RemoteClient(base,prefs,this);connect.setEnabled(false);connect.setText("正在连接…");status.setText("正在验证连接");status.setTextColor(MUTED);busy=true;
             io.execute(()->{try{if(!pass.isEmpty())candidate.json("POST","/api/session",RemoteClient.object("password",pass));else candidate.json("GET","/api/session",null);runOnUiThread(()->{busy=false;if(destroyed)return;prefs.edit().putString("server_url",base).putString("server_cookie",candidate.cookie()).apply();hubStore=new LibraryStore(db,candidate);home=true;tab=0;needsLogin=false;error="";meta=new LibraryStore.Meta();entries.clear();generation++;s.close();render();reload(false,true);});}catch(Exception e){runOnUiThread(()->{busy=false;if(destroyed)return;connect.setEnabled(true);connect.setText("连接资源库");status.setText(e instanceof RemoteClient.Failure&&((RemoteClient.Failure)e).status==401?"密码不正确或登录已过期，请重新输入。":message(e));status.setTextColor(RED);});}});
         });s.show();
     }
     private void logout(){if(hubStore==null)return;confirm("退出家中资源库？","本机文件和索引会保留。",()->{LibraryStore old=hubStore;mutate(old,()->{try{old.client.json("DELETE","/api/session",null);}catch(java.io.IOException ignored){}finally{old.client.forget();}},"已退出登录",()->{needsLogin=true;entries.clear();home=false;tab=2;meta=new LibraryStore.Meta();});});}
     private void pickTree(){if(scanning){toast("当前目录扫描完成后再添加");return;}Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);try{startActivityForResult(i,PICK_TREE);}catch(ActivityNotFoundException e){toast("设备没有可用的文件夹选择器");}}
-    @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(request!=PICK_TREE||result!=RESULT_OK||data==null||data.getData()==null)return;Uri uri=data.getData();try{getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION);String name=DocumentsContract.getTreeDocumentId(uri);int slash=Math.max(name.lastIndexOf('/'),name.lastIndexOf(':'));if(slash>=0)name=name.substring(slash+1);if(name.isEmpty())name="手机存储";db.addRoot(uri,name);home=false;tab=0;meta=new LibraryStore.Meta();entries.clear();render();scan(uri);}catch(Exception e){toast("无法授权目录："+message(e));}}
+    @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(result!=RESULT_OK||data==null||data.getData()==null)return;Uri uri=data.getData();
+        if(request==EXPORT_LOG){io.execute(()->{try(java.io.OutputStream output=getContentResolver().openOutputStream(uri,"w")){if(output==null)throw new java.io.IOException("无法打开目标文件");AppLog.export(output);runOnUiThread(()->toast("诊断包已保存"));}catch(Exception ex){AppLog.error("Diagnostic export failed",ex);runOnUiThread(()->toast("导出失败："+message(ex)));}});return;}
+        if(request!=PICK_TREE)return;try{getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION);String name=DocumentsContract.getTreeDocumentId(uri);int slash=Math.max(name.lastIndexOf('/'),name.lastIndexOf(':'));if(slash>=0)name=name.substring(slash+1);if(name.isEmpty())name="手机存储";db.addRoot(uri,name);home=false;tab=0;meta=new LibraryStore.Meta();entries.clear();render();scan(uri);}catch(Exception e){toast("无法授权目录："+message(e));}}
     private void scan(Uri uri){if(scanning)return;scanning=true;scanMessage="正在索引文件…";generation++;loading=true;updateResults();toast(scanMessage);io.execute(()->{try{int count=new TreeScanner(getContentResolver(),db).scan(uri);runOnUiThread(()->{if(destroyed)return;scanning=false;loading=false;scanMessage="已索引 "+count+" 个文件";thumbs.clear();toast(scanMessage);if(!home)reload(false,true);});}catch(Exception e){runOnUiThread(()->{if(destroyed)return;scanning=false;loading=false;scanMessage="扫描失败："+message(e);error=scanMessage;toast(scanMessage);if(tab==0)updateResults();else render();});}});}
     private void showDetail(LibraryStore.Entry e){
         LibraryStore s=store();if(s==null)return;MobileUi.Sheet sheet=ui.sheet(e.name,typeName(e.kind)+" · "+size(e.size));detailBody(sheet,s,e);sheet.show();
@@ -492,7 +524,7 @@ public final class MainActivity extends Activity {
         intent.putExtra("name",e.name).putExtra("mime",e.mime);
         if(s.remote)intent.putExtra("server",s.client.base).putExtra("resource",e.id);
         ArrayList<String> ids=new ArrayList<>(),names=new ArrayList<>(),mimes=new ArrayList<>();
-        for(LibraryStore.Entry item:entries)if(item.available&&(item.kind.equals("image")||item.kind.equals("video"))){ids.add(item.id);names.add(item.name);mimes.add(item.mime);}
+        for(LibraryStore.Entry item:entries)if(item.available&&item.kind.equals(e.kind)&&(item.kind.equals("image")||item.kind.equals("video"))){ids.add(item.id);names.add(item.name);mimes.add(item.mime);}
         if(ids.contains(e.id)){intent.putStringArrayListExtra("browse_ids",ids);intent.putStringArrayListExtra("browse_names",names);intent.putStringArrayListExtra("browse_mimes",mimes);intent.putExtra("browse_index",ids.indexOf(e.id));}
         startActivity(intent);
     }

@@ -83,6 +83,7 @@ func runHub() error {
 	mux.HandleFunc("DELETE /api/session", hub.logout)
 	mux.Handle("GET /api/hub/nodes", hub.requireSession(http.HandlerFunc(hub.listNodes)))
 	mux.Handle("PUT /api/hub/nodes/active", hub.requireSession(http.HandlerFunc(hub.selectNode)))
+	mux.Handle("DELETE /api/hub/nodes/{id}", hub.requireSession(http.HandlerFunc(hub.removeOfflineNode)))
 	mux.Handle("GET /api/hub/cloud/overview", hub.requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if cloud == nil {
 			w.Header().Set("Cache-Control", "no-store")
@@ -90,6 +91,13 @@ func runHub() error {
 			return
 		}
 		cloud.overview(w, r)
+	})))
+	mux.Handle("DELETE /api/hub/cloud/nodes/{id}", hub.requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if cloud == nil {
+			writeError(w, http.StatusNotFound, "云层未启用")
+			return
+		}
+		cloud.removeOfflineNode(w, r)
 	})))
 	mux.Handle("/api/", hub.requireSession(http.HandlerFunc(hub.proxy)))
 	mux.Handle("/", http.FileServer(http.FS(static)))

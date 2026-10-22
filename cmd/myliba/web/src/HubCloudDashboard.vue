@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref, watch } from "vue";
 import { HardDrive, RefreshCw, X } from "@lucide/vue";
-import { getHubCloudOverview, type HubCloudOverview } from "./api";
+import { getHubCloudOverview, removeHubCloudNode, type HubCloudOverview, type HubCloudNode } from "./api";
 
 const open = ref(false);
 const loading = ref(false);
@@ -18,6 +18,11 @@ async function show() {
   loading.value = true;
   await refresh();
   loading.value = false;
+}
+async function removeNode(node: HubCloudNode) {
+  if (!window.confirm(`移除离线节点 ${node.id} 的 Hub 登记？若它还有唯一的文件块副本，今后需要它重新上线才能恢复。此操作不会删除节点上的文件。`)) return;
+  try { await removeHubCloudNode(node.id); await refresh(); }
+  catch (cause) { error.value = cause instanceof Error ? cause.message : "移除节点失败"; }
 }
 function size(value?: number) {
   if (value === undefined) return "未知";
@@ -68,6 +73,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
               <small>{{ node.backend === "s3" ? "S3 / OSS" : node.backend === "openlist" ? "OpenList / 云盘" : node.backend === "webdav" ? "WebDAV / 云盘" : "本地磁盘" }} · {{ node.relayed ? (node.endpoint ? "经存储节点中继" : "中继未连接") : "直连" }} · 最近上报 {{ time(node.seenAt) }}</small>
               <small class="hub-cloud-endpoint">{{ node.endpoint || "当前无访问地址" }}</small>
               <div class="hub-cloud-node-metrics"><span>{{ node.statsReady ? node.blockCount : "未知" }} 块</span><span>副本占用 {{ size(node.blockBytes) }}</span><span>可用 {{ size(node.availableBytes) }} / {{ size(node.capacityBytes) }}</span><span>{{ node.statsReady ? node.catalogCount : "未知" }} 条索引</span></div>
+              <button v-if="!node.online" class="quiet-button" type="button" :aria-label="`移除离线节点 ${node.id}`" @click="removeNode(node)">移除离线记录</button>
             </div>
           </template>
         </div>

@@ -14,9 +14,11 @@ final class ZoomImageView extends ImageView {
     private final ScaleGestureDetector scaleGesture;
     private final GestureDetector gesture;
     private float fitScale = 1f;
+    private final java.util.function.IntConsumer onSwipe;
 
-    ZoomImageView(Context context) {
+    ZoomImageView(Context context, java.util.function.IntConsumer onSwipe) {
         super(context);
+        this.onSwipe = onSwipe;
         setScaleType(ScaleType.MATRIX);
         setContentDescription("图片预览，双指缩放，双击放大或还原");
         scaleGesture = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -38,6 +40,15 @@ final class ZoomImageView extends ImageView {
                 return true;
             }
             @Override public boolean onSingleTapConfirmed(MotionEvent e) { performClick(); return true; }
+            @Override public boolean onFling(MotionEvent first, MotionEvent last, float velocityX, float velocityY) {
+                if(first==null||last==null||onSwipe==null)return false;
+                transform.getValues(values);
+                float density=getResources().getDisplayMetrics().density;
+                float dx=last.getX()-first.getX(),dy=last.getY()-first.getY();
+                if(values[Matrix.MSCALE_X]>fitScale*1.05f||Math.abs(dx)<70*density||Math.abs(dx)<Math.abs(dy)*1.5f||Math.abs(velocityX)<250*density)return false;
+                onSwipe.accept(dx<0?1:-1);
+                return true;
+            }
         });
     }
 

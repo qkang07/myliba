@@ -90,6 +90,54 @@ func TestCloudHubOverviewRetainsOfflineNodes(t *testing.T) {
 	}
 }
 
+func TestCloudHubRemoveOfflineNode(t *testing.T) {
+	t.Setenv("MYLIBA_HUB_DATA_DIR", t.TempDir())
+	cloud, err := newCloudHub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("a", 32)
+	cloud.mu.Lock()
+	cloud.nodes[id] = cloudNode{ID: id, Role: "storage", SeenAt: time.Now().UTC()}
+	cloud.heartbeatSeen[id] = true
+	if err := cloud.saveNodesLocked(); err != nil {
+		t.Fatal(err)
+	}
+	cloud.mu.Unlock()
+	hub := &remoteHub{sessions: map[string]time.Time{"session": time.Now().Add(time.Hour)}}
+	mux := http.NewServeMux()
+	mux.Handle("DELETE /api/hub/cloud/nodes/{id}", hub.requireSession(http.HandlerFunc(cloud.removeOfflineNode)))
+	remove := func(auth bool) int {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodDelete, "/api/hub/cloud/nodes/"+id, nil)
+		request.Header.Set("Origin", "http://example.com")
+		if auth {
+			request.AddCookie(&http.Cookie{Name: hubSessionCookie, Value: "session"})
+		}
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		return response.Code
+	}
+	if code := remove(false); code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated removal: %d", code)
+	}
+	if code := remove(true); code != http.StatusConflict {
+		t.Fatalf("online removal: %d", code)
+	}
+	cloud.mu.Lock()
+	node := cloud.nodes[id]
+	node.SeenAt = time.Now().Add(-time.Minute)
+	cloud.nodes[id] = node
+	cloud.mu.Unlock()
+	if code := remove(true); code != http.StatusNoContent {
+		t.Fatalf("offline removal: %d", code)
+	}
+	restored, err := newCloudHub()
+	if err != nil || len(restored.nodes) != 0 {
+		t.Fatalf("node registry still contains removed node: %+v %v", restored, err)
+	}
+}
+
 func testCloudRuntime(t *testing.T, dir, token string) *cloudRuntime {
 	t.Helper()
 	disk, err := newCloudDisk(dir)

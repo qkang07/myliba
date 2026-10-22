@@ -104,6 +104,29 @@ func TestHubRoutesSessionToSelectedResourceNode(t *testing.T) {
 	}
 }
 
+func TestRemoveOfflineResourceNode(t *testing.T) {
+	hub := &remoteHub{
+		nodes:         map[string]*remoteNode{"old-phone": {ID: "old-phone", Name: "旧手机", Kind: "android"}},
+		selectedNodes: map[string]string{"test": "old-phone"},
+		sessions:      map[string]time.Time{"test": time.Now().Add(time.Hour)},
+	}
+	mux := http.NewServeMux()
+	mux.Handle("DELETE /api/hub/nodes/{id}", hub.requireSession(http.HandlerFunc(hub.removeOfflineNode)))
+	request := httptest.NewRequest(http.MethodDelete, "/api/hub/nodes/old-phone", nil)
+	request.Header.Set("Origin", "http://example.com")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated removal = %d", response.Code)
+	}
+	request.AddCookie(&http.Cookie{Name: hubSessionCookie, Value: "test"})
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || hub.nodes["old-phone"] != nil || hub.selectedNodes["test"] != "" {
+		t.Fatalf("offline removal = %d, nodes = %+v, selections = %+v", response.Code, hub.nodes, hub.selectedNodes)
+	}
+}
+
 func TestRTCWireRequestAcceptsBrowserAndNativeHeaders(t *testing.T) {
 	for _, input := range []string{
 		`{"type":"request","id":"1","headers":{"content-type":"application/json","range":"bytes=0-9"}}`,

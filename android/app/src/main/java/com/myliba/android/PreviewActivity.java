@@ -161,7 +161,7 @@ public final class PreviewActivity extends Activity {
                 runOnUiThread(() -> {
                     if (closing) { bitmap.recycle(); return; }
                     clearContent();
-                    ImageView image = new ZoomImageView(this);
+                    ImageView image = new ZoomImageView(this, this::navigateMedia);
                     image.setOnClickListener(v->toggleImageControls());
                     image.setImageBitmap(bitmap);
                     currentBitmap = bitmap;

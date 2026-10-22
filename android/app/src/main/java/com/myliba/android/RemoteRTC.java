@@ -26,14 +26,15 @@ final class RemoteRTC implements AutoCloseable {
     RemoteRTC(Context context,String base){this.context=context.getApplicationContext();this.base=base;}
     void configure(String cookie,JSONArray servers){this.cookie=cookie;this.servers=servers==null?new JSONArray():servers;}
     boolean connected(){DataChannel current=channel;return current!=null&&current.state()==DataChannel.State.OPEN;}
-    void connectAsync(){new Thread(()->{try{ensureConnected();}catch(Exception ignored){}},"resource-rtc-connect").start();}
+    void connectAsync(){new Thread(()->{try{ensureConnected();}catch(Exception failure){AppLog.error("Remote RTC background connection failed",failure);}},"resource-rtc-connect").start();}
     void ensureConnected()throws Exception{
         if(connected())return;
         synchronized(lock){
             if(connected())return;
             closeConnection();closed=false;
+            AppLog.info("Remote RTC connecting");
             if(cookie==null||cookie.isEmpty())throw new IOException("请先登录 Hub");
-            PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions());
+            WebRtcRuntime.ensureInitialized(context);
             if(factory==null)factory=PeerConnectionFactory.builder().createPeerConnectionFactory();
             List<PeerConnection.IceServer> ice=new ArrayList<>();
             for(int i=0;i<servers.length();i++){JSONObject server=servers.optJSONObject(i);if(server==null)continue;JSONArray urls=server.optJSONArray("urls");if(urls==null)continue;
@@ -41,10 +42,11 @@ final class RemoteRTC implements AutoCloseable {
             }
             if(ice.isEmpty())ice.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer());
             socket=new HubWebSocket(base.replaceFirst("^https:","wss:")+"/signal",null,cookie,base);
+            AppLog.info("Remote RTC signaling connected");
             CountDownLatch open=new CountDownLatch(1);
             peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
                 @Override public void onSignalingChange(PeerConnection.SignalingState state){}
-                @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){if(state==PeerConnection.IceConnectionState.FAILED||state==PeerConnection.IceConnectionState.CLOSED)open.countDown();}
+                @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Remote RTC ICE "+state);if(state==PeerConnection.IceConnectionState.FAILED||state==PeerConnection.IceConnectionState.CLOSED)open.countDown();}
                 @Override public void onIceConnectionReceivingChange(boolean value){}
                 @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){}
                 @Override public void onIceCandidate(IceCandidate candidate){try{sendSignal(new JSONObject().put("type","candidate").put("candidate",new JSONObject().put("candidate",candidate.sdp).put("sdpMid",candidate.sdpMid).put("sdpMLineIndex",candidate.sdpMLineIndex)));}catch(Exception ignored){}}
@@ -59,7 +61,7 @@ final class RemoteRTC implements AutoCloseable {
             if(channel==null)throw new IOException("RTC data channel unavailable");
             channel.registerObserver(new DataChannel.Observer(){
                 @Override public void onBufferedAmountChange(long amount){}
-                @Override public void onStateChange(){if(connected())open.countDown();}
+                @Override public void onStateChange(){AppLog.info("Remote RTC data channel state changed");if(connected())open.countDown();}
                 @Override public void onMessage(DataChannel.Buffer buffer){if(buffer.binary)return;ByteBuffer data=buffer.data;byte[] raw=new byte[data.remaining()];data.get(raw);
                     try{JSONObject message=new JSONObject(new String(raw,StandardCharsets.UTF_8));BlockingQueue<JSONObject> queue=pending.get(message.optString("id"));if(queue!=null)queue.offer(message);}catch(Exception ignored){}
                 }
@@ -67,16 +69,19 @@ final class RemoteRTC implements AutoCloseable {
             HubWebSocket signaling=socket;
             new Thread(()->readSignals(signaling),"resource-rtc-signaling").start();
             SessionDescription offer=createOffer(peer);ResourceNodeRTC.setDescription(peer,offer,true);
-            sendSignal(new JSONObject().put("type","offer").put("description",new JSONObject().put("type","offer").put("sdp",peer.getLocalDescription().description)));
+            AppLog.info("Remote RTC local offer set");
+            sendSignal(new JSONObject().put("type","offer").put("description",new JSONObject().put("type","offer").put("sdp",offer.description)));
+            AppLog.info("Remote RTC offer sent");
             if(!open.await(16,TimeUnit.SECONDS)||!connected()){closeConnection();throw new IOException("无法与资源节点建立 WebRTC 直连");}
+            AppLog.info("Remote RTC data channel open");
         }
     }
     private void readSignals(HubWebSocket signaling){
         try{while(!closed&&socket==signaling){JSONObject signal=new JSONObject(signaling.read());String type=signal.optString("type");
-            if("answer".equals(type)){JSONObject description=signal.optJSONObject("description");if(description!=null){ResourceNodeRTC.setDescription(peer,new SessionDescription(SessionDescription.Type.ANSWER,description.optString("sdp")),false);remoteReady=true;for(IceCandidate candidate:earlyCandidates)peer.addIceCandidate(candidate);earlyCandidates.clear();}}
+            if("answer".equals(type)){JSONObject description=signal.optJSONObject("description");if(description!=null){ResourceNodeRTC.setDescription(peer,new SessionDescription(SessionDescription.Type.ANSWER,description.optString("sdp")),false);AppLog.info("Remote RTC answer set");remoteReady=true;for(IceCandidate candidate:earlyCandidates)peer.addIceCandidate(candidate);earlyCandidates.clear();}}
             else if("candidate".equals(type)){JSONObject candidate=signal.optJSONObject("candidate");if(candidate!=null){IceCandidate ice=new IceCandidate(candidate.optString("sdpMid"),candidate.optInt("sdpMLineIndex"),candidate.optString("candidate"));if(remoteReady)peer.addIceCandidate(ice);else earlyCandidates.add(ice);}}
             else if("error".equals(type))throw new IOException("Hub 拒绝 RTC 信令");
-        }}catch(Exception ignored){}finally{if(socket==signaling)closeConnection();}
+        }}catch(Exception failure){if(!closed)AppLog.error("Remote RTC signaling ended",failure);}finally{if(socket==signaling)closeConnection();}
     }
     private void sendSignal(JSONObject signal)throws Exception{HubWebSocket current=socket;if(current==null)throw new IOException("RTC signaling disconnected");current.send(signal.toString());}
     private static SessionDescription createOffer(PeerConnection peer)throws Exception{
@@ -110,9 +115,10 @@ final class RemoteRTC implements AutoCloseable {
                 else if("error".equals(type))throw new IOException(message.optString("error","RTC 文件传输中断"));
                 else if("end".equals(type)){if(status==0)throw new IOException("RTC 响应无状态");JSONArray lengths=responseHeaders.optJSONArray("Content-Length");
                     if(lengths!=null&&lengths.length()>0){try{long expected=Long.parseLong(lengths.optString(0));if(expected!=total)throw new IOException("RTC 传输不完整");}catch(NumberFormatException ignored){}}
+                    AppLog.info("Remote RTC response status "+status+" bytes "+total);
                     return new Reply(status,responseHeaders,new byte[0]);}
             }
-        }finally{pending.remove(id);}
+        }catch(Exception failure){AppLog.error("Remote RTC request failed",failure);throw failure;}finally{pending.remove(id);}
     }
     private synchronized void send(JSONObject value)throws Exception{
         DataChannel current=channel;if(current==null)throw new IOException("RTC channel unavailable");

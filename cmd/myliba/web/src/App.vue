@@ -80,6 +80,7 @@ import {
   logout,
   scanRoot,
   selectResourceNode,
+  removeResourceNode,
   selectMediaStore,
   updateCollection,
   type DirectoryListing,
@@ -1238,6 +1239,14 @@ async function changeResourceNode(event: Event) {
   }
 }
 
+async function removeOfflineResourceNode(node: HubResourceNode) {
+  if (!window.confirm(`从 Hub 列表移除离线节点“${node.name}”？节点重新连接时会再次出现。`)) return;
+  try {
+    await removeResourceNode(node.id);
+    window.location.reload();
+  } catch (error) { showError(error); }
+}
+
 function openResourceFile(resource: Resource, download: boolean) {
   if (!download) {
     openDetail(resource);
@@ -1530,6 +1539,14 @@ onBeforeUnmount(() => {
                 <option v-for="node in resourceNodes" :key="node.id" :value="node.id">{{ node.name }}{{ node.kind === "android" ? " · 手机" : " · 桌面" }}{{ node.online ? "" : " · 离线" }}</option>
               </select>
             </label>
+            <details v-if="authenticated && resourceNodes.some((node) => !node.online)" class="resource-node-cleanup">
+              <summary>离线节点</summary>
+              <div class="resource-node-cleanup-list">
+                <div v-for="node in resourceNodes.filter((item) => !item.online)" :key="node.id">
+                  <span>{{ node.name }}</span><button type="button" @click="removeOfflineResourceNode(node)">移除</button>
+                </div>
+              </div>
+            </details>
             <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
               <span class="connection-dot"></span><span>Web · HTTPS 接入</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small>
             </span>

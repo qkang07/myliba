@@ -84,6 +84,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .topbar-actions { gap: 8px; }
 .resource-node-picker { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
 .resource-node-picker select { max-width: 180px; min-height: 30px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); padding: 0 6px; }
+.resource-node-cleanup { position: relative; font-size: 11px; color: var(--text-secondary); }
+.resource-node-cleanup summary { cursor: pointer; white-space: nowrap; }
+.resource-node-cleanup-list { position: absolute; top: 100%; right: 0; z-index: 20; min-width: 180px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: 0 8px 24px #0002; }
+.resource-node-cleanup-list > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px; }
+.resource-node-cleanup-list button { border: 0; background: transparent; color: var(--red); cursor: pointer; }
 .connection-badge { display: inline-flex; min-height: 29px; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--text-secondary); font-size: 11px; }
 .connection-badge.offline { color: var(--amber); }
 .traffic-badge { display: grid; grid-template-columns: 7px auto; column-gap: 7px; row-gap: 2px; min-height: 40px; align-content: center; padding: 4px 9px; border-radius: 9px; font-size: 10px; }

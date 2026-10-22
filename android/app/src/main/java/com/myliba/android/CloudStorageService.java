@@ -44,7 +44,12 @@ public final class CloudStorageService extends Service {
             String identityFile=backend.equals("disk")?"node-id":"node-id-openlist-"+hash((p.getString("openlist_url","")+"/"+p.getString("openlist_mount","")).getBytes(StandardCharsets.UTF_8)).substring(0,16);
             File idFile=new File(root,identityFile);
             if(idFile.exists())nodeId=new String(read(idFile,128),StandardCharsets.US_ASCII).trim();
-            else{byte[] random=new byte[16];new java.security.SecureRandom().nextBytes(random);nodeId=hex(random);write(idFile,nodeId.getBytes(StandardCharsets.US_ASCII));}
+            else{
+                String device=android.provider.Settings.Secure.getString(getContentResolver(),android.provider.Settings.Secure.ANDROID_ID);
+                if(device==null||device.isEmpty()){byte[] random=new byte[16];new java.security.SecureRandom().nextBytes(random);nodeId=hex(random);}
+                else nodeId=hash(("myliba-cloud-node:"+device+":"+identityFile).getBytes(StandardCharsets.UTF_8)).substring(0,32);
+                write(idFile,nodeId.getBytes(StandardCharsets.US_ASCII));
+            }
             if(!nodeId.matches("[0-9a-f]{32}"))throw new IOException("节点 ID 无效");
             if(publicUrl.isEmpty())publicUrl=relayUrl.isEmpty()?"p2p://"+nodeId:relayUrl+"/cloud/relay/"+nodeId;
             if(!publicUrl.startsWith("p2p://")){listener=new ServerSocket();listener.setReuseAddress(true);listener.bind(new InetSocketAddress(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"127.0.0.1":"0.0.0.0",port));}
@@ -55,14 +60,15 @@ public final class CloudStorageService extends Service {
             .setContentTitle("Myliba 云层存储节点运行中").setContentText((openlist==null?"本机磁盘":"OpenList 云盘")+" · 只存储加密文件块").setContentIntent(click).setOngoing(true).build();
         if(Build.VERSION.SDK_INT>=34)startForeground(4319,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);else startForeground(4319,notification);
         stopped=false;running=true;status="等待 Hub 注册";
+        AppLog.info("Cloud storage node starting; transport "+(publicUrl.startsWith("p2p://")?"p2p":publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"relay":"direct"));
         if(listener!=null)workers.execute(()->{while(!stopped){try{Socket socket=listener.accept();workers.execute(()->serve(socket));}catch(IOException ex){if(!stopped)break;}}});
-        workers.execute(()->{while(!stopped){try{syncHub();status="已向 Hub 注册";}catch(Exception ex){status="Hub 同步失败："+ex.getMessage();}try{Thread.sleep(20000);}catch(InterruptedException ex){break;}}});
+        workers.execute(()->{while(!stopped){try{syncHub();status="已向 Hub 注册";AppLog.info("Cloud storage node registered with Hub");}catch(Exception ex){AppLog.error("Cloud storage Hub sync failed",ex);status="Hub 同步失败："+ex.getMessage();}try{Thread.sleep(20000);}catch(InterruptedException ex){break;}}});
         if(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)){relayClient=new CloudRelayClient(relayUrl,nodeId,token,port);new Thread(()->relayClient.run(()->stopped),"cloud-relay").start();}
         if(publicUrl.startsWith("p2p://")){peerClient=new CloudPeerClient(this,hub,nodeId,token);new Thread(()->peerClient.run(()->stopped),"cloud-peer").start();}
         return START_STICKY;
     }
 
-    @Override public void onDestroy(){stopped=true;running=false;relayConnected=false;status="已停止";if(relayClient!=null)relayClient.close();if(peerClient!=null)peerClient.close();try{if(listener!=null)listener.close();}catch(IOException ignored){}workers.shutdownNow();super.onDestroy();}
+    @Override public void onDestroy(){AppLog.info("Cloud storage node stopping");stopped=true;running=false;relayConnected=false;status="已停止";if(relayClient!=null)relayClient.close();if(peerClient!=null)peerClient.close();try{if(listener!=null)listener.close();}catch(IOException ignored){}workers.shutdownNow();super.onDestroy();}
     @Override public IBinder onBind(Intent intent){return null;}
 
     private static String hex(byte[] data){StringBuilder b=new StringBuilder(data.length*2);for(byte value:data)b.append(String.format(Locale.ROOT,"%02x",value&255));return b.toString();}

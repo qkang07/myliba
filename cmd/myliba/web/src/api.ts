@@ -172,6 +172,10 @@ export function selectResourceNode(id: string) {
   });
 }
 
+export function removeResourceNode(id: string) {
+  return request<void>(`/api/hub/nodes/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
 export interface HubProfile {
   id: string;
   name: string;
@@ -308,6 +312,10 @@ export interface HubCloudOverview {
 
 export function getHubCloudOverview() {
   return request<HubCloudOverview>("/api/hub/cloud/overview");
+}
+
+export function removeHubCloudNode(id: string) {
+  return request<void>(`/api/hub/cloud/nodes/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export interface CloudView {

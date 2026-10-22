@@ -118,6 +118,37 @@ func (c *cloudHub) online(node cloudNode, now time.Time) bool {
 	return c.heartbeatSeen[node.ID] && now.Sub(node.SeenAt) <= cloudOnlineWindow
 }
 
+func (c *cloudHub) removeOfflineNode(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || len(id) > 128 {
+		writeError(w, http.StatusBadRequest, "节点 ID 无效")
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	node, exists := c.nodes[id]
+	if !exists {
+		writeError(w, http.StatusNotFound, "节点不存在")
+		return
+	}
+	if c.online(node, time.Now().UTC()) {
+		writeError(w, http.StatusConflict, "节点仍在线，不能移除")
+		return
+	}
+	wasSeen := c.heartbeatSeen[id]
+	delete(c.nodes, id)
+	delete(c.heartbeatSeen, id)
+	if err := c.saveNodesLocked(); err != nil {
+		c.nodes[id] = node
+		if wasSeen {
+			c.heartbeatSeen[id] = true
+		}
+		writeError(w, http.StatusInternalServerError, "保存节点列表失败")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (c *cloudHub) overview(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	nodes := []struct {

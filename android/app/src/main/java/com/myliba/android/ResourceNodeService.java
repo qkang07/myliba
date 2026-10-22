@@ -4,6 +4,7 @@ import android.app.*;
 import android.content.*;
 import android.content.pm.ServiceInfo;
 import android.os.*;
+import android.provider.Settings;
 import android.util.Base64;
 import org.json.*;
 import java.io.*;
@@ -30,14 +31,19 @@ public final class ResourceNodeService extends Service {
         hub=p.getString("hub","");name=p.getString("name",android.os.Build.MODEL);
         try{token=CloudSecretStore.read(p,"token");}catch(Exception ex){status="节点密钥读取失败";stopSelf();return START_NOT_STICKY;}
         if(!hub.startsWith("https://")||token.length()<32||name.trim().isEmpty()){status="资源节点配置无效";stopSelf();return START_NOT_STICKY;}
-        id=p.getString("id","");if(id.isEmpty()){id=UUID.randomUUID().toString();p.edit().putString("id",id).apply();}
+        id=p.getString("id","");if(id.isEmpty()){
+            String device=Settings.Secure.getString(getContentResolver(),Settings.Secure.ANDROID_ID);
+            id=device==null||device.isEmpty()?UUID.randomUUID().toString():UUID.nameUUIDFromBytes(("myliba-resource-node:"+device).getBytes(StandardCharsets.UTF_8)).toString();
+            p.edit().putString("id",id).apply();
+        }
         Intent open=new Intent(this,MainActivity.class);PendingIntent click=PendingIntent.getActivity(this,1,open,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
         Notification notification=new Notification.Builder(this,"resource-node").setSmallIcon(android.R.drawable.stat_sys_upload)
             .setContentTitle("Myliba 手机资源节点运行中").setContentText("经 Hub 向其他客户端开放已索引资源")
             .setContentIntent(click).setOngoing(true).build();
         if(Build.VERSION.SDK_INT>=34)startForeground(4320,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);else startForeground(4320,notification);
         api=new NodeResourceApi(this);stopped=false;running=true;status="正在连接 Hub";
-        try{rtc=new ResourceNodeRTC(this,api,workers);}catch(Exception ex){status="WebRTC 启动失败："+ex.getMessage();running=false;api.close();stopSelf();return START_NOT_STICKY;}
+        AppLog.info("Resource node starting");
+        try{rtc=new ResourceNodeRTC(this,api,workers);}catch(Exception ex){AppLog.error("Resource node WebRTC startup failed",ex);status="WebRTC 启动失败："+ex.getMessage();running=false;api.close();stopSelf();return START_NOT_STICKY;}
         workers.execute(this::run);
         return START_STICKY;
     }
@@ -47,13 +53,14 @@ public final class ResourceNodeService extends Service {
             try{
                 String wss=hub.replaceFirst("^https:","wss:")+"/node?id="+id+"&name="+java.net.URLEncoder.encode(name,"UTF-8")+"&kind=android";
                 HubWebSocket current=new HubWebSocket(wss,token,null,null);socket=current;rtc.setSocket(current);status="已向 Hub 注册 · 等待客户端直连";
+                AppLog.info("Resource node registered with Hub");
                 workers.execute(()->{while(!stopped&&socket==current){try{Thread.sleep(25000);if(!stopped&&socket==current)current.ping();}catch(Exception ex){current.close();return;}}});
                 while(!stopped){JSONObject frame=new JSONObject(current.read());String type=frame.optString("type");
                     if("request".equals(type))workers.execute(()->respond(current,frame));
                     else if("rtc-signal".equals(type))rtc.signal(frame);
                     else if("node-config".equals(type))rtc.setICEServers(frame.optJSONArray("iceServers"));
                 }
-            }catch(Exception ex){if(!stopped)status="Hub 连接中断，正在重试："+ex.getMessage();}
+            }catch(Exception ex){if(!stopped){AppLog.error("Resource node Hub connection interrupted",ex);status="Hub 连接中断，正在重试："+ex.getMessage();}}
             HubWebSocket old=socket;socket=null;if(old!=null)old.close();rtc.closeSessions();
             if(!stopped)try{Thread.sleep(3000);}catch(InterruptedException ex){Thread.currentThread().interrupt();break;}
         }
@@ -76,6 +83,6 @@ public final class ResourceNodeService extends Service {
         finally{try{current.send(new JSONObject().put("type","end").put("id",requestID).toString());}catch(Exception ignored){}}
     }
 
-    @Override public void onDestroy(){stopped=true;running=false;status="已停止";HubWebSocket current=socket;if(current!=null)current.close();if(rtc!=null)rtc.close();if(api!=null)api.close();workers.shutdownNow();super.onDestroy();}
+    @Override public void onDestroy(){AppLog.info("Resource node stopping");stopped=true;running=false;status="已停止";HubWebSocket current=socket;if(current!=null)current.close();if(rtc!=null)rtc.close();if(api!=null)api.close();workers.shutdownNow();super.onDestroy();}
     @Override public IBinder onBind(Intent intent){return null;}
 }

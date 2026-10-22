@@ -120,3 +120,31 @@ func (h *remoteHub) selectNode(w http.ResponseWriter, r *http.Request) {
 	}
 	h.listNodes(w, r)
 }
+
+func (h *remoteHub) removeOfflineNode(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRemoteNodeID(id) {
+		writeError(w, http.StatusBadRequest, "节点 ID 无效")
+		return
+	}
+	h.mu.Lock()
+	node := h.nodes[id]
+	if node == nil {
+		h.mu.Unlock()
+		writeError(w, http.StatusNotFound, "节点不存在")
+		return
+	}
+	if node.Conn != nil {
+		h.mu.Unlock()
+		writeError(w, http.StatusConflict, "节点仍在线，不能移除")
+		return
+	}
+	delete(h.nodes, id)
+	for session, selected := range h.selectedNodes {
+		if selected == id {
+			delete(h.selectedNodes, session)
+		}
+	}
+	h.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
