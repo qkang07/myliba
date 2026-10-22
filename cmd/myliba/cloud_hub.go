@@ -27,6 +27,8 @@ type cloudHub struct {
 	mu            sync.Mutex
 	nodes         map[string]cloudNode
 	heartbeatSeen map[string]bool
+	signals       map[string][]cloudPeerSignal
+	signalWake    map[string]chan struct{}
 	disk          *cloudDisk
 	registryPath  string
 }
@@ -44,7 +46,7 @@ func newCloudHub() (*cloudHub, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &cloudHub{nodes: map[string]cloudNode{}, heartbeatSeen: map[string]bool{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json")}
+	c := &cloudHub{nodes: map[string]cloudNode{}, heartbeatSeen: map[string]bool{}, signals: map[string][]cloudPeerSignal{}, signalWake: map[string]chan struct{}{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json")}
 	if data, err := os.ReadFile(c.registryPath); err == nil {
 		var saved []cloudNode
 		if err := json.Unmarshal(data, &saved); err != nil {
@@ -64,6 +66,9 @@ func newCloudHub() (*cloudHub, error) {
 
 func validCloudNode(node cloudNode) bool {
 	if relayID := cloudRelayEndpointID(node.Endpoint); (relayID != "" && node.ID != relayID) || (node.Relayed && node.Endpoint != "" && relayID == "") {
+		return false
+	}
+	if strings.HasPrefix(node.Endpoint, "p2p://") && node.Endpoint != "p2p://"+node.ID {
 		return false
 	}
 	return node.ID != "" && len(node.ID) <= 128 && validCloudEndpoint(node.Endpoint) &&
@@ -171,6 +176,9 @@ func validCloudEndpoint(raw string) bool {
 	if raw == "" {
 		return true
 	}
+	if strings.HasPrefix(raw, "p2p://") {
+		return validCloudNodeID(strings.TrimPrefix(raw, "p2p://"))
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/" && cloudRelayEndpointID(raw) == "") {
 		return false
@@ -184,7 +192,122 @@ func validCloudEndpoint(raw string) bool {
 	return false
 }
 
+func validCloudNodeID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, ch := range id {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+type cloudPeerSignal struct {
+	From    string    `json:"from"`
+	To      string    `json:"to"`
+	Session string    `json:"session"`
+	Type    string    `json:"type"`
+	SDP     string    `json:"sdp"`
+	Created time.Time `json:"-"`
+}
+
+func (c *cloudHub) signalRoutes(mux *http.ServeMux, token string) {
+	mux.Handle("GET /cloud/ice", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		servers, err := loadICEServers()
+		if err != nil {
+			http.Error(w, "ICE unavailable", 503)
+			return
+		}
+		direct := make([]iceServerConfig, 0, len(servers))
+		for _, server := range servers {
+			urls := make([]string, 0, len(server.URLs))
+			for _, u := range server.URLs {
+				if strings.HasPrefix(strings.ToLower(u), "stun:") || strings.HasPrefix(strings.ToLower(u), "stuns:") {
+					urls = append(urls, u)
+				}
+			}
+			if len(urls) > 0 {
+				direct = append(direct, iceServerConfig{URLs: urls})
+			}
+		}
+		writeJSON(w, 200, map[string]any{"servers": direct})
+	}), token))
+	mux.Handle("POST /cloud/signal", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var signal cloudPeerSignal
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&signal); err != nil || !validCloudNodeID(signal.From) || !validCloudNodeID(signal.To) || signal.From == signal.To || !validCloudNodeID(signal.Session) || (signal.Type != "offer" && signal.Type != "answer") || len(signal.SDP) > 100<<10 || len(signal.SDP) == 0 {
+			http.Error(w, "invalid signal", 400)
+			return
+		}
+		now := time.Now().UTC()
+		c.mu.Lock()
+		sender, senderOK := c.nodes[signal.From]
+		target, targetOK := c.nodes[signal.To]
+		if !senderOK || !targetOK || !c.online(sender, now) || !c.online(target, now) {
+			c.mu.Unlock()
+			http.Error(w, "node offline", 404)
+			return
+		}
+		queue := c.signals[signal.To][:0]
+		for _, entry := range c.signals[signal.To] {
+			if now.Sub(entry.Created) < 60*time.Second {
+				queue = append(queue, entry)
+			}
+		}
+		if len(queue) >= 32 {
+			c.mu.Unlock()
+			http.Error(w, "signal queue full", 429)
+			return
+		}
+		signal.Created = now
+		c.signals[signal.To] = append(queue, signal)
+		if wake := c.signalWake[signal.To]; wake != nil {
+			close(wake)
+			delete(c.signalWake, signal.To)
+		}
+		c.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}), token))
+	mux.Handle("GET /cloud/signal/{id}", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if !validCloudNodeID(id) {
+			http.Error(w, "invalid node", 400)
+			return
+		}
+		c.mu.Lock()
+		if len(c.signals[id]) == 0 && r.URL.Query().Get("wait") == "1" {
+			wake := c.signalWake[id]
+			if wake == nil {
+				wake = make(chan struct{})
+				c.signalWake[id] = wake
+			}
+			c.mu.Unlock()
+			select {
+			case <-wake:
+			case <-time.After(20 * time.Second):
+			case <-r.Context().Done():
+				return
+			}
+			c.mu.Lock()
+			if c.signalWake[id] == wake {
+				delete(c.signalWake, id)
+			}
+		}
+		messages := []cloudPeerSignal{}
+		for _, entry := range c.signals[id] {
+			if time.Since(entry.Created) < 60*time.Second {
+				messages = append(messages, entry)
+			}
+		}
+		delete(c.signals, id)
+		c.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"messages": messages})
+	}), token))
+}
+
 func (c *cloudHub) routes(mux *http.ServeMux, token string) {
+	c.signalRoutes(mux, token)
 	mux.Handle("POST /cloud/nodes/heartbeat", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var node cloudNode
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&node); err != nil || !validCloudNode(node) {

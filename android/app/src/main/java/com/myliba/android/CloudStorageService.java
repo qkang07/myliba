@@ -25,6 +25,7 @@ public final class CloudStorageService extends Service {
     private volatile boolean stopped;
     private String token,hub,publicUrl,relayUrl,nodeId,backend;
     private CloudRelayClient relayClient;
+    private CloudPeerClient peerClient;
     private CloudOpenListBackend openlist;
     private File root;
     private int port;
@@ -36,7 +37,7 @@ public final class CloudStorageService extends Service {
         try{token=CloudSecretStore.read(p,"token");}catch(Exception ex){status="云层令牌读取失败";stopSelf();return START_NOT_STICKY;}
         hub=p.getString("hub","");publicUrl=p.getString("url","");relayUrl=p.getString("relay","");backend=p.getString("backend","disk");port=p.getInt("port",4319);
         activeBackend=backend;
-        if(token.length()<32||token.contains("\r")||token.contains("\n")||!hub.startsWith("https://")||(!publicUrl.startsWith("https://")&&!relayUrl.startsWith("https://"))||port<1||port>65535||!(backend.equals("disk")||backend.equals("openlist"))){status="配置无效";stopSelf();return START_NOT_STICKY;}
+        if(token.length()<32||token.contains("\r")||token.contains("\n")||!hub.startsWith("https://")||(!publicUrl.isEmpty()&&!publicUrl.startsWith("https://"))||(!relayUrl.isEmpty()&&!relayUrl.startsWith("https://"))||port<1||port>65535||!(backend.equals("disk")||backend.equals("openlist"))){status="配置无效";stopSelf();return START_NOT_STICKY;}
         root=new File(getFilesDir(),"cloud-node");new File(root,"blocks").mkdirs();new File(root,"catalog").mkdirs();
         try{
             if(backend.equals("openlist"))openlist=new CloudOpenListBackend(p.getString("openlist_url",""),p.getString("openlist_mount",""),p.getString("openlist_user",""),CloudSecretStore.read(p,"openlist_password"));
@@ -45,8 +46,8 @@ public final class CloudStorageService extends Service {
             if(idFile.exists())nodeId=new String(read(idFile,128),StandardCharsets.US_ASCII).trim();
             else{byte[] random=new byte[16];new java.security.SecureRandom().nextBytes(random);nodeId=hex(random);write(idFile,nodeId.getBytes(StandardCharsets.US_ASCII));}
             if(!nodeId.matches("[0-9a-f]{32}"))throw new IOException("节点 ID 无效");
-            if(publicUrl.isEmpty())publicUrl=relayUrl+"/cloud/relay/"+nodeId;
-            listener=new ServerSocket();listener.setReuseAddress(true);listener.bind(new InetSocketAddress(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"127.0.0.1":"0.0.0.0",port));
+            if(publicUrl.isEmpty())publicUrl=relayUrl.isEmpty()?"p2p://"+nodeId:relayUrl+"/cloud/relay/"+nodeId;
+            if(!publicUrl.startsWith("p2p://")){listener=new ServerSocket();listener.setReuseAddress(true);listener.bind(new InetSocketAddress(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"127.0.0.1":"0.0.0.0",port));}
         }catch(Exception ex){status="存储节点启动失败："+ex.getMessage();stopSelf();return START_NOT_STICKY;}
         Intent open=new Intent(this,MainActivity.class);
         PendingIntent click=PendingIntent.getActivity(this,0,open,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
@@ -54,13 +55,14 @@ public final class CloudStorageService extends Service {
             .setContentTitle("Myliba 云层存储节点运行中").setContentText((openlist==null?"本机磁盘":"OpenList 云盘")+" · 只存储加密文件块").setContentIntent(click).setOngoing(true).build();
         if(Build.VERSION.SDK_INT>=34)startForeground(4319,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);else startForeground(4319,notification);
         stopped=false;running=true;status="等待 Hub 注册";
-        workers.execute(()->{while(!stopped){try{Socket socket=listener.accept();workers.execute(()->serve(socket));}catch(IOException ex){if(!stopped)break;}}});
+        if(listener!=null)workers.execute(()->{while(!stopped){try{Socket socket=listener.accept();workers.execute(()->serve(socket));}catch(IOException ex){if(!stopped)break;}}});
         workers.execute(()->{while(!stopped){try{syncHub();status="已向 Hub 注册";}catch(Exception ex){status="Hub 同步失败："+ex.getMessage();}try{Thread.sleep(20000);}catch(InterruptedException ex){break;}}});
         if(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)){relayClient=new CloudRelayClient(relayUrl,nodeId,token,port);new Thread(()->relayClient.run(()->stopped),"cloud-relay").start();}
+        if(publicUrl.startsWith("p2p://")){peerClient=new CloudPeerClient(this,hub,nodeId,token);new Thread(()->peerClient.run(()->stopped),"cloud-peer").start();}
         return START_STICKY;
     }
 
-    @Override public void onDestroy(){stopped=true;running=false;relayConnected=false;status="已停止";if(relayClient!=null)relayClient.close();try{if(listener!=null)listener.close();}catch(IOException ignored){}workers.shutdownNow();super.onDestroy();}
+    @Override public void onDestroy(){stopped=true;running=false;relayConnected=false;status="已停止";if(relayClient!=null)relayClient.close();if(peerClient!=null)peerClient.close();try{if(listener!=null)listener.close();}catch(IOException ignored){}workers.shutdownNow();super.onDestroy();}
     @Override public IBinder onBind(Intent intent){return null;}
 
     private static String hex(byte[] data){StringBuilder b=new StringBuilder(data.length*2);for(byte value:data)b.append(String.format(Locale.ROOT,"%02x",value&255));return b.toString();}
@@ -91,6 +93,24 @@ public final class CloudStorageService extends Service {
         if(!head)out.write(body);out.flush();
     }
     private static byte[] json(JSONObject value){return value.toString().getBytes(StandardCharsets.UTF_8);}
+    static final class PeerResult {final int status;final byte[] data;PeerResult(int status,byte[] data){this.status=status;this.data=data;}}
+    PeerResult peerRequest(String method,String path,String suppliedToken,byte[] data){
+        try{
+            if(!MessageDigest.isEqual(token.getBytes(StandardCharsets.UTF_8),suppliedToken.getBytes(StandardCharsets.UTF_8)))return new PeerResult(401,new byte[0]);
+            URI uri=new URI(path);String route=uri.getPath();
+            if("GET".equals(method)&&"/cloud/catalog".equals(route))return new PeerResult(200,json(new JSONObject().put("records",new JSONArray(list("catalog")))));
+            if("GET".equals(method)&&"/cloud/inventory".equals(route)){
+                String after=uri.getRawQuery()==null?"":uri.getRawQuery().replaceFirst("^after=","");if(!after.isEmpty()&&!validId(after))return new PeerResult(400,new byte[0]);
+                List<String> ids=list("blocks");int start=0;while(start<ids.size()&&ids.get(start).compareTo(after)<=0)start++;int end=Math.min(start+1000,ids.size());
+                JSONArray page=new JSONArray();for(int i=start;i<end;i++)page.put(ids.get(i));String next=end<ids.size()?ids.get(end-1):"";
+                return new PeerResult(200,json(new JSONObject().put("blocks",page).put("next",next)));
+            }
+            String[] parts=route.split("/");if(parts.length!=4||!"cloud".equals(parts[1])||!("blocks".equals(parts[2])||"catalog".equals(parts[2]))||!validId(parts[3]))return new PeerResult(404,new byte[0]);
+            if("PUT".equals(method)){put(parts[2],parts[3],data);return new PeerResult(204,new byte[0]);}
+            if("GET".equals(method)||"HEAD".equals(method)){byte[] value=get(parts[2],parts[3]);return new PeerResult(200,"HEAD".equals(method)?new byte[0]:value);}
+            return new PeerResult(400,new byte[0]);
+        }catch(FileNotFoundException ex){return new PeerResult(404,new byte[0]);}catch(Exception ex){return new PeerResult(503,new byte[0]);}
+    }
     private void serve(Socket socket){
         try(Socket client=socket){client.setSoTimeout(30000);InputStream in=new BufferedInputStream(client.getInputStream());OutputStream out=client.getOutputStream();
             String[] first=line(in).split(" ");if(first.length<2){respond(out,400,"text/plain",new byte[0],false);return;}

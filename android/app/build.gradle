@@ -2,6 +2,10 @@ plugins {
     id 'com.android.application'
 }
 
+dependencies {
+    implementation 'io.github.webrtc-sdk:android:150.7871.01'
+}
+
 android {
     namespace 'com.myliba.android'
     compileSdk 36
@@ -10,8 +14,8 @@ android {
         applicationId 'com.myliba.android'
         minSdk 26
         targetSdk 36
-        versionCode 3
-        versionName '0.3.0'
+        versionCode 4
+        versionName '0.4.0'
     }
 
     compileOptions {

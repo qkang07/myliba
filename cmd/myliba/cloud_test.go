@@ -142,6 +142,12 @@ func TestCloudSingleLocalNodeWithoutHubOrToken(t *testing.T) {
 	if !runtime.disk.valid("blocks", blockID) || len(runtime.blockLocations(blockID)) != 1 || len(runtime.activePeers()) != 0 {
 		t.Fatal("local block must be indexed as one replica without peers")
 	}
+	listResponse := httptest.NewRecorder()
+	client.list(listResponse, httptest.NewRequest(http.MethodGet, "/api/cloud/files", nil))
+	var listing map[string]json.RawMessage
+	if err := json.Unmarshal(listResponse.Body.Bytes(), &listing); listResponse.Code != http.StatusOK || err != nil || string(listing["peers"]) != "[]" {
+		t.Fatalf("single-node cloud listing must return an empty peers array: status=%d body=%s", listResponse.Code, listResponse.Body.String())
+	}
 	reopenedRuntime, err := newCloudRuntime(nil, false)
 	if err != nil || reopenedRuntime.id != runtime.id {
 		t.Fatalf("reopened node: %+v, %v", reopenedRuntime, err)

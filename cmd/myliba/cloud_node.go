@@ -39,6 +39,7 @@ type cloudRuntime struct {
 	relayMu    sync.RWMutex
 	relays     map[string]*cloudRelayConn
 	relayReady atomic.Bool
+	p2pMu      sync.Mutex
 }
 
 func cloudDataDir(storageOnly bool) (string, error) {
@@ -165,6 +166,9 @@ func (c *cloudRuntime) request(ctx context.Context, method, base, path, token st
 	if !validCloudEndpoint(base) || base == "" {
 		return nil, errors.New("invalid cloud endpoint")
 	}
+	if strings.HasPrefix(base, "p2p://") {
+		return c.p2pRequest(ctx, method, strings.TrimPrefix(base, "p2p://"), path, token, body)
+	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, body)
 	if err != nil {
 		return nil, err
@@ -283,7 +287,7 @@ func (c *cloudRuntime) syncCatalog(ctx context.Context, base, token string) erro
 func (c *cloudRuntime) activePeers() []cloudNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	result := append([]cloudNode(nil), c.peers...)
+	result := append([]cloudNode{}, c.peers...)
 	return result
 }
 

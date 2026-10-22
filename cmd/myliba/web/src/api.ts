@@ -304,8 +304,9 @@ export interface CloudView {
   directEndpoint: string;
 }
 
-export function getCloudFiles() {
-  return request<CloudView>("/api/cloud/files");
+export async function getCloudFiles(): Promise<CloudView> {
+  const view = await request<CloudView>("/api/cloud/files");
+  return { ...view, peers: view.peers ?? [] };
 }
 
 export function uploadResourceToCloud(id: string, history?: boolean) {

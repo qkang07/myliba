@@ -100,7 +100,7 @@ public final class MainActivity extends Activity {
         LinearLayout card=ui.card();nodeTitle=ui.text("",20,INK,true);card.addView(nodeTitle);
         nodeStatus=ui.text("",13,GREEN,false);card.addView(nodeStatus,ui.top(8));
         card.addView(ui.text("云层块存储："+(openlist?"OpenList · "+settings.getString("openlist_mount",""):"本手机的应用存储空间"),12,MUTED,false),ui.top(15));
-        String access=settings.getString("url","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"公网直连";
+        String access=!settings.getString("url","").isEmpty()?"公网直连":!settings.getString("relay","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"Hub 协助节点直连";
         nodeAccess=ui.text("访问："+access,12,MUTED,false);card.addView(nodeAccess,ui.top(6));
         nodeCounts=ui.text("",13,INK,false);card.addView(nodeCounts,ui.top(15));
         nodeCapacity=ui.text("",12,MUTED,false);card.addView(nodeCapacity,ui.top(5));
@@ -119,7 +119,7 @@ public final class MainActivity extends Activity {
         nodeCapacity.setVisibility(CloudStorageService.capacityBytes>0?View.VISIBLE:View.GONE);
         if(CloudStorageService.capacityBytes>0)nodeCapacity.setText("可用 "+size(CloudStorageService.availableBytes)+" / "+size(CloudStorageService.capacityBytes));
         android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
-        nodeAccess.setText("访问："+(settings.getString("url","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"公网直连"));
+        nodeAccess.setText("访问："+(!settings.getString("url","").isEmpty()?"公网直连":!settings.getString("relay","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"Hub 协助节点直连"));
         nodeConfigure.setText(active?"配置并重启":"配置并启动");nodeStop.setVisibility(active?View.VISIBLE:View.GONE);
     }
     private void renderNav(){
@@ -278,7 +278,7 @@ public final class MainActivity extends Activity {
         LinearLayout body=scrollBody();body.addView(ui.text("连接文件所在的地方。",13,MUTED,false));
         LinearLayout current=ui.card();LinearLayout head=ui.row();ImageView symbol=ui.icon(home?"server":"phone",44,GREEN);ui.pad(symbol,10,10);symbol.setBackground(ui.shape(SOFT,14,0));head.addView(symbol);LinearLayout copy=ui.col();copy.setPadding(ui.d(12),0,0,0);copy.addView(ui.text(home?"家中资源库":"这台手机",17,INK,true));copy.addView(ui.text(home?(hubStore==null?"尚未连接":needsLogin?"需要登录":error.isEmpty()?(meta.online?"节点在线":"等待家中节点"):"连接中断"):"本地索引 · 离线可用",11,MUTED,false),ui.top(5));head.addView(copy,ui.weight());current.addView(head);current.addView(ui.text(home?(hubStore==null?"添加服务端地址，在手机上浏览家中资源。":hubStore.client.base):"只访问你授权的文件夹，不移动原文件。",12,MUTED,false),ui.top(15));
         if(home){current.addView(ui.button(hubStore==null?"连接服务端":"连接设置",true,this::connectSheet),ui.top(16));if(hubStore!=null)current.addView(ui.button("退出登录",false,this::logout),ui.top(8));}else current.addView(ui.button(scanning?"正在扫描…":"添加索引目录",true,this::pickTree),ui.top(16));body.addView(current,ui.top(20));
-        if(!home){section(body,"云层存储节点",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"用这台手机存储加密块",CloudStorageService.running?"端口 4319 · "+CloudStorageService.status:"可用公网 HTTPS 地址或存储中继",this::cloudStorageSheet),ui.top(10));body.addView(ui.item("shield","切换为仅存储模式","保留同一 APK，只显示节点运行与配置",this::enterStorageMode),ui.top(9));}
+        if(!home){section(body,"云层存储节点",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"用这台手机存储加密块",CloudStorageService.running?CloudStorageService.status:"只填 Hub 和云层令牌即可尝试节点直连",this::cloudStorageSheet),ui.top(10));body.addView(ui.item("shield","切换为仅存储模式","保留同一 APK，只显示节点运行与配置",this::enterStorageMode),ui.top(9));}
         if(!scanMessage.isEmpty()&&!home)body.addView(ui.text(scanMessage,12,GREEN,false),ui.top(12));if(!error.isEmpty())body.addView(errorCard(),ui.top(12));
         section(body,"索引目录",meta.roots.size()+" 个",null);
         if(meta.roots.isEmpty())body.addView(ui.text(home?"连接后可查看服务端已配置的目录。":"在这里添加照片、下载或工作资料文件夹。",12,MUTED,false),ui.top(10));
@@ -303,13 +303,13 @@ public final class MainActivity extends Activity {
         sheet.body.addView(openlistFields,ui.top(17));openlistFields.setVisibility(backendChoice.getSelectedItemPosition()==1?View.VISIBLE:View.GONE);
         backendChoice.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){public void onNothingSelected(android.widget.AdapterView<?> parent){}public void onItemSelected(android.widget.AdapterView<?> parent,View view,int position,long id){openlistFields.setVisibility(position==1?View.VISIBLE:View.GONE);}});
         sheet.body.addView(ui.text("Hub HTTPS 地址",12,INK,true));EditText hub=ui.input("https://hub.example.com",settings.getString("hub",""));sheet.body.addView(hub,ui.top(7));
-        sheet.body.addView(ui.text("手机的直连 HTTPS 地址",12,INK,true),ui.top(16));EditText endpoint=ui.input("https://phone.example.com",settings.getString("url",""));sheet.body.addView(endpoint,ui.top(7));
-        sheet.body.addView(ui.text("存储中继 HTTPS 地址（直连不可用时填写）",12,INK,true),ui.top(16));EditText relay=ui.input("https://storage.example.com",settings.getString("relay",""));sheet.body.addView(relay,ui.top(7));
+        sheet.body.addView(ui.text("手机的直连 HTTPS 地址（可选）",12,INK,true),ui.top(16));EditText endpoint=ui.input("https://phone.example.com",settings.getString("url",""));sheet.body.addView(endpoint,ui.top(7));
+        sheet.body.addView(ui.text("存储中继 HTTPS 地址（可选）",12,INK,true),ui.top(16));EditText relay=ui.input("https://storage.example.com",settings.getString("relay",""));sheet.body.addView(relay,ui.top(7));
         sheet.body.addView(ui.text("云层令牌",12,INK,true),ui.top(16));EditText secret=ui.input("与 Hub 的 MYLIBA_CLOUD_TOKEN 相同",storedToken);secret.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);sheet.body.addView(secret,ui.top(7));
-        TextView validation=ui.text("没有手机公网地址时，只填存储中继地址。中继节点需启用 MYLIBA_CLOUD_RELAY_ENABLED=1。",12,MUTED,false);sheet.body.addView(validation,ui.top(14));
+        TextView validation=ui.text("两个可选地址都留空时，Hub 只负责信令，文件块由节点 WebRTC 直连传输。若网络无法建立直连，可另配存储中继。",12,MUTED,false);sheet.body.addView(validation,ui.top(14));
         sheet.footer.addView(ui.button(CloudStorageService.running?"保存并重启节点":"启动存储节点",true,()->{
             String h=hub.getText().toString().trim(),u=endpoint.getText().toString().trim(),r=relay.getText().toString().trim(),t=secret.getText().toString();
-            if(!validCloudAddress(h)||(!u.isEmpty()&&!validCloudAddress(u))||(!r.isEmpty()&&!validCloudAddress(r))||(u.isEmpty()&&r.isEmpty())||t.length()<32||t.contains("\r")||t.contains("\n")){validation.setText("需要有效的 Hub、直连或中继 HTTPS 地址，以及至少 32 字符的云层令牌");validation.setTextColor(RED);return;}
+            if(!validCloudAddress(h)||(!u.isEmpty()&&!validCloudAddress(u))||(!r.isEmpty()&&!validCloudAddress(r))||t.length()<32||t.contains("\r")||t.contains("\n")){validation.setText("需要有效的 Hub HTTPS 地址及至少 32 字符的云层令牌");validation.setTextColor(RED);return;}
             String backend=backendChoice.getSelectedItemPosition()==1?"openlist":"disk";
             String address=openlistURL.getText().toString().trim(),mountPath=mount.getText().toString().trim(),username=user.getText().toString().trim(),pass=password.getText().toString();
             if(backend.equals("openlist"))try{new CloudOpenListBackend(address,mountPath,username,pass);}catch(Exception ex){validation.setText(message(ex));validation.setTextColor(RED);return;}
