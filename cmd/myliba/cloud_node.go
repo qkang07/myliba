@@ -12,6 +12,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,24 +24,25 @@ import (
 )
 
 type cloudRuntime struct {
-	disk       *cloudDisk
-	id         string
-	role       string
-	endpoint   string
-	db         *sql.DB
-	hubURL     string
-	token      string
-	mu         sync.RWMutex
-	peers      []cloudNode
-	bootstrap  []cloudNode
-	locations  map[string][]cloudNode
-	client     *http.Client
-	relayURL   string
-	relayOn    bool
-	relayMu    sync.RWMutex
-	relays     map[string]*cloudRelayConn
-	relayReady atomic.Bool
-	p2pMu      sync.Mutex
+	disk         *cloudDisk
+	id           string
+	role         string
+	endpoint     string
+	db           *sql.DB
+	hubURL       string
+	token        string
+	mu           sync.RWMutex
+	peers        []cloudNode
+	bootstrap    []cloudNode
+	locations    map[string][]cloudNode
+	client       *http.Client
+	relayURL     string
+	relayOn      bool
+	relayMu      sync.RWMutex
+	relays       map[string]*cloudRelayConn
+	relayReady   atomic.Bool
+	p2pMu        sync.Mutex
+	grantForPeer func(context.Context, string) (string, error)
 }
 
 func cloudDataDir(storageOnly bool) (string, error) {
@@ -135,13 +138,29 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 		rt.peers = append([]cloudNode(nil), rt.bootstrap...)
 	}
 	if storageOnly {
-		rt.hubURL = os.Getenv("MYLIBA_HUB_URL")
-		rt.token = os.Getenv("MYLIBA_CLOUD_TOKEN")
+		rt.hubURL = strings.TrimSpace(os.Getenv("MYLIBA_HUB_URL"))
 		if endpoint == "" {
 			return nil, errors.New("storage node needs MYLIBA_CLOUD_PUBLIC_URL")
 		}
-		if rt.hubURL == "" || len(rt.token) < 32 {
-			return nil, errors.New("storage node needs MYLIBA_HUB_URL and MYLIBA_CLOUD_TOKEN")
+		if rt.hubURL == "" {
+			return nil, errors.New("storage node needs MYLIBA_HUB_URL")
+		}
+		credentialPath := filepath.Join(dir, "device-credential")
+		if raw, readErr := os.ReadFile(credentialPath); readErr == nil {
+			rt.token = strings.TrimSpace(string(raw))
+		}
+		if len(rt.token) < 32 {
+			password := os.Getenv("MYLIBA_OWNER_PASSWORD")
+			if password == "" {
+				return nil, errors.New("storage node needs MYLIBA_OWNER_PASSWORD for first pairing")
+			}
+			rt.token, err = pairCloudStorage(rt.hubURL, rt.id, password)
+			if err != nil {
+				return nil, fmt.Errorf("storage node pairing: %w", err)
+			}
+			if err = os.WriteFile(credentialPath, []byte(rt.token), 0600); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return rt, nil
@@ -152,14 +171,146 @@ func (c *cloudRuntime) credentials() (string, string, error) {
 		return c.hubURL, c.token, nil
 	}
 	var rawURL, token string
-	err := c.db.QueryRow(`SELECT p.url,p.cloud_token FROM hub_profiles p JOIN hub_settings s ON s.value=p.id WHERE s.key='active_hub'`).Scan(&rawURL, &token)
-	if err == sql.ErrNoRows {
-		return "", strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_TOKEN")), nil
-	}
-	if token == "" {
-		token = strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_TOKEN"))
+	err := c.db.QueryRow(`SELECT p.url,p.token FROM hub_profiles p JOIN hub_settings s ON s.value=p.id WHERE s.key='active_hub'`).Scan(&rawURL, &token)
+	if err == sql.ErrNoRows || (err != nil && strings.Contains(err.Error(), "no such table: hub_profiles")) {
+		return "", "", nil
 	}
 	return rawURL, token, err
+}
+
+func (c *cloudRuntime) peerGrant(ctx context.Context, deviceToken string) (string, error) {
+	if c.grantForPeer != nil {
+		return c.grantForPeer(ctx, deviceToken)
+	}
+	wsURL, _, err := c.credentials()
+	if err != nil {
+		return "", err
+	}
+	base, err := hubHTTPURL(wsURL)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/cloud/auth/grant", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+deviceToken)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Hub cloud grant: HTTP %d", resp.StatusCode)
+	}
+	var grant struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&grant); err != nil {
+		return "", err
+	}
+	if len(grant.Token) < 32 || strings.ContainsAny(grant.Token, "\r\n") {
+		return "", errors.New("invalid cloud grant")
+	}
+	return grant.Token, nil
+}
+
+func pairCloudStorage(rawHub, deviceID, password string) (string, error) {
+	base, err := hubHTTPURL(rawHub)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Host == "" {
+		return "", errors.New("invalid Hub URL")
+	}
+	origin := parsed.Scheme + "://" + parsed.Host
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Timeout: 15 * time.Second, Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	post := func(path string, input any, output any) error {
+		body, _ := json.Marshal(input)
+		req, err := http.NewRequest(http.MethodPost, origin+path, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("Hub HTTP %d", resp.StatusCode)
+		}
+		if output != nil {
+			return json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(output)
+		}
+		return nil
+	}
+	if err := post("/api/session", map[string]string{"password": password}, nil); err != nil {
+		return "", err
+	}
+	defer func() {
+		req, err := http.NewRequest(http.MethodDelete, origin+"/api/session", nil)
+		if err == nil {
+			req.Header.Set("Origin", origin)
+			if resp, err := client.Do(req); err == nil {
+				resp.Body.Close()
+			}
+		}
+	}()
+	var paired struct {
+		Token string `json:"token"`
+	}
+	if err := post("/api/hub/devices", map[string]any{"id": deviceID, "name": "云层存储节点", "kind": "storage", "canCloud": true}, &paired); err != nil {
+		return "", err
+	}
+	if len(paired.Token) < 32 || strings.ContainsAny(paired.Token, "\r\n") {
+		return "", errors.New("Hub returned invalid device credential")
+	}
+	return paired.Token, nil
+}
+
+func (c *cloudRuntime) authorizeCloudPeer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		wsURL, self, err := c.credentials()
+		if err != nil || len(self) < 32 {
+			http.Error(w, "cloud credentials unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		base, err := hubHTTPURL(wsURL)
+		if err != nil {
+			http.Error(w, "Hub unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		body, _ := json.Marshal(map[string]string{"token": strings.TrimPrefix(auth, "Bearer ")})
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		check, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/cloud/auth/verify", bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, "Hub unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		check.Header.Set("Authorization", "Bearer "+self)
+		check.Header.Set("Content-Type", "application/json")
+		resp, err := c.client.Do(check)
+		if err != nil {
+			http.Error(w, "Hub unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (c *cloudRuntime) request(ctx context.Context, method, base, path, token string, body io.Reader) (*http.Response, error) {
@@ -168,6 +319,23 @@ func (c *cloudRuntime) request(ctx context.Context, method, base, path, token st
 	}
 	if strings.HasPrefix(base, "p2p://") {
 		return c.p2pRequest(ctx, method, strings.TrimPrefix(base, "p2p://"), path, token, body)
+	}
+	wsURL, _, err := c.credentials()
+	if err != nil {
+		return nil, err
+	}
+	hubBase := ""
+	if wsURL != "" {
+		hubBase, err = hubHTTPURL(wsURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if strings.TrimRight(base, "/") != hubBase {
+		token, err = c.peerGrant(ctx, token)
+		if err != nil {
+			return nil, err
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, body)
 	if err != nil {
@@ -369,7 +537,7 @@ func (c *cloudRuntime) syncOnce(ctx context.Context) error {
 		return nil
 	}
 	if len(token) < 32 {
-		return errors.New("cloud peers require MYLIBA_CLOUD_TOKEN")
+		return errors.New("cloud peers require an authorized device credential")
 	}
 	peers := c.activePeers()
 	known := map[string]bool{}
@@ -497,9 +665,9 @@ func (c *cloudRuntime) serveDirect() error {
 			return
 		}
 		inner := http.NewServeMux()
-		c.disk.routes(inner, token)
+		c.disk.routesWithAuth(inner, c.authorizeCloudPeer)
 		if c.relayOn {
-			c.relayRoutes(inner, token)
+			c.relayRoutesWithAuth(inner, c.authorizeCloudPeer)
 		}
 		inner.ServeHTTP(w, r)
 	}))

@@ -244,8 +244,8 @@ type cloudPeerSignal struct {
 	Created time.Time `json:"-"`
 }
 
-func (c *cloudHub) signalRoutes(mux *http.ServeMux, token string) {
-	mux.Handle("GET /cloud/ice", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (c *cloudHub) signalRoutes(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
+	mux.Handle("GET /cloud/ice", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		servers, err := loadICEServers()
 		if err != nil {
 			http.Error(w, "ICE unavailable", 503)
@@ -264,8 +264,8 @@ func (c *cloudHub) signalRoutes(mux *http.ServeMux, token string) {
 			}
 		}
 		writeJSON(w, 200, map[string]any{"servers": direct})
-	}), token))
-	mux.Handle("POST /cloud/signal", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("POST /cloud/signal", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var signal cloudPeerSignal
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&signal); err != nil || !validCloudNodeID(signal.From) || !validCloudNodeID(signal.To) || signal.From == signal.To || !validCloudNodeID(signal.Session) || (signal.Type != "offer" && signal.Type != "answer") || len(signal.SDP) > 100<<10 || len(signal.SDP) == 0 {
 			http.Error(w, "invalid signal", 400)
@@ -299,8 +299,8 @@ func (c *cloudHub) signalRoutes(mux *http.ServeMux, token string) {
 		}
 		c.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
-	}), token))
-	mux.Handle("GET /cloud/signal/{id}", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("GET /cloud/signal/{id}", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		if !validCloudNodeID(id) {
 			http.Error(w, "invalid node", 400)
@@ -334,12 +334,16 @@ func (c *cloudHub) signalRoutes(mux *http.ServeMux, token string) {
 		delete(c.signals, id)
 		c.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"messages": messages})
-	}), token))
+	})))
 }
 
 func (c *cloudHub) routes(mux *http.ServeMux, token string) {
-	c.signalRoutes(mux, token)
-	mux.Handle("POST /cloud/nodes/heartbeat", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c.routesWithAuth(mux, func(next http.Handler) http.Handler { return cloudBearer(next, token) })
+}
+
+func (c *cloudHub) routesWithAuth(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
+	c.signalRoutes(mux, authorize)
+	mux.Handle("POST /cloud/nodes/heartbeat", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var node cloudNode
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&node); err != nil || !validCloudNode(node) {
 			http.Error(w, "invalid node", 400)
@@ -358,8 +362,8 @@ func (c *cloudHub) routes(mux *http.ServeMux, token string) {
 			log.Printf("Cloud node registry save failed: %v", err)
 		}
 		w.WriteHeader(http.StatusNoContent)
-	}), token))
-	mux.Handle("GET /cloud/nodes", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("GET /cloud/nodes", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		nodes := []cloudNode{}
 		c.mu.Lock()
@@ -372,19 +376,19 @@ func (c *cloudHub) routes(mux *http.ServeMux, token string) {
 		c.mu.Unlock()
 		sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 		writeJSON(w, 200, map[string]any{"nodes": nodes})
-	}), token))
+	})))
 	// The Hub keeps only opaque encrypted catalog records. It never stores blocks.
-	mux.Handle("GET /cloud/catalog", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /cloud/catalog", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ids, err := c.disk.list("catalog")
 		if err != nil {
 			http.Error(w, "catalog unavailable", 500)
 			return
 		}
 		writeJSON(w, 200, map[string]any{"records": ids})
-	}), token))
+	})))
 	for _, method := range []string{http.MethodGet, http.MethodPut} {
 		method := method
-		mux.Handle(method+" /cloud/catalog/{id}", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.Handle(method+" /cloud/catalog/{id}", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := r.PathValue("id")
 			if !validCloudHash(id) {
 				http.Error(w, "invalid id", 400)
@@ -406,13 +410,13 @@ func (c *cloudHub) routes(mux *http.ServeMux, token string) {
 			defer file.Close()
 			w.Header().Set("Content-Type", "application/octet-stream")
 			http.ServeContent(w, r, id, time.Time{}, file)
-		}), token))
+		})))
 	}
 }
 
 func hubHTTPURL(wsURL string) (string, error) {
 	u, err := url.Parse(wsURL)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.User != nil {
 		return "", errors.New("invalid Hub URL")
 	}
 	switch u.Scheme {
@@ -423,6 +427,11 @@ func hubHTTPURL(wsURL string) (string, error) {
 			return "", errors.New("insecure Hub URL")
 		}
 		u.Scheme = "http"
+	case "https":
+	case "http":
+		if u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" {
+			return "", errors.New("insecure Hub URL")
+		}
 	default:
 		return "", errors.New("invalid Hub scheme")
 	}

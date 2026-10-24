@@ -151,6 +151,7 @@ export interface TrafficRate {
 export interface SessionInfo {
   local?: boolean;
   authenticated: boolean;
+  owner?: boolean;
   nodeOnline: boolean;
   webTraffic?: TrafficRate;
   nodeTraffic?: TrafficRate;
@@ -176,12 +177,36 @@ export function removeResourceNode(id: string) {
   return request<void>(`/api/hub/nodes/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
+export interface HubDevice {
+  id: string;
+  name: string;
+  kind: "android" | "desktop" | "storage";
+  canBrowse: boolean;
+  canServe: boolean;
+  canCloud: boolean;
+  createdAt: string;
+  revokedAt?: string;
+}
+
+export interface HubDevicesView { devices: HubDevice[]; legacyNodeAllowed: boolean }
+
+export function getHubDevices() {
+  return request<HubDevicesView>("/api/hub/devices");
+}
+
+export function revokeHubDevice(id: string) {
+  return request<void>(`/api/hub/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export function setLegacyHubNodes(enabled: boolean) {
+  return request<HubDevicesView>("/api/hub/devices/legacy", { method: "PUT", body: JSON.stringify({ enabled }) });
+}
+
 export interface HubProfile {
   id: string;
   name: string;
   url: string;
   hasToken: boolean;
-  hasCloudToken: boolean;
 }
 
 export interface HubProfilesView {
@@ -194,7 +219,7 @@ export function getHubProfiles() {
   return request<HubProfilesView>("/api/hubs");
 }
 
-export function saveHubProfile(profile: { id?: string; name: string; url: string; token: string; cloudToken: string }) {
+export function saveHubProfile(profile: { id?: string; name: string; url: string; ownerPassword: string }) {
   return request<HubProfilesView>("/api/hubs", { method: "POST", body: JSON.stringify(profile) });
 }
 

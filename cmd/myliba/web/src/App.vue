@@ -7,6 +7,7 @@ import StreamingVideo from "./StreamingVideo.vue";
 import HubSettings from "./HubSettings.vue";
 import CloudPanel from "./CloudPanel.vue";
 import HubCloudDashboard from "./HubCloudDashboard.vue";
+import DeviceManager from "./DeviceManager.vue";
 import {
   Check,
   ChevronDown,
@@ -101,6 +102,7 @@ import {
 
 const remoteMode = ref(false);
 const authenticated = ref(true);
+const ownerSession = ref(true);
 const nodeOnline = ref(false);
 const resourceNodes = ref<HubResourceNode[]>([]);
 const selectedResourceNodeID = ref("");
@@ -1263,6 +1265,7 @@ async function submitLogin() {
     const session = await login(password.value);
     authGeneration++;
     authenticated.value = session.authenticated;
+    ownerSession.value = session.owner ?? true;
     nodeOnline.value = session.nodeOnline;
     resourceNodes.value = session.nodes ?? [];
     selectedResourceNodeID.value = session.selectedNodeId ?? "";
@@ -1281,6 +1284,7 @@ function clearRemoteSession() {
   authGeneration++;
   requestGeneration++;
   authenticated.value = false;
+  ownerSession.value = false;
   nodeOnline.value = false;
   resourceNodes.value = [];
   selectedResourceNodeID.value = "";
@@ -1337,6 +1341,7 @@ async function refreshNodeStatus() {
         clearRemoteSession();
       }
       nodeOnline.value = session.nodeOnline;
+      ownerSession.value = session.owner ?? true;
       resourceNodes.value = session.nodes ?? [];
       selectedResourceNodeID.value = session.selectedNodeId ?? "";
       webTraffic.value = session.webTraffic ?? { downloadBps: 0, uploadBps: 0 };
@@ -1435,6 +1440,7 @@ onMounted(async () => {
     } else {
       remoteMode.value = true;
       authenticated.value = session.authenticated;
+      ownerSession.value = session.owner ?? true;
       nodeOnline.value = session.nodeOnline;
       resourceNodes.value = session.nodes ?? [];
       selectedResourceNodeID.value = session.selectedNodeId ?? "";
@@ -1556,7 +1562,8 @@ onBeforeUnmount(() => {
           </template>
           <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>
           <HubSettings v-if="!remoteMode && authenticated" />
-          <HubCloudDashboard v-if="remoteMode && authenticated" />
+          <HubCloudDashboard v-if="remoteMode && authenticated && ownerSession" />
+          <DeviceManager v-if="remoteMode && authenticated && ownerSession" />
           <CloudPanel v-if="authenticated" :resources="resources" :remote="remoteMode" />
           <button v-if="authenticated" class="button button-secondary preprocess-toggle" type="button" @click="preprocessOpen = true"><Clock3 :size="14" />后台任务 <span v-if="preprocessQueue.counts.pending + preprocessQueue.counts.running">({{ preprocessQueue.counts.pending + preprocessQueue.counts.running }})</span></button>
           <button v-if="remoteMode && authenticated" class="quiet-button signout-button" title="退出登录" @click="signOut"><LogOut :size="15" /><span>退出</span></button>

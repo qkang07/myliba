@@ -33,7 +33,11 @@ func validRemoteNodeID(id string) bool {
 // same node without accepting a caller-supplied routing header on each request.
 func (h *remoteHub) selectedIDLocked(r *http.Request) string {
 	if cookie, err := r.Cookie(hubSessionCookie); err == nil {
-		if id := h.selectedNodes[cookie.Value]; id != "" {
+		id := h.selectedNodes[cookie.Value]
+		if h.auth != nil {
+			id = h.auth.data.Sessions[hubAuthKey(cookie.Value)].SelectedNode
+		}
+		if id != "" {
 			return id
 		}
 	}
@@ -111,9 +115,22 @@ func (h *remoteHub) selectNode(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	_, exists := h.nodes[input.ID]
 	if exists {
-		h.selectedNodes[cookie.Value] = input.ID
+		if h.auth != nil {
+			err = h.auth.update(func(data *hubAuthData) error {
+				session := data.Sessions[hubAuthKey(cookie.Value)]
+				session.SelectedNode = input.ID
+				data.Sessions[hubAuthKey(cookie.Value)] = session
+				return nil
+			})
+		} else {
+			h.selectedNodes[cookie.Value] = input.ID
+		}
 	}
 	h.mu.Unlock()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法保存当前节点")
+		return
+	}
 	if !exists {
 		writeError(w, http.StatusNotFound, "节点不存在")
 		return
@@ -138,6 +155,21 @@ func (h *remoteHub) removeOfflineNode(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 		writeError(w, http.StatusConflict, "节点仍在线，不能移除")
 		return
+	}
+	if h.auth != nil {
+		if err := h.auth.update(func(data *hubAuthData) error {
+			for key, session := range data.Sessions {
+				if session.SelectedNode == id {
+					session.SelectedNode = ""
+					data.Sessions[key] = session
+				}
+			}
+			return nil
+		}); err != nil {
+			h.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "无法清除节点选择")
+			return
+		}
 	}
 	delete(h.nodes, id)
 	for session, selected := range h.selectedNodes {

@@ -34,7 +34,7 @@ public final class CloudStorageService extends Service {
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         if(running)return START_STICKY;
         android.content.SharedPreferences p=getSharedPreferences(PREFS,MODE_PRIVATE);
-        try{token=CloudSecretStore.read(p,"token");}catch(Exception ex){status="云层令牌读取失败";stopSelf();return START_NOT_STICKY;}
+        try{token=CloudSecretStore.read(p,"token");}catch(Exception ex){status="设备凭据读取失败";stopSelf();return START_NOT_STICKY;}
         hub=p.getString("hub","");publicUrl=p.getString("url","");relayUrl=p.getString("relay","");backend=p.getString("backend","disk");port=p.getInt("port",4319);
         activeBackend=backend;
         if(token.length()<32||token.contains("\r")||token.contains("\n")||!hub.startsWith("https://")||(!publicUrl.isEmpty()&&!publicUrl.startsWith("https://"))||(!relayUrl.isEmpty()&&!relayUrl.startsWith("https://"))||port<1||port>65535||!(backend.equals("disk")||backend.equals("openlist"))){status="配置无效";stopSelf();return START_NOT_STICKY;}
@@ -63,7 +63,7 @@ public final class CloudStorageService extends Service {
         AppLog.info("Cloud storage node starting; transport "+(publicUrl.startsWith("p2p://")?"p2p":publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"relay":"direct"));
         if(listener!=null)workers.execute(()->{while(!stopped){try{Socket socket=listener.accept();workers.execute(()->serve(socket));}catch(IOException ex){if(!stopped)break;}}});
         workers.execute(()->{while(!stopped){try{syncHub();status="已向 Hub 注册";AppLog.info("Cloud storage node registered with Hub");}catch(Exception ex){AppLog.error("Cloud storage Hub sync failed",ex);status="Hub 同步失败："+ex.getMessage();}try{Thread.sleep(20000);}catch(InterruptedException ex){break;}}});
-        if(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)){relayClient=new CloudRelayClient(relayUrl,nodeId,token,port);new Thread(()->relayClient.run(()->stopped),"cloud-relay").start();}
+        if(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)){relayClient=new CloudRelayClient(relayUrl,nodeId,token,port,()->peerGrant());new Thread(()->relayClient.run(()->stopped),"cloud-relay").start();}
         if(publicUrl.startsWith("p2p://")){peerClient=new CloudPeerClient(this,hub,nodeId,token);new Thread(()->peerClient.run(()->stopped),"cloud-peer").start();}
         return START_STICKY;
     }
@@ -100,9 +100,29 @@ public final class CloudStorageService extends Service {
     }
     private static byte[] json(JSONObject value){return value.toString().getBytes(StandardCharsets.UTF_8);}
     static final class PeerResult {final int status;final byte[] data;PeerResult(int status,byte[] data){this.status=status;this.data=data;}}
+    private String peerGrant(){
+        HttpURLConnection request=null;
+        try{
+            request=hubRequest("POST","/cloud/auth/grant",new byte[0]);
+            if(request.getResponseCode()!=200)return "";
+            byte[] raw;try(InputStream in=request.getInputStream();ByteArrayOutputStream out=new ByteArrayOutputStream()){byte[] buffer=new byte[1024];int n;while((n=in.read(buffer))!=-1){out.write(buffer,0,n);if(out.size()>8192)return "";}raw=out.toByteArray();}
+            String grant=new JSONObject(new String(raw,StandardCharsets.UTF_8)).optString("token","");
+            return grant.length()>=32&&!grant.contains("\r")&&!grant.contains("\n")?grant:"";
+        }catch(Exception ex){AppLog.error("Cloud grant failed",ex);return "";}
+        finally{if(request!=null)request.disconnect();}
+    }
+    private boolean verifyPeer(String suppliedToken){
+        if(suppliedToken==null||suppliedToken.length()<32||suppliedToken.length()>4096)return false;
+        HttpURLConnection check=null;
+        try{
+            check=hubRequest("POST","/cloud/auth/verify",json(new JSONObject().put("token",suppliedToken)));
+            return check.getResponseCode()==204;
+        }catch(Exception ex){AppLog.error("Cloud peer authorization failed",ex);return false;}
+        finally{if(check!=null)check.disconnect();}
+    }
     PeerResult peerRequest(String method,String path,String suppliedToken,byte[] data){
         try{
-            if(!MessageDigest.isEqual(token.getBytes(StandardCharsets.UTF_8),suppliedToken.getBytes(StandardCharsets.UTF_8)))return new PeerResult(401,new byte[0]);
+            if(!verifyPeer(suppliedToken))return new PeerResult(401,new byte[0]);
             URI uri=new URI(path);String route=uri.getPath();
             if("GET".equals(method)&&"/cloud/catalog".equals(route))return new PeerResult(200,json(new JSONObject().put("records",new JSONArray(list("catalog")))));
             if("GET".equals(method)&&"/cloud/inventory".equals(route)){
@@ -122,7 +142,8 @@ public final class CloudStorageService extends Service {
             String[] first=line(in).split(" ");if(first.length<2){respond(out,400,"text/plain",new byte[0],false);return;}
             String method=first[0];URI uri=new URI(first[1]);String route=uri.getPath();Map<String,String> headers=new HashMap<>();String header;int total=0;
             while(!(header=line(in)).isEmpty()){total+=header.length();if(total>16384)throw new IOException("headers too large");int colon=header.indexOf(':');if(colon>0)headers.put(header.substring(0,colon).toLowerCase(Locale.ROOT),header.substring(colon+1).trim());}
-            if(!MessageDigest.isEqual(("Bearer "+token).getBytes(StandardCharsets.UTF_8),headers.getOrDefault("authorization","").getBytes(StandardCharsets.UTF_8))){respond(out,401,"text/plain",new byte[0],false);return;}
+            String authorization=headers.getOrDefault("authorization","");
+            if(!authorization.startsWith("Bearer ")||!verifyPeer(authorization.substring(7))){respond(out,401,"text/plain",new byte[0],false);return;}
             if("GET".equals(method)&&"/cloud/catalog".equals(route)){try{respond(out,200,"application/json",json(new JSONObject().put("records",new JSONArray(list("catalog")))),false);}catch(Exception ex){respond(out,503,"text/plain",new byte[0],false);}return;}
             if("GET".equals(method)&&"/cloud/inventory".equals(route)){
                 String after="";if(uri.getRawQuery()!=null)for(String p:uri.getRawQuery().split("&"))if(p.startsWith("after="))after=URLDecoder.decode(p.substring(6),"UTF-8");

@@ -80,6 +80,8 @@ type remoteHub struct {
 	password          string
 	secure            bool
 	sessions          map[string]time.Time
+	auth              *hubAuthStore
+	cloudGrants       map[string]cloudGrant
 	loginTries        int
 	loginBlockedUntil time.Time
 	shareChecks       int
@@ -364,7 +366,15 @@ func (h *remoteHub) attach(conn *websocket.Conn) {
 }
 
 func (h *remoteHub) attachNode(conn *websocket.Conn, id, name, kind string) {
+	h.attachNodeChecked(conn, id, name, kind, nil, "")
+}
+
+func (h *remoteHub) attachNodeChecked(conn *websocket.Conn, id, name, kind string, request *http.Request, legacyToken string) bool {
 	h.mu.Lock()
+	if request != nil && !h.authorizedNodeLocked(request, id, kind, legacyToken) {
+		h.mu.Unlock()
+		return false
+	}
 	if h.nodes == nil {
 		h.nodes = map[string]*remoteNode{}
 	}
@@ -380,6 +390,7 @@ func (h *remoteHub) attachNode(conn *websocket.Conn, id, name, kind string) {
 	}
 	go h.readNode(id, conn)
 	_ = h.send(conn, wireMessage{Type: "node-config", ICEServers: h.directICEServers()})
+	return true
 }
 
 func (h *remoteHub) readNode(id string, conn *websocket.Conn) {

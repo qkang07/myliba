@@ -144,7 +144,7 @@ func testCloudRuntime(t *testing.T, dir, token string) *cloudRuntime {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &cloudRuntime{disk: disk, id: newID(), role: "storage", token: token, client: &http.Client{}, locations: map[string][]cloudNode{}}
+	return &cloudRuntime{disk: disk, id: newID(), role: "storage", token: token, client: &http.Client{}, locations: map[string][]cloudNode{}, grantForPeer: func(_ context.Context, presented string) (string, error) { return presented, nil }}
 }
 
 func serveCloudTestNode(t *testing.T, runtime *cloudRuntime, token string) *httptest.Server {

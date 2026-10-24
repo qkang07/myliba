@@ -12,11 +12,10 @@ import (
 )
 
 type hubProfile struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	URL           string `json:"url"`
-	HasToken      bool   `json:"hasToken"`
-	HasCloudToken bool   `json:"hasCloudToken"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+	HasToken bool   `json:"hasToken"`
 }
 
 type hubProfilesView struct {
@@ -106,7 +105,7 @@ func newHubProfiles(db *sql.DB, iceServers []iceServerConfig) (*hubProfiles, err
 				return nil, errors.New("MYLIBA_NODE_TOKEN must be at least 32 characters")
 			}
 			id := newID()
-			if _, err := db.Exec(`INSERT INTO hub_profiles(id,name,url,token,cloud_token) VALUES(?,?,?,?,?)`, id, "原有服务端", hubURL, token, strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_TOKEN"))); err != nil {
+			if _, err := db.Exec(`INSERT INTO hub_profiles(id,name,url,token) VALUES(?,?,?,?)`, id, "原有服务端", hubURL, token); err != nil {
 				return nil, err
 			}
 			if _, err := db.Exec(`INSERT INTO hub_settings(key,value) VALUES('active_hub',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, id); err != nil {
@@ -175,7 +174,7 @@ func (h *hubProfiles) activate(id string) error {
 func (h *hubProfiles) view() (hubProfilesView, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	rows, err := h.db.Query(`SELECT id,name,url,cloud_token FROM hub_profiles ORDER BY rowid`)
+	rows, err := h.db.Query(`SELECT id,name,url FROM hub_profiles ORDER BY rowid`)
 	if err != nil {
 		return hubProfilesView{}, err
 	}
@@ -183,12 +182,10 @@ func (h *hubProfiles) view() (hubProfilesView, error) {
 	view := hubProfilesView{Profiles: []hubProfile{}, ActiveID: h.activeID, Status: h.status}
 	for rows.Next() {
 		var p hubProfile
-		var cloudToken string
-		if err := rows.Scan(&p.ID, &p.Name, &p.URL, &cloudToken); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.URL); err != nil {
 			return hubProfilesView{}, err
 		}
 		p.HasToken = true
-		p.HasCloudToken = cloudToken != "" || os.Getenv("MYLIBA_CLOUD_TOKEN") != ""
 		view.Profiles = append(view.Profiles, p)
 	}
 	return view, rows.Err()
@@ -221,18 +218,17 @@ func (h *hubProfiles) save(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		ID         string `json:"id"`
-		Name       string `json:"name"`
-		URL        string `json:"url"`
-		Token      string `json:"token"`
-		CloudToken string `json:"cloudToken"`
+		ID            string `json:"id"`
+		Name          string `json:"name"`
+		URL           string `json:"url"`
+		Token         string `json:"token"`
+		OwnerPassword string `json:"ownerPassword"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "服务端配置格式错误")
 		return
 	}
 	input.ID, input.Name, input.URL, input.Token = strings.TrimSpace(input.ID), strings.TrimSpace(input.Name), strings.TrimSpace(input.URL), strings.TrimSpace(input.Token)
-	input.CloudToken = strings.TrimSpace(input.CloudToken)
 	if input.Name == "" || len([]rune(input.Name)) > 80 {
 		writeError(w, http.StatusBadRequest, "服务端名称需为 1 到 80 个字符")
 		return
@@ -245,9 +241,13 @@ func (h *hubProfiles) save(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "节点密钥过长")
 		return
 	}
-	if input.CloudToken != "" && (len(input.CloudToken) < 32 || len(input.CloudToken) > 4096) {
-		writeError(w, http.StatusBadRequest, "云层密钥需至少 32 个字符")
-		return
+	if input.OwnerPassword != "" {
+		deviceToken, err := pairDesktopHub(input.URL, h.nodeID, h.nodeName, input.OwnerPassword)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		input.Token = deviceToken
 	}
 	h.mu.Lock()
 	id := input.ID
@@ -262,13 +262,6 @@ func (h *hubProfiles) save(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if input.ID != "" && input.CloudToken == "" {
-		if err := h.db.QueryRow(`SELECT cloud_token FROM hub_profiles WHERE id=?`, id).Scan(&input.CloudToken); err != nil {
-			h.mu.Unlock()
-			writeError(w, http.StatusNotFound, "服务端配置不存在")
-			return
-		}
-	}
 	if len(input.Token) < 32 {
 		h.mu.Unlock()
 		writeError(w, http.StatusBadRequest, "节点密钥至少需要 32 个字符")
@@ -277,9 +270,9 @@ func (h *hubProfiles) save(w http.ResponseWriter, r *http.Request) {
 	var result sql.Result
 	var err error
 	if input.ID == "" {
-		result, err = h.db.Exec(`INSERT INTO hub_profiles(id,name,url,token,cloud_token) VALUES(?,?,?,?,?)`, id, input.Name, input.URL, input.Token, input.CloudToken)
+		result, err = h.db.Exec(`INSERT INTO hub_profiles(id,name,url,token) VALUES(?,?,?,?)`, id, input.Name, input.URL, input.Token)
 	} else {
-		result, err = h.db.Exec(`UPDATE hub_profiles SET name=?,url=?,token=?,cloud_token=? WHERE id=?`, input.Name, input.URL, input.Token, input.CloudToken, id)
+		result, err = h.db.Exec(`UPDATE hub_profiles SET name=?,url=?,token=? WHERE id=?`, input.Name, input.URL, input.Token, id)
 	}
 	if err == nil && result != nil && input.ID != "" {
 		var affected int64

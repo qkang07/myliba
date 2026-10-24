@@ -140,7 +140,15 @@ func (c *cloudRuntime) p2pRequest(parent context.Context, method, target, path, 
 	})
 	channel.OnOpen(func() {
 		go func() {
-			header, _ := json.Marshal(cloudChannelHeader{Type: "request", Method: method, Path: path, Token: token})
+			grant, grantErr := c.peerGrant(ctx, token)
+			if grantErr != nil {
+				select {
+				case finished <- result{nil, grantErr}:
+				default:
+				}
+				return
+			}
+			header, _ := json.Marshal(cloudChannelHeader{Type: "request", Method: method, Path: path, Token: grant})
 			if err := channel.SendText(string(header)); err == nil {
 				for offset := 0; offset < len(payload); offset += 16 << 10 {
 					end := offset + 16<<10

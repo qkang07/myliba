@@ -103,7 +103,7 @@ func TestCloudPeerDataChannelBypassesHubForBytes(t *testing.T) {
 	hub.routes(mux, token)
 	server := httptest.NewServer(mux)
 	defer server.Close()
-	runtime := &cloudRuntime{id: "11111111111111111111111111111111", hubURL: "ws" + strings.TrimPrefix(server.URL, "http") + "/node", token: token, client: &http.Client{Timeout: 10 * time.Second}}
+	runtime := &cloudRuntime{id: "11111111111111111111111111111111", hubURL: "ws" + strings.TrimPrefix(server.URL, "http") + "/node", token: token, client: &http.Client{Timeout: 10 * time.Second}, grantForPeer: func(context.Context, string) (string, error) { return token, nil }}
 	target := "22222222222222222222222222222222"
 	block := bytes.Repeat([]byte("encrypted-chunk"), (4<<20)/len("encrypted-chunk"))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

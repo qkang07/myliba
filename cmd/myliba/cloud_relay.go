@@ -94,7 +94,11 @@ func cloudRelayPath(method, path string) bool {
 }
 
 func (c *cloudRuntime) relayRoutes(mux *http.ServeMux, token string) {
-	mux.Handle("GET /cloud/tunnel/{id}", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c.relayRoutesWithAuth(mux, func(next http.Handler) http.Handler { return cloudBearer(next, token) })
+}
+
+func (c *cloudRuntime) relayRoutesWithAuth(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
+	mux.Handle("GET /cloud/tunnel/{id}", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		if len(id) != 32 || cloudRelayEndpointID("https://relay.invalid/cloud/relay/"+id) == "" {
 			http.Error(w, "invalid node", 400)
@@ -140,9 +144,9 @@ func (c *cloudRuntime) relayRoutes(mux *http.ServeMux, token string) {
 				pending <- frame
 			}
 		}
-	}), token))
+	})))
 
-	mux.Handle("/cloud/relay/{id}/cloud/{tail...}", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/cloud/relay/{id}/cloud/{tail...}", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := "/cloud/" + r.PathValue("tail")
 		if r.URL.RawQuery != "" {
 			path += "?" + r.URL.RawQuery
@@ -202,7 +206,7 @@ func (c *cloudRuntime) relayRoutes(mux *http.ServeMux, token string) {
 		case <-ctx.Done():
 			http.Error(w, "relay timeout", 504)
 		}
-	}), token))
+	})))
 }
 
 type cloudRelayWriter struct {
@@ -240,17 +244,22 @@ func (c *cloudRuntime) runRelayTunnel(ctx context.Context) {
 	for ctx.Err() == nil {
 		_, token, err := c.credentials()
 		if err == nil && len(token) >= 32 {
-			header := http.Header{"Authorization": []string{"Bearer " + token}}
-			conn, _, dialErr := websocket.Dial(ctx, u.String(), &websocket.DialOptions{HTTPHeader: header})
-			if dialErr == nil {
-				conn.SetReadLimit(cloudRelayLimit)
-				c.relayReady.Store(true)
-				log.Printf("Cloud relay tunnel connected: %s", c.relayURL)
-				c.serveRelayTunnel(ctx, conn, token)
-				c.relayReady.Store(false)
-				_ = conn.CloseNow()
+			grant, grantErr := c.peerGrant(ctx, token)
+			if grantErr != nil {
+				log.Printf("Cloud relay grant: %v", grantErr)
 			} else {
-				log.Printf("Cloud relay tunnel: %v", dialErr)
+				header := http.Header{"Authorization": []string{"Bearer " + grant}}
+				conn, _, dialErr := websocket.Dial(ctx, u.String(), &websocket.DialOptions{HTTPHeader: header})
+				if dialErr == nil {
+					conn.SetReadLimit(cloudRelayLimit)
+					c.relayReady.Store(true)
+					log.Printf("Cloud relay tunnel connected: %s", c.relayURL)
+					c.serveRelayTunnel(ctx, conn, token)
+					c.relayReady.Store(false)
+					_ = conn.CloseNow()
+				} else {
+					log.Printf("Cloud relay tunnel: %v", dialErr)
+				}
 			}
 		}
 		select {
@@ -287,7 +296,7 @@ func (c *cloudRuntime) serveRelayTunnel(ctx context.Context, conn *websocket.Con
 			req.Header.Set("Authorization", "Bearer "+token)
 			writer := &cloudRelayWriter{header: make(http.Header)}
 			mux := http.NewServeMux()
-			c.disk.routes(mux, token)
+			c.disk.routesWithAuth(mux, c.authorizeCloudPeer)
 			mux.ServeHTTP(writer, req)
 			if writer.status == 0 {
 				writer.status = 200

@@ -272,7 +272,11 @@ func cloudBearer(next http.Handler, token string) http.Handler {
 }
 
 func (d *cloudDisk) routes(mux *http.ServeMux, token string) {
-	mux.Handle("GET /cloud/inventory", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	d.routesWithAuth(mux, func(next http.Handler) http.Handler { return cloudBearer(next, token) })
+}
+
+func (d *cloudDisk) routesWithAuth(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
+	mux.Handle("GET /cloud/inventory", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		after := r.URL.Query().Get("after")
 		if after != "" && !validCloudHash(after) {
 			http.Error(w, "invalid cursor", 400)
@@ -296,21 +300,21 @@ func (d *cloudDisk) routes(mux *http.ServeMux, token string) {
 			next = ids[end-1]
 		}
 		writeJSON(w, 200, map[string]any{"blocks": ids[start:end], "next": next})
-	}), token))
-	mux.Handle("GET /cloud/catalog", cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("GET /cloud/catalog", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ids, err := d.list("catalog")
 		if err != nil {
 			http.Error(w, "catalog unavailable", 500)
 			return
 		}
 		writeJSON(w, 200, map[string]any{"records": ids})
-	}), token))
+	})))
 	for _, kind := range []string{"blocks", "catalog"} {
 		kind := kind
 		base := "/cloud/" + kind + "/{id}"
 		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut} {
 			method := method
-			mux.Handle(method+" "+base, cloudBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mux.Handle(method+" "+base, authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				id := r.PathValue("id")
 				if !validCloudHash(id) {
 					http.Error(w, "invalid id", 400)
@@ -349,7 +353,7 @@ func (d *cloudDisk) routes(mux *http.ServeMux, token string) {
 				if method == http.MethodGet {
 					_, _ = io.Copy(w, file)
 				}
-			}), token))
+			})))
 		}
 	}
 }

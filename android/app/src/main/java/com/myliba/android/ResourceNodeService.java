@@ -24,6 +24,25 @@ public final class ResourceNodeService extends Service {
     private ResourceNodeRTC rtc;
     private String hub,token,id,name;
 
+    static String ensureID(Context context){
+        SharedPreferences p=context.getSharedPreferences(PREFS,MODE_PRIVATE);
+        String id=p.getString("id","");if(!id.isEmpty())return id;
+        String device=Settings.Secure.getString(context.getContentResolver(),Settings.Secure.ANDROID_ID);
+        id=device==null||device.isEmpty()?UUID.randomUUID().toString():UUID.nameUUIDFromBytes(("myliba-resource-node:"+device).getBytes(StandardCharsets.UTF_8)).toString();
+        p.edit().putString("id",id).apply();return id;
+    }
+
+    static void savePaired(Context context,String hub,String id,String token)throws Exception{
+        context.getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("hub",hub).putString("id",id)
+            .putString("token",CloudSecretStore.protect(token)).putBoolean("paired",true).apply();
+    }
+
+    static boolean clearPaired(Context context,String hub){
+        SharedPreferences p=context.getSharedPreferences(PREFS,MODE_PRIVATE);
+        if(p.getBoolean("paired",false)&&hub.equals(p.getString("hub",""))){p.edit().remove("token").remove("paired").apply();return true;}
+        return false;
+    }
+
     @Override public void onCreate(){super.onCreate();getSystemService(NotificationManager.class).createNotificationChannel(new NotificationChannel("resource-node","Myliba 资源节点",NotificationManager.IMPORTANCE_LOW));}
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         if(running)return START_STICKY;
@@ -31,11 +50,7 @@ public final class ResourceNodeService extends Service {
         hub=p.getString("hub","");name=p.getString("name",android.os.Build.MODEL);
         try{token=CloudSecretStore.read(p,"token");}catch(Exception ex){status="节点密钥读取失败";stopSelf();return START_NOT_STICKY;}
         if(!hub.startsWith("https://")||token.length()<32||name.trim().isEmpty()){status="资源节点配置无效";stopSelf();return START_NOT_STICKY;}
-        id=p.getString("id","");if(id.isEmpty()){
-            String device=Settings.Secure.getString(getContentResolver(),Settings.Secure.ANDROID_ID);
-            id=device==null||device.isEmpty()?UUID.randomUUID().toString():UUID.nameUUIDFromBytes(("myliba-resource-node:"+device).getBytes(StandardCharsets.UTF_8)).toString();
-            p.edit().putString("id",id).apply();
-        }
+        id=ensureID(this);
         Intent open=new Intent(this,MainActivity.class);PendingIntent click=PendingIntent.getActivity(this,1,open,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
         Notification notification=new Notification.Builder(this,"resource-node").setSmallIcon(android.R.drawable.stat_sys_upload)
             .setContentTitle("Myliba 手机资源节点运行中").setContentText("经 Hub 向其他客户端开放已索引资源")

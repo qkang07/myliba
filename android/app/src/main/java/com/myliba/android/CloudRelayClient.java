@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -16,11 +17,12 @@ import javax.net.ssl.SSLSocketFactory;
 final class CloudRelayClient {
     private static final int LIMIT=18<<20;
     private final String url,id,token;
+    private final Supplier<String> grantProvider;
     private final int localPort;
     private final SecureRandom random=new SecureRandom();
     private volatile SSLSocket socket;
     private volatile boolean connected;
-    CloudRelayClient(String url,String id,String token,int localPort){this.url=url;this.id=id;this.token=token;this.localPort=localPort;}
+    CloudRelayClient(String url,String id,String token,int localPort,Supplier<String> grantProvider){this.url=url;this.id=id;this.token=token;this.localPort=localPort;this.grantProvider=grantProvider;}
     void close(){SSLSocket current=socket;if(current!=null)try{current.close();}catch(IOException ignored){}}
     boolean isConnected(){return connected;}
 
@@ -46,7 +48,8 @@ final class CloudRelayClient {
         InputStream in=new BufferedInputStream(tls.getInputStream());OutputStream out=tls.getOutputStream();
         byte[] nonce=new byte[16];random.nextBytes(nonce);String key=Base64.encodeToString(nonce,Base64.NO_WRAP);
         String host=uri.getHost()+(uri.getPort()<0?"":":"+port);
-        String request="GET /cloud/tunnel/"+id+" HTTP/1.1\r\nHost: "+host+"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: "+key+"\r\nAuthorization: Bearer "+token+"\r\n\r\n";
+        String grant=grantProvider.get();if(grant.length()<32)throw new IOException("cloud grant unavailable");
+        String request="GET /cloud/tunnel/"+id+" HTTP/1.1\r\nHost: "+host+"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: "+key+"\r\nAuthorization: Bearer "+grant+"\r\n\r\n";
         out.write(request.getBytes(StandardCharsets.US_ASCII));out.flush();
         String status=line(in);if(!status.startsWith("HTTP/1.1 101 ")&&!status.startsWith("HTTP/1.0 101 "))throw new IOException("relay handshake failed");
         String accept="";for(int i=0;i<64;i++){String header=line(in);if(header.isEmpty())break;int colon=header.indexOf(':');if(colon>0&&header.substring(0,colon).equalsIgnoreCase("Sec-WebSocket-Accept"))accept=header.substring(colon+1).trim();}
