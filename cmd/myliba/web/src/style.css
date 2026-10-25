@@ -702,6 +702,7 @@ body.detail-preview-open { overflow: hidden; }
 .hub-cloud-node { display: grid; gap: 5px; padding: 13px 0; border-bottom: 1px solid var(--line); }
 .hub-cloud-node-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .hub-cloud-node-heading strong { font-size: 12px; }
+.hub-profile-row .hub-device-id { display: block; overflow: visible; overflow-wrap: anywhere; white-space: normal; user-select: text; }
 .hub-cloud-node > small { color: var(--text-muted); font-size: 10px; }
 .hub-cloud-endpoint { overflow-wrap: anywhere; }
 .hub-cloud-status { padding: 3px 7px; border-radius: 6px; background: var(--green-soft); color: var(--green); font-size: 10px; }

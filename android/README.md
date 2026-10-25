@@ -26,6 +26,12 @@ Open `android/` as a project in Android Studio with JDK 17 and Android SDK 36. T
 
 The Windows toolchain is under `.runtime/android-toolchain/` at the repository root and is ignored by Git. `build.ps1` sets environment variables only for its own process; it does not change system settings.
 
+### Updating an installed APK
+
+Android accepts an in-place update only when the package ID and signing certificate match the installed app. Debug APKs from different signing keys cannot update each other. To sign future debug and release APKs with one retained key, set `MYLIBA_ANDROID_KEYSTORE`, `MYLIBA_ANDROID_STORE_PASSWORD`, `MYLIBA_ANDROID_KEY_ALIAS`, and `MYLIBA_ANDROID_KEY_PASSWORD` in the build process before running `build.ps1`. Keep the keystore and passwords outside Git, and reuse the **original** signing key if the app is already installed. A new key cannot repair a signature mismatch with an existing installation; uninstalling in that case deletes app-private data.
+
+On Android 8 and newer, the phone-derived node ID stays stable across uninstall and reinstall only with the same signing key and Android user. After a reinstall, pair again with the owner password. If the Hub already has this phone under an older ID, copy its complete ID from **Hub → 设备授权**, then enter it in **连接 Hub → 恢复 Hub 旧手机设备 ID**. This rotates that Hub device's credential and reconnects the phone under its old resource-node ID. Use this only for the same phone. The phone's local index, tags, saved queries, folder permissions, and app-private encrypted cloud blocks are not restored by re-pairing; reselect and rescan local folders. Cloud blocks need a separate backup or healthy replicas.
+
 Minimum Android version: 8.0 (API 26). No broad storage permission is requested. Android's folder picker controls which folders are available; some system folders cannot be selected on newer Android versions.
 
 ## First use

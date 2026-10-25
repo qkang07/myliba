@@ -2,6 +2,18 @@ plugins {
     id 'com.android.application'
 }
 
+def signingPath = System.getenv('MYLIBA_ANDROID_KEYSTORE')
+def signingStorePassword = System.getenv('MYLIBA_ANDROID_STORE_PASSWORD')
+def signingKeyAlias = System.getenv('MYLIBA_ANDROID_KEY_ALIAS')
+def signingKeyPassword = System.getenv('MYLIBA_ANDROID_KEY_PASSWORD')
+def signingValues = [signingPath, signingStorePassword, signingKeyAlias, signingKeyPassword]
+if (signingValues.any { it } && !signingValues.every { it }) {
+    throw new GradleException('Set all four MYLIBA_ANDROID signing variables together')
+}
+if (signingPath && !file(signingPath).isFile()) {
+    throw new GradleException('MYLIBA_ANDROID_KEYSTORE does not point to a file')
+}
+
 dependencies {
     implementation 'io.github.webrtc-sdk:android:150.7871.01'
 }
@@ -16,6 +28,21 @@ android {
         targetSdk 36
         versionCode 8
         versionName '0.4.4'
+    }
+
+    if (signingPath) {
+        signingConfigs {
+            myliba {
+                storeFile file(signingPath)
+                storePassword signingStorePassword
+                keyAlias signingKeyAlias
+                keyPassword signingKeyPassword
+            }
+        }
+        buildTypes {
+            debug { signingConfig signingConfigs.myliba }
+            release { signingConfig signingConfigs.myliba }
+        }
     }
 
     compileOptions {

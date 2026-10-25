@@ -25,10 +25,16 @@ public final class ResourceTransferService extends Service {
         if(intent==null)return START_NOT_STICKY;
         if("cancel".equals(intent.getAction())){String id=intent.getStringExtra("id");AtomicBoolean flag=cancelled.get(id);if(flag!=null)flag.set(true);return START_NOT_STICKY;}
         String id=UUID.randomUUID().toString(),name=intent.getStringExtra("name"),resource=intent.getStringExtra("resource"),base=intent.getStringExtra("base"),node=intent.getStringExtra("node");
-        long total=intent.getLongExtra("total",-1);if(name==null||resource==null||base==null)return START_NOT_STICKY;
-        AtomicBoolean flag=new AtomicBoolean();cancelled.put(id,flag);record(id,name,total,0,"等待下载","","");
+        long total=intent.getLongExtra("total",-1);
+        if("retry".equals(intent.getAction())){
+            id=intent.getStringExtra("id");JSONObject previous=find(id);if(previous==null||cancelled.containsKey(id)||!("失败".equals(previous.optString("status"))||"已取消".equals(previous.optString("status")))){if(active.get()==0)stopSelf(startId);return START_NOT_STICKY;}
+            name=previous.optString("name");resource=previous.optString("resource");base=previous.optString("base");node=previous.optString("node");total=previous.optLong("total",-1);
+        }
+        if(id==null||name==null||name.isEmpty()||resource==null||resource.isEmpty()||base==null||base.isEmpty()){if(active.get()==0)stopSelf(startId);return START_NOT_STICKY;}
+        AtomicBoolean flag=new AtomicBoolean();cancelled.put(id,flag);record(id,name,total,0,"等待下载","","",base,resource,node);
         active.incrementAndGet();if(Build.VERSION.SDK_INT>=34)startForeground(4321,notification("下载中 · "+name),ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);else startForeground(4321,notification("下载中 · "+name));
-        work.execute(()->{download(id,name,resource,base,node,total,flag);cancelled.remove(id);if(active.decrementAndGet()<=0)stopSelf();});
+        final String taskId=id,taskName=name,taskResource=resource,taskBase=base,taskNode=node;final long taskTotal=total;
+        work.execute(()->{download(taskId,taskName,taskResource,taskBase,taskNode,taskTotal,flag);cancelled.remove(taskId);if(active.decrementAndGet()<=0)stopSelf();});
         return START_STICKY;
     }
     private Notification notification(String text){Intent open=new Intent(this,MainActivity.class);PendingIntent click=PendingIntent.getActivity(this,2,open,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
@@ -56,9 +62,11 @@ public final class ResourceTransferService extends Service {
         finally{if(client!=null)client.close();}
     }
     static JSONArray records(Context context){synchronized(RECORDS){try{return new JSONArray(context.getSharedPreferences(PREFS,MODE_PRIVATE).getString("items","[]"));}catch(Exception ex){return new JSONArray();}}}
+    private JSONObject find(String id){if(id==null)return null;JSONArray items=records(this);for(int i=0;i<items.length();i++){JSONObject item=items.optJSONObject(i);if(item!=null&&id.equals(item.optString("id")))return item;}return null;}
     private void recoverInterrupted(){synchronized(RECORDS){JSONArray old=records(this),next=new JSONArray();boolean changed=false;for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item==null)continue;String state=item.optString("status");if("下载中".equals(state)||"等待下载".equals(state)){try{item.put("status","失败").put("error","传输中断，请重新下载");changed=true;}catch(JSONException ignored){}}next.put(item);}if(changed)getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
-    private void record(String id,String name,long total,long downloaded,String state,String uri,String error){synchronized(RECORDS){JSONArray old=records(this),next=new JSONArray();boolean found=false;for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item==null)continue;if(id.equals(item.optString("id"))){found=true;next.put(entry(id,name,total,downloaded,state,uri,error));}else next.put(item);}if(!found)next.put(entry(id,name,total,downloaded,state,uri,error));getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
-    private static JSONObject entry(String id,String name,long total,long downloaded,String state,String uri,String error){return RemoteClient.object("id",id,"name",name,"total",total,"downloaded",downloaded,"status",state,"uri",uri,"error",error);}
+    private void record(String id,String name,long total,long downloaded,String state,String uri,String error){record(id,name,total,downloaded,state,uri,error,null,null,null);}
+    private void record(String id,String name,long total,long downloaded,String state,String uri,String error,String base,String resource,String node){synchronized(RECORDS){JSONArray old=records(this),next=new JSONArray();boolean found=false;for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item==null)continue;if(id.equals(item.optString("id"))){found=true;next.put(entry(id,name,total,downloaded,state,uri,error,base==null?item.optString("base"):base,resource==null?item.optString("resource"):resource,node==null?item.optString("node"):node));}else next.put(item);}if(!found)next.put(entry(id,name,total,downloaded,state,uri,error,base,resource,node));getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
+    private static JSONObject entry(String id,String name,long total,long downloaded,String state,String uri,String error,String base,String resource,String node){return RemoteClient.object("id",id,"name",name,"total",total,"downloaded",downloaded,"status",state,"uri",uri,"error",error,"base",base==null?"":base,"resource",resource==null?"":resource,"node",node==null?"":node);}
     static void remove(Context context,String id){synchronized(RECORDS){JSONArray old=records(context),next=new JSONArray();for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item!=null&&!id.equals(item.optString("id")))next.put(item);}context.getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
     @Override public IBinder onBind(Intent intent){return null;}
     @Override public void onDestroy(){work.shutdownNow();super.onDestroy();}

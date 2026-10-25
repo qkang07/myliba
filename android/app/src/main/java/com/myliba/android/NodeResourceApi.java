@@ -70,8 +70,10 @@ final class NodeResourceApi {
         if(parts.length==4&&"resources".equals(parts[1])){
             LocalLibrary.Item found=item(parts[2]);if(found==null)return error(404,"资源不存在");
             if("file".equals(parts[3])&&"GET".equals(method))return file(found,requestHeaders,uri);
-            if("thumbnail".equals(parts[3])&&"GET".equals(method))return thumbnail(found);
-            if("thumbnail".equals(parts[3])&&"POST".equals(method))return json(200,new JSONObject().put("ok",true));
+            if("thumbnail".equals(parts[3])&&"GET".equals(method))return thumbnail(found,false);
+            if("thumbnail".equals(parts[3])&&"POST".equals(method)){
+                try(Result generated=thumbnail(found,true)){return generated.status==200?json(200,new JSONObject().put("ok",true)):error(404,"暂无缩略图");}
+            }
             if("tag-suggestions".equals(parts[3])&&"GET".equals(method))return json(200,new JSONObject().put("suggestions",new JSONArray()));
             if("video-info".equals(parts[3])&&"GET".equals(method))return videoInfo(found);
         }
@@ -125,15 +127,17 @@ final class NodeResourceApi {
         result.headers.put("Content-Security-Policy",new JSONArray().put("sandbox"));
         return result;
     }
-    private Result thumbnail(LocalLibrary.Item item)throws Exception{
+    private Result thumbnail(LocalLibrary.Item item,boolean force)throws Exception{
+        File cached=ThumbnailLoader.cacheFile(context,item.uri,item.modified,item.size);
+        if(!force&&cached.isFile()){cached.setLastModified(System.currentTimeMillis());return new Result(200,"image/jpeg",new FileInputStream(cached),cached.length());}
         Bitmap bitmap=null;Uri uri=Uri.parse(item.uri);
         try{
             if("video".equals(kind(item))){MediaMetadataRetriever retriever=new MediaMetadataRetriever();try{retriever.setDataSource(context,uri);bitmap=retriever.getFrameAtTime(0);}finally{retriever.release();}}
             else if("image".equals(kind(item))){BitmapFactory.Options options=new BitmapFactory.Options();options.inJustDecodeBounds=true;try(InputStream in=context.getContentResolver().openInputStream(uri)){BitmapFactory.decodeStream(in,null,options);}int sample=1;while(Math.max(options.outWidth,options.outHeight)/sample>1024)sample*=2;options.inJustDecodeBounds=false;options.inSampleSize=sample;try(InputStream in=context.getContentResolver().openInputStream(uri)){bitmap=BitmapFactory.decodeStream(in,null,options);}}
         }catch(Exception ignored){}
         if(bitmap==null)return error(404,"暂无缩略图");
-        ByteArrayOutputStream out=new ByteArrayOutputStream();try{bitmap.compress(Bitmap.CompressFormat.JPEG,82,out);}finally{bitmap.recycle();}
-        byte[] bytes=out.toByteArray();return new Result(200,"image/jpeg",new ByteArrayInputStream(bytes),bytes.length);
+        try{ThumbnailLoader.saveLocalThumbnail(cached,bitmap);}finally{bitmap.recycle();}
+        return new Result(200,"image/jpeg",new FileInputStream(cached),cached.length());
     }
     private Result videoInfo(LocalLibrary.Item item)throws Exception{
         MediaMetadataRetriever retriever=new MediaMetadataRetriever();long duration=0;

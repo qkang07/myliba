@@ -5,6 +5,7 @@
 .runtime/
 node_modules/
 .pnpm-store/
+cmd/myliba/web/dist/
 *.exe
 *.exe~
 *.db

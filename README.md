@@ -7,6 +7,7 @@ The native Android app lives in [`android/`](android/README.md). It indexes fold
 ## Local use
 
 Build the Vue web app before starting the Go service. The production files are embedded into the executable.
+The generated `cmd/myliba/web/dist/` directory is ignored by Git. On a fresh checkout, run `pnpm build:web` before invoking `go build`, `go run`, or `go test` directly for `cmd/myliba`.
 
 ```powershell
 pnpm install

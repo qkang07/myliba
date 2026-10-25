@@ -34,13 +34,14 @@ public final class MainActivity extends Activity {
     private ThumbnailLoader thumbs; private SharedPreferences prefs;
     private LocalFilters localFilters=new LocalFilters(),hubFilters=new LocalFilters();
     private LibraryStore.Meta meta=new LibraryStore.Meta();
-    private LinearLayout shell,header,content,navigation,batchDock;
+    private LinearLayout shell,header,content,navigation,batchDock,tagChoicesContainer;
     private ListView files;private ResourceAdapter adapter;private FrameLayout resultArea;
     private TextView resultLabel,footerLabel;private EditText search;
     private TextView nodeTitle,nodeStatus,nodeCounts,nodeCapacity,nodeAccess,nodePeers,nodeConfigure,nodeStop,resourceNodeStatus;
     private boolean displayedNodeRunning;
     private boolean home,grid,loading,selecting,busy,scanning,destroyed,needsLogin,storageOnly;
-    private int tab,generation,total; private String error="",scanMessage="",activeCollection;
+    private volatile boolean thumbnailGenerating,thumbnailCancel;
+    private int tab,generation,total; private String error="",scanMessage="",activeCollection,thumbnailMessage="";
     private final Runnable searchTask=()->reload(false,false);
     private final Runnable transferRefresh=new Runnable(){@Override public void run(){if(!destroyed&&tab==3){renderTransfers();handler.postDelayed(this,1000);}}};
     private final Runnable nodeRefresh=new Runnable(){@Override public void run(){if(!destroyed&&storageOnly){if(displayedNodeRunning!=CloudStorageService.running)render();else updateStorageOnlyStatus();handler.postDelayed(this,3000);}}};
@@ -71,13 +72,13 @@ public final class MainActivity extends Activity {
     }
     private void navigate(int page){if(tab==page)return;hideKeyboard();handler.removeCallbacks(searchTask);handler.removeCallbacks(transferRefresh);handler.removeCallbacks(resourceNodeRefresh);generation++;loading=false;tab=page;selected.clear();selecting=false;error="";render();if(tab==3)handler.postDelayed(transferRefresh,1000);else{if(tab==2)handler.postDelayed(resourceNodeRefresh,3000);reload(false,true);}}
     private void render(){
-        header.removeAllViews();content.removeAllViews();files=null;adapter=null;search=null;resultArea=null;resultLabel=null;
+        header.removeAllViews();content.removeAllViews();files=null;adapter=null;search=null;resultArea=null;resultLabel=null;tagChoicesContainer=null;
         if(storageOnly){renderStorageOnly();return;}
         navigation.setVisibility(View.VISIBLE);batchDock.setVisibility(View.VISIBLE);
-        header.setPadding(ui.d(22),ui.d(14),ui.d(18),ui.d(14));
+        header.setPadding(ui.d(20),ui.d(10),ui.d(18),ui.d(9));
         TextView brand=ui.text("MYLIBA",10,GREEN,true);brand.setLetterSpacing(.18f);header.addView(brand);
         LinearLayout title=ui.row();String[] titles={"资源库","文件夹","来源","传输列表"};title.addView(ui.text(titles[tab],28,INK,true),ui.weight());
-        LinearLayout source=ui.row();ui.pad(source,12,8);source.addView(ui.icon(home?"server":"phone",17,GREEN));TextView label=ui.text(home?selectedNodeName():"本机",12,GREEN,true);label.setPadding(ui.d(7),0,ui.d(5),0);source.addView(label);source.addView(ui.icon("down",15,GREEN));ui.touch(source,SOFT,20,this::sourceSheet);source.setContentDescription("切换资源库，当前"+(home?selectedNodeName():"本机"));title.addView(source);
+        LinearLayout source=ui.row();ui.pad(source,10,7);source.addView(ui.icon(home?"server":"phone",17,GREEN));TextView label=ui.text(home?selectedNodeName():localNodeName(),12,GREEN,true);label.setPadding(ui.d(6),0,ui.d(4),0);label.setSingleLine();label.setEllipsize(TextUtils.TruncateAt.END);label.setMaxWidth(ui.d(96));source.addView(label);source.addView(ui.icon("down",15,GREEN));ui.touch(source,SOFT,20,this::sourceSheet);source.setContentDescription("切换资源库，当前"+(home?selectedNodeName():"本节点 "+localNodeName()));title.addView(source);
         header.addView(title,ui.top(7));
         if(tab==0)renderLibrary();else if(tab==1)renderFolders();else if(tab==2)renderSources();else renderTransfers();
         renderNav();renderBatch();
@@ -142,20 +143,26 @@ public final class MainActivity extends Activity {
         search.setOnEditorActionListener((v,id,event)->{handler.removeCallbacks(searchTask);hideKeyboard();reload(false,false);return true;});
         ArrayList<View> types=new ArrayList<>();String[] keys={"","image","video","document","audio"};String[] names={"全部","图片","视频","文档","音频"};
         for(int i=0;i<keys.length;i++){String key=keys[i];boolean active=key.isEmpty()?f().attributes.stream().noneMatch(x->x.startsWith("type:")):f().attributes.contains("type:"+key);types.add(ui.chip(names[i],active,()->{LocalFilters next=f().copy();next.attributes.removeIf(x->x.startsWith("type:"));if(!key.isEmpty())next.attributes.add("type:"+key);applyFilters(next,false);}));}
-        controls.addView(ui.rail(types),ui.top(12));
+        controls.addView(ui.rail(types),ui.top(7));
+        tagChoicesContainer=ui.col();controls.addView(tagChoicesContainer);renderTagChoices();
         ArrayList<View> applied=new ArrayList<>();
         if(!f().folderId.equals("all"))applied.add(ui.chip(folderName(f().folderId)+"  ×",true,()->{f().folderId="all";activeCollection=null;refreshScreen(true);}));
         if(activeCollection!=null){LibraryStore.Group g=find(meta.collections,activeCollection);if(g!=null)applied.add(ui.chip(g.name+"  ×",true,()->{activeCollection=null;refreshScreen(false);}));}
-        for(String tag:f().tags)applied.add(ui.chip(tag+"  ×",true,()->{f().tags.remove(tag);refreshScreen(false);}));
         if(f().unorganized)applied.add(ui.chip("待整理  ×",true,()->{f().unorganized=false;refreshScreen(false);}));
         for(String key:f().attributes)if(!key.startsWith("type:"))applied.add(ui.chip(LocalLibrary.attributeLabel(key)+"  ×",true,()->{f().attributes.remove(key);refreshScreen(false);}));
         if(!f().rootUri.isEmpty())applied.add(ui.chip("已选来源  ×",true,()->{f().rootUri="";refreshScreen(false);}));
-        if(!applied.isEmpty())controls.addView(ui.rail(applied),ui.top(8));
-        LinearLayout tools=ui.row();resultLabel=ui.text("最近文件",13,INK,true);tools.addView(resultLabel,ui.weight());tools.addView(ui.iconButton("sort","排序",this::sortSheet));tools.addView(ui.iconButton(grid?"list":"grid",grid?"切换列表":"切换网格",()->{grid=!grid;prefs.edit().putBoolean("view_grid",grid).apply();render();}));tools.addView(ui.iconButton("more","资源操作",this::libraryMenu));controls.addView(tools,ui.top(8));
+        if(!applied.isEmpty())controls.addView(ui.rail(applied),ui.top(5));
+        LinearLayout tools=ui.row();resultLabel=ui.text("最近文件",13,INK,true);tools.addView(resultLabel,ui.weight());tools.addView(ui.iconButton("sort","排序",this::sortSheet));tools.addView(ui.iconButton(grid?"list":"grid",grid?"切换列表":"切换网格",()->{grid=!grid;prefs.edit().putBoolean("view_grid",grid).apply();render();}));tools.addView(ui.iconButton("more","资源操作",this::libraryMenu));controls.addView(tools,ui.top(3));
         resultArea=new FrameLayout(this);content.addView(resultArea,new LinearLayout.LayoutParams(-1,0,1));
         files=new ListView(this);files.setDivider(null);files.setSelector(android.R.color.transparent);files.setClipToPadding(false);files.setPadding(ui.d(20),0,ui.d(20),ui.d(12));files.setVerticalScrollBarEnabled(false);
         footerLabel=ui.text("加载更多",13,GREEN,true);footerLabel.setGravity(Gravity.CENTER);ui.pad(footerLabel,12,18);footerLabel.setOnClickListener(v->reload(true,false));files.addFooterView(footerLabel);
         adapter=new ResourceAdapter();files.setAdapter(adapter);resultArea.addView(files,new FrameLayout.LayoutParams(-1,-1));updateResults();
+    }
+    private void renderTagChoices(){
+        if(tagChoicesContainer==null)return;tagChoicesContainer.removeAllViews();
+        ArrayList<View> choices=new ArrayList<>();
+        for(LibraryStore.Facet tag:meta.tags){String key=tag.key;choices.add(ui.chip(tag.name,f().tags.contains(key),()->{LocalFilters next=f().copy();if(next.tags.contains(key))next.tags.remove(key);else next.tags.add(key);applyFilters(next,false);}));}
+        if(!choices.isEmpty())tagChoicesContainer.addView(ui.rail(choices),ui.top(5));
     }
     private void updateResults(){
         if(adapter==null||tab!=0)return;adapter.notifyDataSetChanged();resultLabel.setText((selecting?"选择文件":f().query.isEmpty()?"最近文件":"搜索结果")+(total>0?"  ·  "+total:""));
@@ -184,9 +191,9 @@ public final class MainActivity extends Activity {
     private final class Cell {
         final LinearLayout root,copy; final FrameLayout preview; final ImageView image,placeholder,more;final TextView name,info,tags;final boolean tile;
         Cell(boolean tile){this.tile=tile;root=tile?ui.col():ui.row();root.setBackground(ui.shape(PAPER,17,0));ui.pad(root,tile?0:12,tile?0:11);
-            preview=new FrameLayout(MainActivity.this);preview.setClipToOutline(true);preview.setBackground(ui.shape(SOFT,tile?16:13,0));image=new ImageView(MainActivity.this);image.setScaleType(ImageView.ScaleType.CENTER_CROP);preview.addView(image,new FrameLayout.LayoutParams(-1,-1));placeholder=ui.icon("file",tile?38:27,GREEN);preview.addView(placeholder,new FrameLayout.LayoutParams(ui.d(tile?38:27),ui.d(tile?38:27),Gravity.CENTER));root.addView(preview,ui.lp(tile?-1:58,tile?122:58));
-            copy=ui.col();if(tile)ui.pad(copy,12,12);else copy.setPadding(ui.d(12),0,0,0);
-            name=ui.text("",tile?13:14,INK,true);name.setMaxLines(tile?2:1);name.setEllipsize(TextUtils.TruncateAt.END);if(tile)name.setMinHeight(ui.d(36));copy.addView(name);
+            preview=new FrameLayout(MainActivity.this);preview.setClipToOutline(true);preview.setBackground(ui.shape(SOFT,tile?16:13,0));image=new ImageView(MainActivity.this);image.setScaleType(ImageView.ScaleType.CENTER_CROP);preview.addView(image,new FrameLayout.LayoutParams(-1,-1));placeholder=ui.icon("file",tile?38:27,GREEN);preview.addView(placeholder,new FrameLayout.LayoutParams(ui.d(tile?38:27),ui.d(tile?38:27),Gravity.CENTER));root.addView(preview,ui.lp(tile?-1:58,tile?102:58));
+            copy=ui.col();if(tile)ui.pad(copy,10,9);else copy.setPadding(ui.d(12),0,0,0);
+            name=ui.text("",tile?13:14,INK,true);name.setMaxLines(tile?2:1);name.setEllipsize(TextUtils.TruncateAt.END);copy.addView(name);
             info=ui.text("",11,MUTED,false);info.setSingleLine();info.setEllipsize(TextUtils.TruncateAt.END);copy.addView(info,ui.top(5));
             tags=ui.text("",10,GREEN,false);tags.setSingleLine();tags.setEllipsize(TextUtils.TruncateAt.END);copy.addView(tags,ui.top(6));
             if(tile)root.addView(copy,ui.lp(-1,-2));else root.addView(copy,ui.weight());
@@ -207,17 +214,25 @@ public final class MainActivity extends Activity {
         if(destroyed||scanning)return;if(append&&loading)return;LibraryStore s=store();if(s==null){loading=false;updateResults();return;}
         LocalFilters query=f().copy();int token=++generation,offset=append?entries.size():0;int targetTab=tab;loading=true;error="";if(!append){selected.clear();selecting=false;}updateResults();
         io.execute(()->{try{LibraryStore.Meta next=(metadata||targetTab==0&&!append)?s.metadata(query):null;LibraryStore.Page p=targetTab==0?s.page(query,offset):null;
-            runOnUiThread(()->{if(destroyed||token!=generation||s!=store())return;loading=false;needsLogin=false;if(next!=null)meta=next;if(p!=null){if(!append)entries.clear();entries.addAll(p.items);total=p.total;}if(tab==0)updateResults();else render();});
+            runOnUiThread(()->{if(destroyed||token!=generation||s!=store())return;if(home&&s.remote&&s.client.selectedNodeId.equals(ResourceNodeService.ensureID(this))){switchSource(false);return;}loading=false;needsLogin=false;if(next!=null){meta=next;renderTagChoices();}if(p!=null){if(!append)entries.clear();entries.addAll(p.items);total=p.total;}if(tab==0)updateResults();else render();});
         }catch(Exception e){runOnUiThread(()->{if(destroyed||token!=generation||s!=store())return;loading=false;error=message(e);needsLogin=e instanceof RemoteClient.Failure&&((RemoteClient.Failure)e).status==401;if(needsLogin)entries.clear();if(tab==0)updateResults();else render();});}});
     }
     private void refreshScreen(boolean metadata){hideKeyboard();handler.removeCallbacks(searchTask);selected.clear();selecting=false;entries.clear();render();reload(false,metadata);}
     private void applyFilters(LocalFilters value,boolean metadata){setFilters(value);refreshScreen(metadata);}
     private int filterCount(){return f().tags.size()+f().attributes.size()+(f().rootUri.isEmpty()?0:1)+(f().unorganized?1:0);}
     private void sourceSheet(){
-        MobileUi.Sheet s=ui.sheet("选择资源库","选择 Hub 上的资源节点，或浏览这台手机的本地资源。");
-        s.body.addView(ui.item("phone","本机文件",!home?"当前资源库 · 可离线使用":"读取已授权的手机文件夹",()->{s.close();switchSource(false);}));
-        s.body.addView(ui.item("server","连接 Hub",hubStore==null?"连接你的 Myliba 服务端":Uri.parse(hubStore.client.base).getHost(),()->{s.close();if(hubStore==null)connectSheet();else switchSource(true);}),ui.top(10));
+        MobileUi.Sheet s=ui.sheet("选择资源库","这台手机是一个资源节点。连接 Hub 后，可切换到其他设备的资源库。");
+        populateSourceSheet(s);
+        s.show();
+        LibraryStore current=hubStore;
+        if(current!=null)io.execute(()->{try{current.client.json("GET","/api/session",null);runOnUiThread(()->{if(!destroyed&&s.dialog.isShowing()&&current==hubStore)populateSourceSheet(s);});}catch(Exception ex){runOnUiThread(()->{if(!destroyed&&s.dialog.isShowing()&&current==hubStore)s.body.addView(ui.text("Hub 节点列表暂不可用："+message(ex),11,RED,false),ui.top(10));});}});
+    }
+    private void populateSourceSheet(MobileUi.Sheet s){
+        s.body.removeAllViews();
+        s.body.addView(ui.item("server",hubStore==null?"连接 Hub":"Hub 连接设置",hubStore==null?"连接你的 Myliba Hub":Uri.parse(hubStore.client.base).getHost(),()->{s.close();connectSheet();}));
+        s.body.addView(ui.item("phone","本节点 · "+localNodeName(),!home?"当前资源库 · 可离线使用":"读取这台手机已授权的文件夹",()->{s.close();switchSource(false);}),ui.top(10));
         if(hubStore!=null){JSONArray nodes=hubStore.client.nodes;for(int i=0;i<nodes.length();i++){JSONObject node=nodes.optJSONObject(i);if(node==null)continue;String id=node.optString("id");
+            if(id.equals(ResourceNodeService.ensureID(this)))continue;
             s.body.addView(ui.item("android".equals(node.optString("kind"))?"phone":"server",node.optString("name",id),node.optBoolean("online")?(id.equals(hubStore.client.selectedNodeId)?"当前节点 · 在线":"在线 · 点击切换"):"离线",()->{
                 s.close();LibraryStore current=hubStore;io.execute(()->{try{current.client.selectNode(id);runOnUiThread(()->{if(destroyed||hubStore!=current)return;home=true;tab=0;hubFilters=new LocalFilters();activeCollection=null;generation++;entries.clear();meta=new LibraryStore.Meta();render();reload(false,true);});}catch(Exception ex){runOnUiThread(()->toast("切换节点失败："+message(ex)));}});
             }),ui.top(8));
@@ -226,10 +241,10 @@ public final class MainActivity extends Activity {
                     LibraryStore current=hubStore;io.execute(()->{try{current.client.json("DELETE","/api/hub/nodes/"+RemoteClient.enc(id),null);current.client.json("GET","/api/session",null);runOnUiThread(()->{if(destroyed||hubStore!=current)return;toast("已移除离线节点");render();if(home)reload(false,true);});}catch(Exception ex){runOnUiThread(()->toast("移除节点失败："+message(ex)));}});
                 });
             }),ui.top(4));}}
-        s.show();
     }
-    private String selectedNodeName(){if(hubStore==null)return "Hub";JSONArray nodes=hubStore.client.nodes;for(int i=0;i<nodes.length();i++){JSONObject node=nodes.optJSONObject(i);if(node!=null&&hubStore.client.selectedNodeId.equals(node.optString("id")))return node.optString("name","Hub");}return "Hub";}
-    private void libraryMenu(){MobileUi.Sheet s=ui.sheet("资源操作",null);s.body.addView(ui.item("check","选择文件","长按任意文件也可开始选择",()->{s.close();selecting=true;updateResults();}));s.body.addView(ui.item("spark","保存为常用查询","保存当前搜索和筛选条件",()->{s.close();saveCollection(null);}));if(home)s.body.addView(ui.item("refresh","后台预处理","查看缩略图与文件指纹任务",()->{s.close();preprocessSheet();}));s.body.addView(ui.item("refresh","刷新资源库","重新读取索引中的文件",()->{s.close();reload(false,true);}));s.show();}
+    private String localNodeName(){return getSharedPreferences(ResourceNodeService.PREFS,MODE_PRIVATE).getString("name",Build.MODEL);}
+    private String selectedNodeName(){if(hubStore==null)return "Hub";if(hubStore.client.selectedNodeId.equals(ResourceNodeService.ensureID(this)))return "本节点";JSONArray nodes=hubStore.client.nodes;for(int i=0;i<nodes.length();i++){JSONObject node=nodes.optJSONObject(i);if(node!=null&&hubStore.client.selectedNodeId.equals(node.optString("id")))return node.optString("name","Hub");}return "Hub";}
+    private void libraryMenu(){MobileUi.Sheet s=ui.sheet("资源操作",null);s.body.addView(ui.item("check","选择文件","长按任意文件也可开始选择",()->{s.close();selecting=true;updateResults();}));s.body.addView(ui.item("spark","保存为常用查询","保存当前搜索和筛选条件",()->{s.close();saveCollection(null);}));if(home)s.body.addView(ui.item("refresh","后台预处理","查看缩略图与文件指纹任务",()->{s.close();preprocessSheet();}));else s.body.addView(ui.item("image","生成本机缩略图","预先为已索引的图片、视频和 PDF 生成封面",()->{s.close();generateLocalThumbnails();}));s.body.addView(ui.item("refresh","刷新资源库","重新读取索引中的文件",()->{s.close();reload(false,true);}));s.show();}
     private void preprocessSheet(){LibraryStore s=store();if(s==null||!s.remote)return;MobileUi.Sheet sheet=ui.sheet("后台预处理","家中资源库的缩略图和文件指纹任务");TextView loading=ui.text("正在读取任务…",13,MUTED,false);sheet.body.addView(loading);sheet.show();loadPreprocess(sheet,s);}
     private void loadPreprocess(MobileUi.Sheet sheet,LibraryStore s){io.execute(()->{try{JSONObject queue=s.client.json("GET","/api/preprocess",null);runOnUiThread(()->{if(destroyed||!sheet.dialog.isShowing())return;sheet.body.removeAllViews();sheet.footer.removeAllViews();JSONObject counts=queue.optJSONObject("counts");if(counts!=null)sheet.body.addView(ui.text("排队 "+counts.optInt("pending")+" · 处理中 "+counts.optInt("running")+" · 失败 "+counts.optInt("failed")+" · 完成 "+counts.optInt("done"),13,INK,true));if(counts!=null&&counts.optInt("failed")>0)sheet.body.addView(ui.button("重试全部失败任务",false,()->{sheet.close();mutate(s,()->s.client.json("POST","/api/preprocess/retry-failed",null),"已重新排队",()->preprocessSheet());}),ui.top(14));JSONArray jobs=queue.optJSONArray("jobs");if(jobs==null||jobs.length()==0)sheet.body.addView(ui.text("当前没有任务",13,MUTED,false),ui.top(16));else for(int i=0;i<jobs.length();i++){JSONObject job=jobs.optJSONObject(i);if(job==null)continue;String status=job.optString("status");String label=status.equals("pending")?"排队中":status.equals("running")?"处理中":status.equals("failed")?"失败":"已完成";String op=job.optString("operation").equals("thumbnail")?"缩略图":"文件指纹";String detail=op+" · "+label+(job.optInt("priority")>0&&status.equals("pending")?" · 当前列表优先":"");if(!job.optString("error").isEmpty())detail+=" · "+job.optString("error");String id=job.optString("resourceId");LinearLayout row=ui.item(op.equals("缩略图")?"image":"file",job.optString("name"),detail,()->{if(!status.equals("failed"))return;sheet.close();mutate(s,()->s.client.json("POST","/api/preprocess/"+RemoteClient.enc(id)+"/retry",null),"任务已重新排队",()->preprocessSheet());});sheet.body.addView(row,ui.top(8));}sheet.footer.addView(ui.button("刷新状态",false,()->loadPreprocess(sheet,s)),ui.top(8));});}catch(Exception ex){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing()){sheet.body.removeAllViews();sheet.body.addView(ui.text("读取失败："+message(ex),13,RED,false));}});}});}
     private void toggleSelection(String id){selecting=true;if(!selected.add(id))selected.remove(id);updateResults();}
@@ -291,19 +306,20 @@ public final class MainActivity extends Activity {
     private void collectionMenu(LibraryStore.Group g){MobileUi.Sheet s=ui.sheet(g.name,collectionSummary(g.filters));s.body.addView(ui.item("edit","重命名",null,()->{s.close();saveCollection(g);}));s.body.addView(ui.item("refresh","用当前筛选更新",collectionSummary(f()),()->{s.close();LibraryStore st=store();LocalFilters copy=f().copy();mutate(st,()->st.saveCollection(g.id,g.name,copy),"查询条件已更新",null);}));s.body.addView(ui.item("trash","删除常用查询","文件不会被删除",()->{s.close();confirm("删除这个常用查询？",g.name,()->{LibraryStore st=store();mutate(st,()->st.deleteCollection(g.id),"常用查询已删除",()->{if(g.id.equals(activeCollection))activeCollection=null;});});}));s.show();}
     private void renderSources(){
         LinearLayout body=scrollBody();body.addView(ui.text("连接文件所在的地方。",13,MUTED,false));
-        LinearLayout current=ui.card();LinearLayout head=ui.row();ImageView symbol=ui.icon(home?"server":"phone",44,GREEN);ui.pad(symbol,10,10);symbol.setBackground(ui.shape(SOFT,14,0));head.addView(symbol);LinearLayout copy=ui.col();copy.setPadding(ui.d(12),0,0,0);copy.addView(ui.text(home?"家中资源库":"这台手机",17,INK,true));copy.addView(ui.text(home?(hubStore==null?"尚未连接":needsLogin?"需要登录":error.isEmpty()?(meta.online?"节点在线":"等待家中节点"):"连接中断"):"本地索引 · 离线可用",11,MUTED,false),ui.top(5));head.addView(copy,ui.weight());current.addView(head);current.addView(ui.text(home?(hubStore==null?"添加服务端地址，在手机上浏览家中资源。":hubStore.client.base):"只访问你授权的文件夹，不移动原文件。",12,MUTED,false),ui.top(15));
-        if(home){current.addView(ui.button(hubStore==null?"连接服务端":"连接设置",true,this::connectSheet),ui.top(16));if(hubStore!=null)current.addView(ui.button("退出登录",false,this::logout),ui.top(8));}else current.addView(ui.button(scanning?"正在扫描…":"添加索引目录",true,this::pickTree),ui.top(16));body.addView(current,ui.top(20));
+        section(body,"Hub",hubStore==null?null:"设置",hubStore==null?null:this::connectSheet);body.addView(connectionCard(),ui.top(10));
+        LinearLayout current=ui.card();LinearLayout head=ui.row();ImageView symbol=ui.icon(home?"server":"phone",44,GREEN);ui.pad(symbol,10,10);symbol.setBackground(ui.shape(SOFT,14,0));head.addView(symbol);LinearLayout copy=ui.col();copy.setPadding(ui.d(12),0,0,0);copy.addView(ui.text(home?selectedNodeName():"本节点 · "+localNodeName(),17,INK,true));copy.addView(ui.text(home?(hubStore==null?"尚未连接":needsLogin?"需要登录":error.isEmpty()?(meta.online?"节点在线":"等待资源节点"):"连接中断"):"本地索引 · 离线可用",11,MUTED,false),ui.top(5));head.addView(copy,ui.weight());current.addView(head);current.addView(ui.text(home?"通过 Hub 访问此资源节点":"只访问你授权的文件夹，不移动原文件。",12,MUTED,false),ui.top(15));
+        if(home){current.addView(ui.button(hubStore==null?"连接 Hub":"切换资源节点",true,hubStore==null?this::connectSheet:this::sourceSheet),ui.top(16));if(hubStore!=null)current.addView(ui.button("退出登录",false,this::logout),ui.top(8));}else current.addView(ui.button(scanning?"正在扫描…":"添加索引目录",true,this::pickTree),ui.top(16));body.addView(current,ui.top(20));
         if(!home){
             section(body,"手机资源节点",null,null);
             body.addView(ui.item("server",ResourceNodeService.running?"资源节点运行中":"让其他客户端访问本机资源库",ResourceNodeService.status,this::resourceNodeSheet),ui.top(10));
             resourceNodeStatus=ui.text(ResourceNodeService.status,12,MUTED,false);body.addView(resourceNodeStatus,ui.top(6));
+			body.addView(ui.item("image",thumbnailGenerating?"停止生成缩略图":"生成本机缩略图",thumbnailGenerating?thumbnailMessage:thumbnailMessage.isEmpty()?"为已索引的图片、视频和 PDF 预生成封面":thumbnailMessage,()->{if(thumbnailGenerating){thumbnailCancel=true;thumbnailMessage="正在停止…";render();}else generateLocalThumbnails();}),ui.top(9));
 			section(body,"云层存储节点",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"用这台手机存储加密块",CloudStorageService.running?CloudStorageService.status+" · 可连通 "+CloudStorageService.peerLinks.values().stream().filter(value->value.endsWith("直连")).count()+"/"+CloudStorageService.peerLinks.size()+" 节点":"使用主人授权的设备凭据连接 Hub",this::cloudStorageSheet),ui.top(10));body.addView(ui.item("shield","切换为仅存储模式","保留同一 APK，只显示节点运行与配置",this::enterStorageMode),ui.top(9));
         }
         if(!scanMessage.isEmpty()&&!home)body.addView(ui.text(scanMessage,12,GREEN,false),ui.top(12));if(!error.isEmpty())body.addView(errorCard(),ui.top(12));
         section(body,"索引目录",meta.roots.size()+" 个",null);
         if(meta.roots.isEmpty())body.addView(ui.text(home?"连接后可查看服务端已配置的目录。":"在这里添加照片、下载或工作资料文件夹。",12,MUTED,false),ui.top(10));
         for(LibraryStore.Group r:meta.roots){LinearLayout row=ui.item("folder",shortPath(r.name),r.count+" 个文件"+(home?" · "+r.name:""),()->{LocalFilters next=new LocalFilters();next.rootUri=r.id;setFilters(next);activeCollection=null;tab=0;refreshScreen(false);});if(!home){row.removeViewAt(row.getChildCount()-1);row.addView(ui.iconButton("more",r.name+"的操作",()->rootMenu(r)));}body.addView(row,ui.top(9));}
-        if(!home){section(body,"家中资源库",null,null);body.addView(connectionCard(),ui.top(12));}
         section(body,"诊断",null,null);body.addView(ui.item("file","查看诊断日志","直连状态、异常记录和导出诊断包",this::diagnosticsSheet),ui.top(10));
         LinearLayout note=ui.row();note.addView(ui.icon("shield",18,MUTED));TextView message=ui.text("本机与服务端的标签、文件夹分别保存。",11,MUTED,false);message.setPadding(ui.d(8),0,0,0);note.addView(message,ui.weight());body.addView(note,ui.top(24));
     }
@@ -322,7 +338,7 @@ public final class MainActivity extends Activity {
         intent.putExtra(Intent.EXTRA_TITLE,"myliba-diagnostics-"+stamp+".zip");
         try{startActivityForResult(intent,EXPORT_LOG);}catch(ActivityNotFoundException ex){toast("设备没有可用的文件保存器");}
     }
-    private View connectionCard(){return ui.item("server",hubStore==null?"连接家中资源库":"打开家中资源库",hubStore==null?"通过你的 Myliba 服务端访问家中文件":Uri.parse(hubStore.client.base).getHost(),()->{if(hubStore==null||needsLogin)connectSheet();else if(home)navigate(0);else{tab=0;switchSource(true);}});}
+    private View connectionCard(){return ui.item("server",hubStore==null?"连接 Hub":"选择 Hub 资源节点",hubStore==null?"连接一次，即可访问获授权的其他节点":Uri.parse(hubStore.client.base).getHost(),()->{if(hubStore==null||needsLogin)connectSheet();else sourceSheet();});}
     private void resourceNodeSheet(){
         SharedPreferences settings=getSharedPreferences(ResourceNodeService.PREFS,MODE_PRIVATE);
         String tokenValue;try{tokenValue=CloudSecretStore.read(settings,"token");}catch(Exception ex){tokenValue="";}
@@ -411,13 +427,15 @@ public final class MainActivity extends Activity {
         parent.addView(row,ui.top(top));
     }
     private void connectSheet(){
-        MobileUi.Sheet s=ui.sheet("连接家中资源库","首次输入主人密码，为这台手机授权。以后由设备凭据自动连接。");s.body.addView(ui.icon("server",42,GREEN));s.body.addView(ui.text("服务端地址",12,INK,true),ui.top(22));EditText address=ui.input("https://library.example.com",hubStore==null?"":hubStore.client.base);address.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_URI);s.body.addView(address,ui.top(9));s.body.addView(ui.text("主人密码（已授权设备可留空）",12,INK,true),ui.top(18));EditText password=ui.input("与 Web 端使用相同的密码","");password.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);addClearablePassword(s.body,password,9);TextView status=ui.text("主人密码不会保存在手机上；设备凭据由系统安全存储。",12,MUTED,false);s.body.addView(status,ui.top(14));TextView connect=ui.button("连接资源库",true,()->{});s.footer.addView(connect);
-        connect.setOnClickListener(v->{if(busy)return;final String base;try{base=RemoteClient.normalize(address.getText().toString());}catch(Exception e){status.setText(message(e));status.setTextColor(RED);return;}String pass=password.getText().toString();RemoteClient candidate=new RemoteClient(base,prefs,this);connect.setEnabled(false);connect.setText("正在连接…");status.setText("正在验证连接");status.setTextColor(MUTED);busy=true;
+        MobileUi.Sheet s=ui.sheet("连接 Hub","首次输入主人密码，为这台手机授权。以后由设备凭据自动连接。");s.body.addView(ui.icon("server",42,GREEN));s.body.addView(ui.text("Hub 地址",12,INK,true),ui.top(22));EditText address=ui.input("https://library.example.com",hubStore==null?"":hubStore.client.base);address.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_URI);s.body.addView(address,ui.top(9));s.body.addView(ui.text("主人密码（已授权设备可留空）",12,INK,true),ui.top(18));EditText password=ui.input("与 Web 端使用相同的密码","");password.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);addClearablePassword(s.body,password,9);
+        s.body.addView(ui.text("恢复 Hub 旧手机设备 ID（可选）",12,INK,true),ui.top(18));EditText oldID=ui.input("从 Hub 的设备授权列表复制完整 ID","");s.body.addView(oldID,ui.top(9));s.body.addView(ui.text("仅在卸载重装后恢复旧设备时填写；需要主人密码。此操作会更新旧设备的授权凭据。",12,MUTED,false),ui.top(7));
+        TextView status=ui.text("主人密码不会保存在手机上；设备凭据由系统安全存储。",12,MUTED,false);s.body.addView(status,ui.top(14));TextView connect=ui.button("连接 Hub",true,()->{});s.footer.addView(connect);
+        connect.setOnClickListener(v->{if(busy)return;final String base;try{base=RemoteClient.normalize(address.getText().toString());}catch(Exception e){status.setText(message(e));status.setTextColor(RED);return;}String pass=password.getText().toString(),restoreID=oldID.getText().toString().trim();if(!restoreID.isEmpty()&&pass.isEmpty()){status.setText("恢复旧设备 ID 需要主人密码");status.setTextColor(RED);return;}RemoteClient candidate=new RemoteClient(base,prefs,this);connect.setEnabled(false);connect.setText("正在连接…");status.setText("正在验证连接");status.setTextColor(MUTED);busy=true;
             io.execute(()->{try{
                 boolean paired=false,legacyHub=false;
                 if(!pass.isEmpty()){
                     candidate.json("POST","/api/session",RemoteClient.object("password",pass));
-                    String id=ResourceNodeService.ensureID(this);
+                    String id=restoreID.isEmpty()?ResourceNodeService.ensureID(this):verifiedOldAndroidID(candidate,restoreID);
                     try{
                         JSONObject result=candidate.json("POST","/api/hub/devices",RemoteClient.object("id",id,"name",android.os.Build.MODEL,"kind","android","canBrowse",true,"canServe",true,"canCloud",true));
                         String token=result.getString("token");candidate.pairedCredential(id,token);ResourceNodeService.savePaired(this,base,id,token);
@@ -431,9 +449,21 @@ public final class MainActivity extends Activity {
                 }else candidate.json("GET","/api/session",null);
                 String savedCookie=CloudSecretStore.protect(candidate.cookie());
                 final boolean restartNode=paired&&ResourceNodeService.running,restartCloud=paired&&CloudStorageService.running&&base.equals(getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE).getString("hub","")),oldHub=legacyHub;
-                runOnUiThread(()->{busy=false;if(destroyed)return;prefs.edit().putString("server_url",base).putString("server_cookie",savedCookie).apply();hubStore=new LibraryStore(db,candidate);home=true;tab=0;needsLogin=false;error="";meta=new LibraryStore.Meta();entries.clear();generation++;s.close();render();reload(false,true);if(oldHub)toast("Hub 尚未支持设备授权，暂用旧登录");if(restartNode){stopService(new Intent(this,ResourceNodeService.class));handler.postDelayed(()->startForegroundService(new Intent(this,ResourceNodeService.class)),700);}if(restartCloud){stopService(new Intent(this,CloudStorageService.class));handler.postDelayed(()->startForegroundService(new Intent(this,CloudStorageService.class)),700);}});
-            }catch(Exception e){runOnUiThread(()->{busy=false;if(destroyed)return;connect.setEnabled(true);connect.setText("连接资源库");status.setText(e instanceof RemoteClient.Failure&&((RemoteClient.Failure)e).status==401?"密码不正确或登录已过期，请重新输入。":message(e));status.setTextColor(RED);});}});
+                runOnUiThread(()->{busy=false;if(destroyed){new Thread(candidate::close,"resource-rtc-dispose").start();return;}if(hubStore!=null){RemoteClient previous=hubStore.client;new Thread(previous::close,"resource-rtc-dispose").start();}prefs.edit().putString("server_url",base).putString("server_cookie",savedCookie).apply();hubStore=new LibraryStore(db,candidate);home=!candidate.selectedNodeId.equals(ResourceNodeService.ensureID(this));tab=0;needsLogin=false;error="";meta=new LibraryStore.Meta();entries.clear();generation++;s.close();render();reload(false,true);if(oldHub)toast("Hub 尚未支持设备授权，暂用旧登录");if(restartNode){stopService(new Intent(this,ResourceNodeService.class));handler.postDelayed(()->startForegroundService(new Intent(this,ResourceNodeService.class)),700);}if(restartCloud){stopService(new Intent(this,CloudStorageService.class));handler.postDelayed(()->startForegroundService(new Intent(this,CloudStorageService.class)),700);}});
+            }catch(Exception e){candidate.close();runOnUiThread(()->{busy=false;if(destroyed)return;connect.setEnabled(true);connect.setText("连接 Hub");status.setText(e instanceof RemoteClient.Failure&&((RemoteClient.Failure)e).status==401?"密码不正确或登录已过期，请重新输入。":message(e));status.setTextColor(RED);});}});
         });s.show();
+    }
+    private static String verifiedOldAndroidID(RemoteClient client,String id)throws Exception{
+        if(!id.matches("[A-Za-z0-9_-]{1,80}"))throw new java.io.IOException("旧设备 ID 格式无效");
+        JSONArray devices=client.json("GET","/api/hub/devices",null).optJSONArray("devices");
+        if(devices!=null)for(int i=0;i<devices.length();i++){
+            JSONObject device=devices.getJSONObject(i);
+            if(id.equals(device.optString("id"))){
+                if(!"android".equals(device.optString("kind")))throw new java.io.IOException("所选 ID 不是手机设备");
+                return id;
+            }
+        }
+        throw new java.io.IOException("Hub 中找不到该手机设备 ID，请从设备授权列表复制完整 ID");
     }
     private void logout(){if(hubStore==null)return;confirm("退出并撤销这台手机？","将清除本机设备凭据并停止资源节点；本机文件和索引会保留。",()->{LibraryStore old=hubStore;mutate(old,()->{
         if(old.client.paired()){
@@ -449,6 +479,25 @@ public final class MainActivity extends Activity {
         if(request==EXPORT_LOG){io.execute(()->{try(java.io.OutputStream output=getContentResolver().openOutputStream(uri,"w")){if(output==null)throw new java.io.IOException("无法打开目标文件");AppLog.export(output);runOnUiThread(()->toast("诊断包已保存"));}catch(Exception ex){AppLog.error("Diagnostic export failed",ex);runOnUiThread(()->toast("导出失败："+message(ex)));}});return;}
         if(request!=PICK_TREE)return;try{getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION);String name=DocumentsContract.getTreeDocumentId(uri);int slash=Math.max(name.lastIndexOf('/'),name.lastIndexOf(':'));if(slash>=0)name=name.substring(slash+1);if(name.isEmpty())name="手机存储";db.addRoot(uri,name);home=false;tab=0;meta=new LibraryStore.Meta();entries.clear();render();scan(uri);}catch(Exception e){toast("无法授权目录："+message(e));}}
     private void scan(Uri uri){if(scanning)return;scanning=true;scanMessage="正在索引文件…";generation++;loading=true;updateResults();toast(scanMessage);io.execute(()->{try{int count=new TreeScanner(getContentResolver(),db).scan(uri);runOnUiThread(()->{if(destroyed)return;scanning=false;loading=false;scanMessage="已索引 "+count+" 个文件";thumbs.clear();toast(scanMessage);if(!home)reload(false,true);});}catch(Exception e){runOnUiThread(()->{if(destroyed)return;scanning=false;loading=false;scanMessage="扫描失败："+message(e);error=scanMessage;toast(scanMessage);if(tab==0)updateResults();else render();});}});}
+    private void generateLocalThumbnails(){
+        if(thumbnailGenerating)return;thumbnailGenerating=true;thumbnailCancel=false;thumbnailMessage="准备生成…";if(tab==2&&!home)render();
+        io.execute(()->{
+            int generated=0,failed=0,offset=0;
+            try{
+                LocalFilters all=new LocalFilters();
+                while(!thumbnailCancel&&!destroyed){
+                    LibraryStore.Page page=localStore.page(all,offset);
+                    if(page.items.isEmpty())break;
+                    for(LibraryStore.Entry entry:page.items){if(thumbnailCancel||destroyed)break;try{if(thumbs.generate(entry,false))generated++;}catch(Exception ex){failed++;AppLog.error("Local thumbnail generation failed: "+entry.name,ex);}}
+                    offset+=page.items.size();final int done=offset,found=generated,errors=failed,remaining=page.total;
+                    runOnUiThread(()->{if(!destroyed&&thumbnailGenerating&&!thumbnailCancel){thumbnailMessage="已扫描 "+done+" / "+remaining+" · 已生成 "+found+(errors>0?" · 失败 "+errors:"");if(tab==2&&!home)render();}});
+                    if(offset>=page.total)break;
+                }
+                final int found=generated,errors=failed;final boolean stopped=thumbnailCancel;
+                runOnUiThread(()->{if(destroyed)return;thumbnailGenerating=false;thumbnailMessage=(stopped?"已停止 · ":"已完成 · ")+"缩略图 "+found+(errors>0?" · 失败 "+errors:"");toast(thumbnailMessage);if(tab==2&&!home)render();});
+            }catch(Exception ex){runOnUiThread(()->{if(destroyed)return;thumbnailGenerating=false;thumbnailMessage="生成失败："+message(ex);toast(thumbnailMessage);if(tab==2&&!home)render();});}
+        });
+    }
     private void showDetail(LibraryStore.Entry e){
         LibraryStore s=store();if(s==null)return;MobileUi.Sheet sheet=ui.sheet(e.name,typeName(e.kind)+" · "+size(e.size));detailBody(sheet,s,e);sheet.show();
         io.execute(()->{try{LibraryStore.Entry fresh=s.detail(e);runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing())detailBody(sheet,s,fresh);});}catch(Exception failure){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing())toast(message(failure));});}});
@@ -456,6 +505,7 @@ public final class MainActivity extends Activity {
     private void detailBody(MobileUi.Sheet sheet,LibraryStore s,LibraryStore.Entry e){
         sheet.body.removeAllViews();sheet.footer.removeAllViews();FrameLayout frame=new FrameLayout(this);frame.setBackground(ui.shape(typeBg(e.kind),18,0));frame.setClipToOutline(true);ImageView img=new ImageView(this);img.setScaleType(ImageView.ScaleType.FIT_CENTER);frame.addView(img,new FrameLayout.LayoutParams(-1,-1));ImageView icon=ui.icon(e.kind,54,typeColor(e.kind));frame.addView(icon,new FrameLayout.LayoutParams(ui.d(54),ui.d(54),Gravity.CENTER));sheet.body.addView(frame,ui.lp(-1,190));thumbs.load(s,e,img,icon);
         if(s.remote&&(e.kind.equals("image")||e.kind.equals("video"))&&e.available){TextView generate=ui.chip("重新生成移动端封面",false,()->mutate(s,()->s.client.json("POST","/api/resources/"+RemoteClient.enc(e.id)+"/thumbnail?size=mobile",null),"移动端封面已生成",()->{thumbs.clear();detailBody(sheet,s,e);}));sheet.body.addView(generate,ui.top(8));}
+        else if(!s.remote&&(e.kind.equals("image")||e.kind.equals("video")||e.mime.equals("application/pdf"))){sheet.body.addView(ui.chip("重新生成本机缩略图",false,()->{io.execute(()->{try{thumbs.generate(e,true);runOnUiThread(()->{if(destroyed)return;thumbs.clear();toast("缩略图已生成");if(sheet.dialog.isShowing())detailBody(sheet,s,e);});}catch(Exception ex){runOnUiThread(()->toast("生成失败："+message(ex)));}});}),ui.top(8));}
         if(e.kind.equals("video")&&e.available)sheet.body.addView(ui.item("video","分段截图","按视频时长分为 6 段，生成适合手机的截图",()->{sheet.close();showVideoCaptures(s,e);}),ui.top(12));
         section(sheet.body,"文件信息",null,null);detailLine(sheet.body,"大小",size(e.size));detailLine(sheet.body,"修改时间",dateTime(e.modified));detailLine(sheet.body,"文件路径",e.path);if(!e.available)detailLine(sheet.body,"状态","来源暂不可用");
         section(sheet.body,"手动标签","添加",()->tagPrompt(Collections.singletonList(e.id),()->refreshDetail(sheet,s,e)));
@@ -592,7 +642,10 @@ public final class MainActivity extends Activity {
             LinearLayout card=ui.card();TextView title=ui.text(name,15,INK,true);title.setMaxLines(2);card.addView(title);String detail=state+" · "+size(downloaded)+(totalBytes>0?" / "+size(totalBytes):"");if(state.equals("失败")&&!item.optString("error").isEmpty())detail+=" · "+item.optString("error");card.addView(ui.text(detail,12,MUTED,false),ui.top(7));
             if(state.equals("等待下载")||state.equals("下载中")){ProgressBar bar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);bar.setMax(100);bar.setIndeterminate(totalBytes<=0);if(totalBytes>0)bar.setProgress((int)Math.min(100,downloaded*100/totalBytes));card.addView(bar,ui.top(12));card.addView(ui.button("取消下载",false,()->{Intent cancel=new Intent(this,ResourceTransferService.class);cancel.setAction("cancel");cancel.putExtra("id",id);startService(cancel);}),ui.top(12));}
             else if(state.equals("已完成")&&item.optString("uri").startsWith("content:"))card.addView(ui.button("打开文件",false,()->{Intent open=new Intent(Intent.ACTION_VIEW);open.setDataAndType(Uri.parse(item.optString("uri")),"*/*");open.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);try{startActivity(Intent.createChooser(open,"打开下载文件"));}catch(Exception ex){toast("没有可用的应用打开此文件");}}),ui.top(12));
-            else card.addView(ui.button("移出列表",false,()->{ResourceTransferService.remove(this,id);renderTransfers();}),ui.top(12));body.addView(card,ui.top(12));
+            else if((state.equals("失败")||state.equals("已取消"))&&!item.optString("resource").isEmpty()){
+                LinearLayout actions=ui.row();actions.addView(ui.button("重试",true,()->{Intent retry=new Intent(this,ResourceTransferService.class);retry.setAction("retry");retry.putExtra("id",id);try{startForegroundService(retry);handler.postDelayed(this::renderTransfers,250);}catch(Exception ex){toast("重试失败："+message(ex));}}),new LinearLayout.LayoutParams(0,ui.d(48),1));
+                LinearLayout.LayoutParams remove=new LinearLayout.LayoutParams(0,ui.d(48),1);remove.leftMargin=ui.d(8);actions.addView(ui.button("删除记录",false,()->{ResourceTransferService.remove(this,id);renderTransfers();}),remove);card.addView(actions,ui.top(12));
+            }else{if(state.equals("失败")||state.equals("已取消"))card.addView(ui.text("旧版记录缺少下载来源，请从文件详情重新发起。",11,MUTED,false),ui.top(10));card.addView(ui.button("移出列表",false,()->{ResourceTransferService.remove(this,id);renderTransfers();}),ui.top(12));}body.addView(card,ui.top(12));
         }
         DownloadManager manager=(DownloadManager)getSystemService(DOWNLOAD_SERVICE);
         for(int i=saved.length()-1;i>=0;i--){JSONObject item=saved.optJSONObject(i);if(item==null)continue;long id=item.optLong("id",-1);if(id<0)continue;String name=item.optString("name","下载文件");
@@ -629,5 +682,5 @@ public final class MainActivity extends Activity {
     @android.annotation.SuppressLint("GestureBackNavigation")
     @Override public void onBackPressed(){handleBack();}
     @Override protected void onSaveInstanceState(Bundle b){b.putBoolean("home",home);b.putInt("tab",tab);b.putString("local",localFilters.serialize());b.putString("hub",hubFilters.serialize());b.putString("collection",activeCollection);super.onSaveInstanceState(b);}
-    @Override protected void onDestroy(){destroyed=true;generation++;handler.removeCallbacksAndMessages(null);thumbs.close();io.execute(db::close);io.shutdown();super.onDestroy();}
+    @Override protected void onDestroy(){destroyed=true;generation++;handler.removeCallbacksAndMessages(null);thumbs.close();if(hubStore!=null){RemoteClient previous=hubStore.client;new Thread(previous::close,"resource-rtc-dispose").start();}io.execute(db::close);io.shutdown();super.onDestroy();}
 }

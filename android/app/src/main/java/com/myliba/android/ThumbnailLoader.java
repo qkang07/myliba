@@ -1,6 +1,7 @@
 package com.myliba.android;
 
 import android.app.Activity;
+import android.content.Context;
 import android.graphics.*;
 import android.graphics.pdf.PdfRenderer;
 import android.media.MediaMetadataRetriever;
@@ -12,6 +13,8 @@ import android.util.Size;
 import android.view.View;
 import android.widget.ImageView;
 import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.concurrent.*;
 
 final class ThumbnailLoader {
@@ -23,10 +26,37 @@ final class ThumbnailLoader {
         if(!e.available||!(e.kind.equals("image")||e.kind.equals("video")||(!store.remote&&e.mime.equals("application/pdf"))))return;
         String key=(store.remote?store.client.base:"local")+e.id+e.modified+e.size;target.setTag(key);target.setImageDrawable(null);
         Bitmap hit=cache.get(key);if(hit!=null){target.setImageBitmap(hit);fallback.setVisibility(View.GONE);return;}
-        pool.execute(()->{try{Bitmap b=read(store,e);if(b==null)return;cache.put(key,b);activity.runOnUiThread(()->{if(!activity.isFinishing()&&key.equals(target.getTag())){target.setImageBitmap(b);fallback.setVisibility(View.GONE);}});}catch(Exception ignored){}});
+        pool.execute(()->{try{Bitmap b=store.remote?read(store,e):localThumbnail(store,e,false);if(b==null)return;cache.put(key,b);activity.runOnUiThread(()->{if(!activity.isFinishing()&&key.equals(target.getTag())){target.setImageBitmap(b);fallback.setVisibility(View.GONE);}});}catch(Exception ignored){}});
+    }
+    boolean generate(LibraryStore.Entry entry,boolean force)throws Exception{
+        if(!(entry.kind.equals("image")||entry.kind.equals("video")||entry.mime.equals("application/pdf")))return false;
+        Bitmap bitmap=localThumbnail(null,entry,force);if(bitmap==null)return false;
+        cache.put("local"+entry.id+entry.modified+entry.size,bitmap);return true;
+    }
+    private Bitmap localThumbnail(LibraryStore store,LibraryStore.Entry entry,boolean force)throws Exception{
+        File file=cacheFile(activity,entry.id,entry.modified,entry.size);
+        if(!force&&file.isFile()){Bitmap cached=BitmapFactory.decodeFile(file.getAbsolutePath());if(cached!=null){file.setLastModified(System.currentTimeMillis());return cached;}}
+        Bitmap bitmap=read(store,entry);if(bitmap==null)return null;
+        saveLocalThumbnail(file,bitmap);
+        return bitmap;
+    }
+    static File cacheFile(Context context,String id,long modified,long size)throws Exception{
+        File directory=new File(context.getCacheDir(),"resource-thumbnails");
+        MessageDigest digest=MessageDigest.getInstance("SHA-256");byte[] hash=digest.digest((id+"|"+modified+"|"+size).getBytes(StandardCharsets.UTF_8));
+        StringBuilder name=new StringBuilder();for(byte b:hash)name.append(String.format(java.util.Locale.ROOT,"%02x",b&255));
+        return new File(directory,name+".jpg");
+    }
+    static void saveLocalThumbnail(File file,Bitmap bitmap)throws IOException{
+        File directory=file.getParentFile();
+        if(!directory.isDirectory()&&!directory.mkdirs())throw new IOException("无法创建缩略图目录");
+        File temporary=File.createTempFile("thumb-",".tmp",directory);
+        try{
+            try(FileOutputStream out=new FileOutputStream(temporary)){if(!bitmap.compress(Bitmap.CompressFormat.JPEG,78,out))throw new IOException("无法保存缩略图");}
+            if(!temporary.renameTo(file)){file.delete();if(!temporary.renameTo(file))throw new IOException("无法保存缩略图");}
+        }finally{temporary.delete();}
     }
     private Bitmap read(LibraryStore s,LibraryStore.Entry e)throws Exception{
-        if(s.remote){
+        if(s!=null&&s.remote){
             String endpoint="/api/resources/"+RemoteClient.enc(e.id)+"/thumbnail";
             byte[] data;
             try { data=s.client.bytes("GET",endpoint+"?size=mobile",null,3*1024*1024); }

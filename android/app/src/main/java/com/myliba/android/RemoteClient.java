@@ -34,7 +34,7 @@ final class RemoteClient {
     }
     String cookie(){return cookie;}
     boolean paired(){return base.equals(prefs.getString("device_hub",""))&&!prefs.getString("device_id","").isEmpty();}
-    void forget(){cookie="";rtcConfigured=false;rtc.close();if(base.equals(prefs.getString("server_url","")))prefs.edit().remove("server_cookie").apply();}
+    void forget(){cookie="";rtcConfigured=false;rtc.close();rtc=new RemoteRTC(context,base);if(base.equals(prefs.getString("server_url","")))prefs.edit().remove("server_cookie").apply();}
     void unpair(){forget();if(base.equals(prefs.getString("device_hub","")))prefs.edit().remove("device_hub").remove("device_id").remove("device_token").apply();}
     void pairedCredential(String id,String token)throws Exception{
         prefs.edit().putString("device_id",id).putString("device_hub",base).putString("device_token",CloudSecretStore.protect(token)).apply();
