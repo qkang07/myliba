@@ -494,7 +494,10 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 		jobs[id] = status
 	}
 	c.jobsMu.Unlock()
-	writeJSON(w, 200, map[string]any{"files": items, "jobs": jobs, "nodeId": c.runtime.id, "libraryId": c.libraryID(), "peers": c.runtime.activePeers(), "directEndpoint": c.runtime.endpoint})
+	c.runtime.mu.RLock()
+	lan := append([]string(nil), c.runtime.lan...)
+	c.runtime.mu.RUnlock()
+	writeJSON(w, 200, map[string]any{"files": items, "jobs": jobs, "nodeId": c.runtime.id, "libraryId": c.libraryID(), "peers": c.runtime.activePeers(), "peerStatus": c.runtime.peerStatuses(), "directEndpoint": c.runtime.endpoint, "lan": lan})
 }
 
 func (c *cloudClient) upload(w http.ResponseWriter, r *http.Request) {

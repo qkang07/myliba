@@ -67,11 +67,9 @@ func (c *cloudRuntime) p2pRequest(parent context.Context, method, target, path, 
 	if !validCloudNodeID(target) {
 		return nil, errors.New("invalid peer ID")
 	}
-	// The Hub mailbox is per node. Serialize offers so one request cannot consume another answer.
-	c.p2pMu.Lock()
-	defer c.p2pMu.Unlock()
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
+	c.startSignalInbox(parent)
 	var payload []byte
 	var err error
 	if body != nil {
@@ -196,34 +194,33 @@ func (c *cloudRuntime) p2pRequest(parent context.Context, method, target, path, 
 		return nil, err
 	}
 	session := hex.EncodeToString(raw)
+	answerChannel := make(chan cloudPeerSignal, 1)
+	c.signalMu.Lock()
+	if c.answers == nil {
+		c.answers = map[string]chan cloudPeerSignal{}
+	}
+	c.answers[session] = answerChannel
+	c.signalMu.Unlock()
+	defer func() { c.signalMu.Lock(); delete(c.answers, session); c.signalMu.Unlock() }()
 	signal := cloudPeerSignal{From: c.id, To: target, Session: session, Type: "offer", SDP: peer.LocalDescription().SDP}
 	if err := c.p2pHub(ctx, http.MethodPost, "/cloud/signal", token, signal, nil); err != nil {
 		return nil, err
 	}
-	for {
-		var inbox struct {
-			Messages []cloudPeerSignal `json:"messages"`
+	select {
+	case answer := <-answerChannel:
+		if answer.From != target {
+			return nil, errors.New("unexpected cloud peer answer")
 		}
-		if err := c.p2pHub(ctx, http.MethodGet, "/cloud/signal/"+c.id+"?wait=1", token, nil, &inbox); err != nil {
+		if err := peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP}); err != nil {
 			return nil, err
 		}
-		for _, answer := range inbox.Messages {
-			if answer.Type == "answer" && answer.From == target && answer.Session == session {
-				if err := peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP}); err != nil {
-					return nil, err
-				}
-				select {
-				case result := <-finished:
-					return result.response, result.err
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(time.Second):
-		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case result := <-finished:
+		return result.response, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }

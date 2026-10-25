@@ -129,7 +129,7 @@ func main() {
 	}
 	go cloudRuntime.run(context.Background())
 	go cloud.assetSyncWorker(context.Background())
-	if cloudRuntime.endpoint != "" {
+	if cloudRuntime.endpoint != "" && !strings.HasPrefix(cloudRuntime.endpoint, "p2p://") {
 		go func() {
 			if err := cloudRuntime.serveDirect(); err != nil {
 				log.Fatal(err)

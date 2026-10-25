@@ -211,3 +211,76 @@ func TestCloudPeerDataChannelBypassesHubForBytes(t *testing.T) {
 	cancel()
 	<-answerDone
 }
+
+func TestCloudGoPeersCanServeEachOther(t *testing.T) {
+	t.Setenv("MYLIBA_HUB_DATA_DIR", t.TempDir())
+	t.Setenv("MYLIBA_ICE_SERVERS", `[{"urls":["stun:127.0.0.1:9"]}]`)
+	hub, err := newCloudHub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "0123456789abcdef0123456789abcdef"
+	mux := http.NewServeMux()
+	hub.routes(mux, token)
+	mux.HandleFunc("POST /cloud/auth/verify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			Token string `json:"token"`
+		}
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body.Token != token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	hubURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/node"
+	create := func(id string) *cloudRuntime {
+		disk, err := newCloudDisk(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &cloudRuntime{id: id, role: "client", disk: disk, hubURL: hubURL, token: token, client: &http.Client{Timeout: 10 * time.Second}, grantForPeer: func(context.Context, string) (string, error) { return token, nil }}
+	}
+	first := create("11111111111111111111111111111111")
+	second := create("22222222222222222222222222222222")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, node := range []cloudNode{{ID: first.id, Role: "client", Endpoint: "p2p://" + first.id}, {ID: second.id, Role: "client", Endpoint: "p2p://" + second.id}} {
+		if err := first.p2pHub(ctx, http.MethodPost, "/cloud/nodes/heartbeat", token, node, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second.startSignalInbox(ctx)
+	response, err := first.p2pRequest(ctx, http.MethodGet, second.id, "/cloud/ping", token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("peer ping status = %d", response.StatusCode)
+	}
+	block := bytes.Repeat([]byte("encrypted-cloud-data"), 1<<14)
+	id := cloudHash(block)
+	response, err = first.p2pRequest(ctx, http.MethodPut, second.id, "/cloud/blocks/"+id, token, bytes.NewReader(block))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("peer PUT status = %d", response.StatusCode)
+	}
+	response, err = first.p2pRequest(ctx, http.MethodGet, second.id, "/cloud/blocks/"+id, token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil || response.StatusCode != http.StatusOK || !bytes.Equal(got, block) {
+		t.Fatalf("peer GET: status %d, bytes %d, err %v", response.StatusCode, len(got), err)
+	}
+}

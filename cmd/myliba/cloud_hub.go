@@ -15,11 +15,14 @@ import (
 )
 
 type cloudNode struct {
-	ID       string    `json:"id"`
-	Endpoint string    `json:"endpoint"`
-	Relayed  bool      `json:"relayed,omitempty"`
-	Role     string    `json:"role"`
-	SeenAt   time.Time `json:"seenAt"`
+	ID       string                     `json:"id"`
+	Endpoint string                     `json:"endpoint"`
+	LAN      []string                   `json:"lan,omitempty"`
+	LANKey   string                     `json:"lanKey,omitempty"`
+	Links    map[string]cloudPeerStatus `json:"links,omitempty"`
+	Relayed  bool                       `json:"relayed,omitempty"`
+	Role     string                     `json:"role"`
+	SeenAt   time.Time                  `json:"seenAt"`
 	cloudStorageStats
 }
 
@@ -65,6 +68,17 @@ func newCloudHub() (*cloudHub, error) {
 }
 
 func validCloudNode(node cloudNode) bool {
+	if !validCloudLAN(node.LAN, node.LANKey) {
+		return false
+	}
+	if len(node.Links) > 64 {
+		return false
+	}
+	for id, status := range node.Links {
+		if !validCloudNodeID(id) || (status.State != "checking" && status.State != "connected" && status.State != "unreachable") || (status.Path != "" && status.Path != "lan" && status.Path != "webrtc" && status.Path != "direct") {
+			return false
+		}
+	}
 	if relayID := cloudRelayEndpointID(node.Endpoint); (relayID != "" && node.ID != relayID) || (node.Relayed && node.Endpoint != "" && relayID == "") {
 		return false
 	}
@@ -345,7 +359,7 @@ func (c *cloudHub) routesWithAuth(mux *http.ServeMux, authorize func(http.Handle
 	c.signalRoutes(mux, authorize)
 	mux.Handle("POST /cloud/nodes/heartbeat", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var node cloudNode
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&node); err != nil || !validCloudNode(node) {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&node); err != nil || !validCloudNode(node) {
 			http.Error(w, "invalid node", 400)
 			return
 		}

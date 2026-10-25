@@ -305,6 +305,8 @@ export interface CloudFile {
 export interface CloudNode {
   id: string;
   endpoint: string;
+	lan?: string[];
+	links?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "direct" }>;
   relayed?: boolean;
   role: "client" | "storage";
   seenAt: string;
@@ -349,7 +351,9 @@ export interface CloudView {
   nodeId: string;
   libraryId: string;
   peers: CloudNode[];
+	peerStatus?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "direct"; checkedAt?: string }>;
   directEndpoint: string;
+	lan?: string[];
 }
 
 export async function getCloudFiles(): Promise<CloudView> {

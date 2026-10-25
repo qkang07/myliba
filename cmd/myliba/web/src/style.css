@@ -706,6 +706,8 @@ body.detail-preview-open { overflow: hidden; }
 .hub-cloud-endpoint { overflow-wrap: anywhere; }
 .hub-cloud-status { padding: 3px 7px; border-radius: 6px; background: var(--green-soft); color: var(--green); font-size: 10px; }
 .hub-cloud-status.offline { background: var(--surface-subtle); color: var(--text-muted); }
+.hub-cloud-links { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 9px; }
+.hub-cloud-links small { color: var(--text-muted); }
 .hub-cloud-node-metrics { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .hub-cloud-node-metrics span { padding: 4px 6px; border-radius: 5px; background: var(--surface-subtle); color: var(--text-secondary); font-size: 10px; }
 @media (max-width: 600px) { .hub-cloud-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

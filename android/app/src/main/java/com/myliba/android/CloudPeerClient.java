@@ -12,20 +12,22 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
-/** Hub-signaled WebRTC receiver. Only SDP uses Hub; encrypted blocks use the DataChannel. */
+/** Hub-signaled WebRTC peer. Only SDP uses Hub; encrypted blocks use the DataChannel. */
 final class CloudPeerClient {
     private final CloudStorageService storage;
     private final String hub,id,token;
     private final Map<String,CloudSession> sessions=new ConcurrentHashMap<>();
+	private final Map<String,CompletableFuture<JSONObject>> pendingAnswers=new ConcurrentHashMap<>();
     private final ExecutorService offers=Executors.newCachedThreadPool();
     private final ExecutorService cleanup=Executors.newSingleThreadExecutor();
-    private PeerConnectionFactory factory;
+	private volatile PeerConnectionFactory factory;
     private volatile boolean closed;
     CloudPeerClient(CloudStorageService storage,String hub,String id,String token){this.storage=storage;this.hub=hub;this.id=id;this.token=token;}
     synchronized void close(){
         if(closed)return;
         AppLog.info("Cloud peer client stopping");closed=true;
         offers.shutdownNow();cleanup.shutdown();
+		for(CompletableFuture<JSONObject> answer:pendingAnswers.values())answer.completeExceptionally(new IOException("cloud peer stopped"));pendingAnswers.clear();
         new Thread(()->{
             awaitStopped(offers);awaitStopped(cleanup);
             for(CloudSession session:sessions.values())session.dispose();
@@ -57,7 +59,8 @@ final class CloudPeerClient {
                     JSONArray messages=inbox.optJSONArray("messages");
                     if(messages!=null)for(int i=0;i<messages.length();i++){
                         JSONObject signal=messages.optJSONObject(i);
-                        if(signal!=null&&"offer".equals(signal.optString("type"))&&signal.optString("session").matches("[0-9a-f]{32}")&&signal.optString("from").matches("[0-9a-f]{32}")){
+						if(signal!=null&&"answer".equals(signal.optString("type"))){CompletableFuture<JSONObject> waiting=pendingAnswers.get(signal.optString("session"));if(waiting!=null)waiting.complete(signal);}
+						else if(signal!=null&&"offer".equals(signal.optString("type"))&&signal.optString("session").matches("[0-9a-f]{32}")&&signal.optString("from").matches("[0-9a-f]{32}")){
                             AppLog.info("Cloud peer offer received");
                             offers.execute(()->accept(signal));
                         }
@@ -83,6 +86,69 @@ final class CloudPeerClient {
         }finally{conn.disconnect();}
     }
 
+	CloudStorageService.PeerResult request(String target,String method,String path,byte[] payload)throws Exception{
+		if(closed||factory==null||!target.matches("[0-9a-f]{32}")||target.equals(id))throw new IOException("peer unavailable");
+		if(payload!=null&&payload.length>(4<<20)+64)throw new IOException("cloud request too large");
+		String grant=storage.peerGrant();if(grant.isEmpty())throw new IOException("peer grant unavailable");
+		byte[] random=new byte[16];new java.security.SecureRandom().nextBytes(random);StringBuilder sessionBuilder=new StringBuilder();for(byte value:random)sessionBuilder.append(String.format(Locale.ROOT,"%02x",value&255));String session=sessionBuilder.toString();
+		CompletableFuture<JSONObject> answer=new CompletableFuture<>();pendingAnswers.put(session,answer);
+		PeerConnection peer=null;
+		try{
+			JSONArray serverList=request("GET","/cloud/ice",null).optJSONArray("servers");List<PeerConnection.IceServer> ice=new ArrayList<>();
+			if(serverList!=null)for(int i=0;i<serverList.length();i++){JSONObject entry=serverList.optJSONObject(i);if(entry==null)continue;JSONArray urls=entry.optJSONArray("urls");if(urls!=null)for(int j=0;j<urls.length();j++){String url=urls.optString(j);if(url.startsWith("stun:")||url.startsWith("stuns:"))ice.add(PeerConnection.IceServer.builder(url).createIceServer());}}
+			CountDownLatch gathered=new CountDownLatch(1);List<String> candidates=Collections.synchronizedList(new ArrayList<>());
+			peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
+				@Override public void onSignalingChange(PeerConnection.SignalingState state){}
+				@Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){}
+				@Override public void onIceConnectionReceivingChange(boolean receiving){}
+				@Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){if(state==PeerConnection.IceGatheringState.COMPLETE)gathered.countDown();}
+				@Override public void onIceCandidate(IceCandidate candidate){candidates.add(candidate.sdp);}
+				@Override public void onIceCandidatesRemoved(IceCandidate[] candidates){}
+				@Override public void onAddStream(MediaStream stream){}
+				@Override public void onRemoveStream(MediaStream stream){}
+				@Override public void onDataChannel(DataChannel channel){}
+				@Override public void onRenegotiationNeeded(){}
+			});
+			if(peer==null)throw new IOException("peer connection unavailable");
+			Outbound outbound=new Outbound(method,path,grant,payload==null?new byte[0]:payload);
+			DataChannel channel=peer.createDataChannel("cloud",new DataChannel.Init());if(channel==null)throw new IOException("data channel unavailable");channel.registerObserver(outbound);outbound.channel=channel;
+			CountDownLatch created=new CountDownLatch(1);SessionDescription[] offer=new SessionDescription[1];
+			peer.createOffer(new SdpObserver(){
+				@Override public void onCreateSuccess(SessionDescription value){offer[0]=value;created.countDown();}
+				@Override public void onSetSuccess(){}
+				@Override public void onCreateFailure(String error){created.countDown();}
+				@Override public void onSetFailure(String error){created.countDown();}
+			},new MediaConstraints());
+			if(!created.await(10,TimeUnit.SECONDS)||offer[0]==null)throw new IOException("peer offer failed");
+			setDescription(peer,offer[0],true);
+			if(!gathered.await(12,TimeUnit.SECONDS))throw new IOException("ICE gathering timed out");
+			request("POST","/cloud/signal",new JSONObject().put("from",id).put("to",target).put("session",session).put("type","offer").put("sdp",withCandidates(offer[0].description,candidates)));
+			JSONObject remote=answer.get(15,TimeUnit.SECONDS);if(!target.equals(remote.optString("from")))throw new IOException("unexpected peer answer");
+			setDescription(peer,new SessionDescription(SessionDescription.Type.ANSWER,remote.getString("sdp")),false);
+			if(!outbound.done.await(20,TimeUnit.SECONDS))throw new IOException("peer response timed out");
+			if(outbound.failure!=null)throw outbound.failure;
+			return new CloudStorageService.PeerResult(outbound.status,outbound.response.toByteArray());
+		}finally{pendingAnswers.remove(session);if(peer!=null){peer.close();peer.dispose();}}
+	}
+	private static final class Outbound implements DataChannel.Observer {
+		final String method,path,grant;final byte[] payload;final CountDownLatch done=new CountDownLatch(1);final ByteArrayOutputStream response=new ByteArrayOutputStream();
+		volatile DataChannel channel;volatile IOException failure;volatile int status;
+		Outbound(String method,String path,String grant,byte[] payload){this.method=method;this.path=path;this.grant=grant;this.payload=payload;}
+		@Override public void onBufferedAmountChange(long previousAmount){}
+		@Override public void onStateChange(){if(channel==null)return;if(channel.state()==DataChannel.State.OPEN){new Thread(()->{
+			try{send(new JSONObject().put("type","request").put("method",method).put("path",path).put("token",grant).toString().getBytes(StandardCharsets.UTF_8),false);
+				for(int offset=0;offset<payload.length;offset+=16<<10)send(Arrays.copyOfRange(payload,offset,Math.min(offset+(16<<10),payload.length)),true);
+				send("{\"type\":\"end\"}".getBytes(StandardCharsets.UTF_8),false);
+			}catch(Exception ex){failure=new IOException("cloud peer send failed",ex);done.countDown();}
+		},"cloud-peer-send").start();}else if(channel.state()==DataChannel.State.CLOSED&&done.getCount()>0){failure=new IOException("cloud peer channel closed");done.countDown();}}
+		private void send(byte[] bytes,boolean binary)throws Exception{while(channel.bufferedAmount()>512<<10){if(channel.state()!=DataChannel.State.OPEN)throw new IOException("channel closed");Thread.sleep(5);}if(!channel.send(new DataChannel.Buffer(ByteBuffer.wrap(bytes),binary)))throw new IOException("send failed");}
+		@Override public synchronized void onMessage(DataChannel.Buffer message){byte[] bytes=new byte[message.data.remaining()];message.data.get(bytes);
+			if(message.binary){if(response.size()+bytes.length>16<<20){failure=new IOException("peer response too large");done.countDown();}else response.write(bytes,0,bytes.length);return;}
+			try{JSONObject control=new JSONObject(new String(bytes,StandardCharsets.UTF_8));if("response".equals(control.optString("type")))status=control.optInt("status");else if("end".equals(control.optString("type"))){if(status<100||status>599)failure=new IOException("invalid peer response");done.countDown();}}
+			catch(Exception ex){failure=new IOException("invalid peer response",ex);done.countDown();}
+		}
+	}
+
     private void accept(JSONObject offer){
         String session=offer.optString("session"),from=offer.optString("from");
         if(closed)return;
@@ -97,7 +163,7 @@ final class CloudPeerClient {
                 JSONObject entry=serverList.optJSONObject(i);if(entry==null)continue;JSONArray urls=entry.optJSONArray("urls");
                 if(urls!=null)for(int j=0;j<urls.length();j++){String url=urls.optString(j);if(url.startsWith("stun:")||url.startsWith("stuns:"))ice.add(PeerConnection.IceServer.builder(url).createIceServer());}
             }
-            CountDownLatch gathered=new CountDownLatch(1);
+            CountDownLatch gathered=new CountDownLatch(1);List<String> candidates=Collections.synchronizedList(new ArrayList<>());
             if(closed||factory==null)throw new IOException("Cloud peer is stopping");
             PeerConnection peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
                 @Override public void onSignalingChange(PeerConnection.SignalingState state){}
@@ -107,7 +173,7 @@ final class CloudPeerClient {
                 }
                 @Override public void onIceConnectionReceivingChange(boolean receiving){}
                 @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){if(state==PeerConnection.IceGatheringState.COMPLETE)gathered.countDown();}
-                @Override public void onIceCandidate(IceCandidate candidate){}
+                @Override public void onIceCandidate(IceCandidate candidate){candidates.add(candidate.sdp);}
                 @Override public void onIceCandidatesRemoved(IceCandidate[] candidates){}
                 @Override public void onAddStream(MediaStream stream){}
                 @Override public void onRemoveStream(MediaStream stream){}
@@ -130,7 +196,7 @@ final class CloudPeerClient {
             AppLog.info("Cloud peer local answer set");
             if(!gathered.await(15,TimeUnit.SECONDS))throw new IOException("ICE gathering timed out");
             AppLog.info("Cloud peer ICE gathering complete");
-            JSONObject signal=new JSONObject().put("from",id).put("to",from).put("session",session).put("type","answer").put("sdp",peer.getLocalDescription().description);
+            JSONObject signal=new JSONObject().put("from",id).put("to",from).put("session",session).put("type","answer").put("sdp",withCandidates(answer[0].description,candidates));
             request("POST","/cloud/signal",signal);
             AppLog.info("Cloud peer answer sent");
             CloudStorageService.status="节点直连信令已建立";
@@ -175,6 +241,12 @@ final class CloudPeerClient {
         if(local)peer.setLocalDescription(observer,value);else peer.setRemoteDescription(observer,value);
         if(!done.await(15,TimeUnit.SECONDS)||error[0]!=null)throw new IOException("WebRTC SDP failed: "+error[0]);
     }
+	private static String withCandidates(String sdp,List<String> candidates){
+		StringBuilder result=new StringBuilder(sdp);
+		if(!sdp.endsWith("\r\n"))result.append("\r\n");
+		synchronized(candidates){for(String candidate:candidates)if(candidate!=null&&!candidate.isEmpty()&&candidate.indexOf('\r')<0&&candidate.indexOf('\n')<0)result.append("a=").append(candidate.startsWith("a=")?candidate.substring(2):candidate).append("\r\n");}
+		result.append("a=end-of-candidates\r\n");return result.toString();
+	}
 
     private final class CloudChannel implements DataChannel.Observer {
         private final DataChannel channel;private final CloudSession owner;private final ByteArrayOutputStream body=new ByteArrayOutputStream();

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -33,6 +34,11 @@ type cloudRuntime struct {
 	token        string
 	mu           sync.RWMutex
 	peers        []cloudNode
+	lan          []string
+	lanPort      string
+	lanKey       string
+	lanCert      tls.Certificate
+	peerStatus   map[string]cloudPeerStatus
 	bootstrap    []cloudNode
 	locations    map[string][]cloudNode
 	client       *http.Client
@@ -41,7 +47,9 @@ type cloudRuntime struct {
 	relayMu      sync.RWMutex
 	relays       map[string]*cloudRelayConn
 	relayReady   atomic.Bool
-	p2pMu        sync.Mutex
+	signalOnce   sync.Once
+	signalMu     sync.Mutex
+	answers      map[string]chan cloudPeerSignal
 	grantForPeer func(context.Context, string) (string, error)
 }
 
@@ -118,8 +126,12 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 			Timeout:       90 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		locations: map[string][]cloudNode{}, relayURL: relayURL,
+		locations: map[string][]cloudNode{}, peerStatus: map[string]cloudPeerStatus{}, answers: map[string]chan cloudPeerSignal{}, relayURL: relayURL,
 		relayOn: os.Getenv("MYLIBA_CLOUD_RELAY_ENABLED") == "1", relays: map[string]*cloudRelayConn{},
+	}
+	rt.lanCert, rt.lanKey, err = cloudLANCertificate(dir)
+	if err != nil {
+		log.Printf("Cloud LAN unavailable: %v", err)
 	}
 	if raw := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_BOOTSTRAP_URLS")); raw != "" {
 		var endpoints []string
@@ -317,9 +329,6 @@ func (c *cloudRuntime) request(ctx context.Context, method, base, path, token st
 	if !validCloudEndpoint(base) || base == "" {
 		return nil, errors.New("invalid cloud endpoint")
 	}
-	if strings.HasPrefix(base, "p2p://") {
-		return c.p2pRequest(ctx, method, strings.TrimPrefix(base, "p2p://"), path, token, body)
-	}
 	wsURL, _, err := c.credentials()
 	if err != nil {
 		return nil, err
@@ -330,6 +339,32 @@ func (c *cloudRuntime) request(ctx context.Context, method, base, path, token st
 		if err != nil {
 			return nil, err
 		}
+	}
+	var lanPeer cloudNode
+	if strings.TrimRight(base, "/") != hubBase {
+		c.mu.RLock()
+		for _, peer := range c.peers {
+			if peer.Endpoint == base {
+				lanPeer = peer
+				break
+			}
+		}
+		c.mu.RUnlock()
+	}
+	if len(lanPeer.LAN) > 0 {
+		payload, err := readCloudRequestBody(body)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(payload)
+		if grant, grantErr := c.peerGrant(ctx, token); grantErr == nil {
+			if response, lanErr := cloudLANRequest(ctx, lanPeer, method, path, grant, payload); lanErr == nil {
+				return response, nil
+			}
+		}
+	}
+	if strings.HasPrefix(base, "p2p://") {
+		return c.p2pRequest(ctx, method, strings.TrimPrefix(base, "p2p://"), path, token, body)
 	}
 	if strings.TrimRight(base, "/") != hubBase {
 		token, err = c.peerGrant(ctx, token)
@@ -579,7 +614,23 @@ func (c *cloudRuntime) syncOnce(ctx context.Context) error {
 	sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
 	c.mu.Lock()
 	c.peers = peers
+	if c.peerStatus == nil {
+		c.peerStatus = map[string]cloudPeerStatus{}
+	}
+	active := make(map[string]bool, len(peers))
+	for _, peer := range peers {
+		active[peer.ID] = true
+		if _, exists := c.peerStatus[peer.ID]; !exists {
+			c.peerStatus[peer.ID] = cloudPeerStatus{State: "checking"}
+		}
+	}
+	for id := range c.peerStatus {
+		if !active[id] {
+			delete(c.peerStatus, id)
+		}
+	}
 	c.mu.Unlock()
+	go c.probePeers(peers, token)
 	for _, peer := range peers {
 		if err := c.syncCatalog(ctx, peer.Endpoint, token); err != nil {
 			log.Printf("Cloud index sync with %s: %v", peer.ID, err)
@@ -596,10 +647,29 @@ func (c *cloudRuntime) hubPeers(ctx context.Context, hub, token string) ([]cloud
 		log.Printf("Cloud storage stats unavailable: %v", err)
 	}
 	endpoint := c.endpoint
+	if endpoint == "" {
+		endpoint = "p2p://" + c.id
+	}
 	if c.relayURL != "" && cloudRelayEndpointID(endpoint) != "" && !c.relayReady.Load() {
 		endpoint = ""
 	}
-	data, _ := json.Marshal(cloudNode{ID: c.id, Endpoint: endpoint, Relayed: cloudRelayEndpointID(c.endpoint) != "", Role: c.role, cloudStorageStats: stats})
+	c.mu.Lock()
+	if c.lanPort != "" {
+		c.lan = cloudLANAddresses(c.lanPort)
+	}
+	lan := append([]string(nil), c.lan...)
+	c.mu.Unlock()
+	lanKey := c.lanKey
+	if len(lan) == 0 {
+		lanKey = ""
+	}
+	links := c.peerStatuses()
+	for id := range links {
+		if !validCloudNodeID(id) {
+			delete(links, id)
+		}
+	}
+	data, _ := json.Marshal(cloudNode{ID: c.id, Endpoint: endpoint, LAN: lan, LANKey: lanKey, Links: links, Relayed: cloudRelayEndpointID(c.endpoint) != "", Role: c.role, cloudStorageStats: stats})
 	response, err := c.request(ctx, http.MethodPost, hub, "/cloud/nodes/heartbeat", token, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -624,7 +694,10 @@ func (c *cloudRuntime) hubPeers(ctx context.Context, hub, token string) ([]cloud
 	}
 	peers := []cloudNode{}
 	for _, node := range list.Nodes {
-		if node.ID != c.id && node.Endpoint != "" && validCloudEndpoint(node.Endpoint) {
+		if node.ID != c.id && (node.Endpoint != "" || len(node.LAN) > 0) && validCloudEndpoint(node.Endpoint) && validCloudLAN(node.LAN, node.LANKey) {
+			if node.Endpoint == "" {
+				node.Endpoint = node.LAN[0]
+			}
 			peers = append(peers, node)
 		}
 	}
@@ -632,6 +705,8 @@ func (c *cloudRuntime) hubPeers(ctx context.Context, hub, token string) ([]cloud
 }
 
 func (c *cloudRuntime) run(ctx context.Context) {
+	c.startLAN(ctx)
+	c.startSignalInbox(ctx)
 	if c.relayURL != "" && strings.Contains(c.endpoint, "/cloud/relay/") {
 		go c.runRelayTunnel(ctx)
 	}
@@ -651,13 +726,8 @@ func (c *cloudRuntime) run(ctx context.Context) {
 	}
 }
 
-func (c *cloudRuntime) serveDirect() error {
-	addr := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_LISTEN"))
-	if addr == "" {
-		addr = "127.0.0.1:4319"
-	}
+func (c *cloudRuntime) directHandler() http.Handler {
 	mux := http.NewServeMux()
-	// Credentials can rotate when a saved Hub profile is updated.
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, token, err := c.credentials()
 		if err != nil || len(token) < 32 {
@@ -671,8 +741,16 @@ func (c *cloudRuntime) serveDirect() error {
 		}
 		inner.ServeHTTP(w, r)
 	}))
+	return mux
+}
+
+func (c *cloudRuntime) serveDirect() error {
+	addr := strings.TrimSpace(os.Getenv("MYLIBA_CLOUD_LISTEN"))
+	if addr == "" {
+		addr = "127.0.0.1:4319"
+	}
 	log.Printf("Cloud direct endpoint listening on %s", addr)
-	return (&http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}).ListenAndServe()
+	return (&http.Server{Addr: addr, Handler: c.directHandler(), ReadHeaderTimeout: 10 * time.Second}).ListenAndServe()
 }
 
 func runCloudStorage() error {

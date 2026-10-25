@@ -276,6 +276,9 @@ func (d *cloudDisk) routes(mux *http.ServeMux, token string) {
 }
 
 func (d *cloudDisk) routesWithAuth(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
+	mux.Handle("GET /cloud/ping", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})))
 	mux.Handle("GET /cloud/inventory", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		after := r.URL.Query().Get("after")
 		if after != "" && !validCloudHash(after) {

@@ -20,8 +20,12 @@ public final class CloudStorageService extends Service {
     static volatile long blockCount,catalogCount,capacityBytes,availableBytes;
     static volatile String activeBackend="disk";
     static volatile boolean relayConnected;
-    private final ExecutorService workers=Executors.newFixedThreadPool(4);
+	static final ConcurrentHashMap<String,String> peerLinks=new ConcurrentHashMap<>();
+	private final Set<String> probingPeers=ConcurrentHashMap.newKeySet();
+    private final ExecutorService workers=Executors.newFixedThreadPool(12);
     private ServerSocket listener;
+	private CloudLan lan;
+	private final ExecutorService probes=Executors.newFixedThreadPool(4);
     private volatile boolean stopped;
     private String token,hub,publicUrl,relayUrl,nodeId,backend;
     private CloudRelayClient relayClient;
@@ -51,6 +55,7 @@ public final class CloudStorageService extends Service {
                 write(idFile,nodeId.getBytes(StandardCharsets.US_ASCII));
             }
             if(!nodeId.matches("[0-9a-f]{32}"))throw new IOException("节点 ID 无效");
+			try{lan=new CloudLan(nodeId);}catch(Exception ex){AppLog.error("Cloud LAN unavailable",ex);}
             if(publicUrl.isEmpty())publicUrl=relayUrl.isEmpty()?"p2p://"+nodeId:relayUrl+"/cloud/relay/"+nodeId;
             if(!publicUrl.startsWith("p2p://")){listener=new ServerSocket();listener.setReuseAddress(true);listener.bind(new InetSocketAddress(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"127.0.0.1":"0.0.0.0",port));}
         }catch(Exception ex){status="存储节点启动失败："+ex.getMessage();stopSelf();return START_NOT_STICKY;}
@@ -62,13 +67,14 @@ public final class CloudStorageService extends Service {
         stopped=false;running=true;status="等待 Hub 注册";
         AppLog.info("Cloud storage node starting; transport "+(publicUrl.startsWith("p2p://")?"p2p":publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"relay":"direct"));
         if(listener!=null)workers.execute(()->{while(!stopped){try{Socket socket=listener.accept();workers.execute(()->serve(socket));}catch(IOException ex){if(!stopped)break;}}});
+		if(lan!=null)workers.execute(()->{while(!stopped){try{Socket socket=lan.listener.accept();workers.execute(()->serve(socket));}catch(IOException ex){if(!stopped)break;}}});
         workers.execute(()->{while(!stopped){try{syncHub();status="已向 Hub 注册";AppLog.info("Cloud storage node registered with Hub");}catch(Exception ex){AppLog.error("Cloud storage Hub sync failed",ex);status="Hub 同步失败："+ex.getMessage();}try{Thread.sleep(20000);}catch(InterruptedException ex){break;}}});
         if(publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)){relayClient=new CloudRelayClient(relayUrl,nodeId,token,port,()->peerGrant());new Thread(()->relayClient.run(()->stopped),"cloud-relay").start();}
-        if(publicUrl.startsWith("p2p://")){peerClient=new CloudPeerClient(this,hub,nodeId,token);new Thread(()->peerClient.run(()->stopped),"cloud-peer").start();}
+		peerClient=new CloudPeerClient(this,hub,nodeId,token);new Thread(()->peerClient.run(()->stopped),"cloud-peer").start();
         return START_STICKY;
     }
 
-    @Override public void onDestroy(){AppLog.info("Cloud storage node stopping");stopped=true;running=false;relayConnected=false;status="已停止";if(relayClient!=null)relayClient.close();if(peerClient!=null)peerClient.close();try{if(listener!=null)listener.close();}catch(IOException ignored){}workers.shutdownNow();super.onDestroy();}
+    @Override public void onDestroy(){AppLog.info("Cloud storage node stopping");stopped=true;running=false;relayConnected=false;status="已停止";peerLinks.clear();if(relayClient!=null)relayClient.close();if(peerClient!=null)peerClient.close();try{if(listener!=null)listener.close();if(lan!=null)lan.listener.close();}catch(IOException ignored){}probes.shutdownNow();workers.shutdownNow();super.onDestroy();}
     @Override public IBinder onBind(Intent intent){return null;}
 
     private static String hex(byte[] data){StringBuilder b=new StringBuilder(data.length*2);for(byte value:data)b.append(String.format(Locale.ROOT,"%02x",value&255));return b.toString();}
@@ -100,7 +106,7 @@ public final class CloudStorageService extends Service {
     }
     private static byte[] json(JSONObject value){return value.toString().getBytes(StandardCharsets.UTF_8);}
     static final class PeerResult {final int status;final byte[] data;PeerResult(int status,byte[] data){this.status=status;this.data=data;}}
-    private String peerGrant(){
+    String peerGrant(){
         HttpURLConnection request=null;
         try{
             request=hubRequest("POST","/cloud/auth/grant",new byte[0]);
@@ -123,6 +129,7 @@ public final class CloudStorageService extends Service {
     PeerResult peerRequest(String method,String path,String suppliedToken,byte[] data){
         try{
             if(!verifyPeer(suppliedToken))return new PeerResult(401,new byte[0]);
+			if("GET".equals(method)&&"/cloud/ping".equals(path))return new PeerResult(204,new byte[0]);
             URI uri=new URI(path);String route=uri.getPath();
             if("GET".equals(method)&&"/cloud/catalog".equals(route))return new PeerResult(200,json(new JSONObject().put("records",new JSONArray(list("catalog")))));
             if("GET".equals(method)&&"/cloud/inventory".equals(route)){
@@ -144,6 +151,7 @@ public final class CloudStorageService extends Service {
             while(!(header=line(in)).isEmpty()){total+=header.length();if(total>16384)throw new IOException("headers too large");int colon=header.indexOf(':');if(colon>0)headers.put(header.substring(0,colon).toLowerCase(Locale.ROOT),header.substring(colon+1).trim());}
             String authorization=headers.getOrDefault("authorization","");
             if(!authorization.startsWith("Bearer ")||!verifyPeer(authorization.substring(7))){respond(out,401,"text/plain",new byte[0],false);return;}
+			if("GET".equals(method)&&"/cloud/ping".equals(route)){respond(out,204,"text/plain",new byte[0],false);return;}
             if("GET".equals(method)&&"/cloud/catalog".equals(route)){try{respond(out,200,"application/json",json(new JSONObject().put("records",new JSONArray(list("catalog")))),false);}catch(Exception ex){respond(out,503,"text/plain",new byte[0],false);}return;}
             if("GET".equals(method)&&"/cloud/inventory".equals(route)){
                 String after="";if(uri.getRawQuery()!=null)for(String p:uri.getRawQuery().split("&"))if(p.startsWith("after="))after=URLDecoder.decode(p.substring(6),"UTF-8");
@@ -164,14 +172,58 @@ public final class CloudStorageService extends Service {
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();c.setRequestMethod(method);c.setConnectTimeout(10000);c.setReadTimeout(30000);c.setInstanceFollowRedirects(false);c.setRequestProperty("Authorization","Bearer "+token);
         if(data!=null){c.setDoOutput(true);c.setRequestProperty("Content-Type","application/json");c.setFixedLengthStreamingMode(data.length);try(OutputStream out=c.getOutputStream()){out.write(data);}}return c;
     }
+	private void probeNodes(JSONArray nodes){
+		Set<String> active=new HashSet<>();
+		for(int i=0;i<nodes.length();i++){
+			JSONObject node=nodes.optJSONObject(i);if(node==null)continue;
+			String id=node.optString("id"),endpoint=node.optString("endpoint");
+			if(id.equals(nodeId)||!id.matches("[0-9a-f]{32}"))continue;
+			active.add(id);peerLinks.putIfAbsent(id,"检测中");
+			if(!probingPeers.add(id))continue;
+			try{probes.execute(()->{
+				try{
+				String result="不可达";
+				try{
+					JSONArray addresses=node.optJSONArray("lan");String key=node.optString("lanKey");
+					if(addresses!=null&&addresses.length()>0){String grant=peerGrant();if(!grant.isEmpty()&&CloudLan.request(addresses,key,"GET","/cloud/ping",grant,null).status==204)result="局域网直连";}
+				}catch(Exception ex){AppLog.info("Cloud LAN probe "+id+": "+ex.getMessage());}
+				if(result.equals("不可达"))try{
+					PeerResult response=null;
+					if(endpoint.equals("p2p://"+id)&&peerClient!=null)response=peerClient.request(id,"GET","/cloud/ping",null);
+					else if(endpoint.startsWith("https://")){String grant=peerGrant();if(!grant.isEmpty())response=httpsPeerRequest(endpoint,"GET","/cloud/ping",grant,null);}
+					if(response!=null&&response.status==204)result=endpoint.startsWith("p2p://")?"WebRTC 直连":"HTTPS 直连";
+				}catch(Exception ex){AppLog.info("Cloud peer probe "+id+": "+ex.getMessage());}
+				if(!stopped)peerLinks.put(id,result);
+				}finally{probingPeers.remove(id);}
+			});}catch(RejectedExecutionException ignored){probingPeers.remove(id);}
+		}
+		peerLinks.keySet().retainAll(active);
+	}
+	private static PeerResult httpsPeerRequest(String endpoint,String method,String path,String grant,byte[] data)throws Exception{
+		HttpURLConnection connection=(HttpURLConnection)new URL(endpoint+path).openConnection();
+		connection.setRequestMethod(method);connection.setConnectTimeout(3000);connection.setReadTimeout(8000);connection.setInstanceFollowRedirects(false);connection.setRequestProperty("Authorization","Bearer "+grant);
+		try{
+			if(data!=null&&data.length>0){connection.setDoOutput(true);connection.setFixedLengthStreamingMode(data.length);try(OutputStream out=connection.getOutputStream()){out.write(data);}}
+			int status=connection.getResponseCode();InputStream input=status>=400?connection.getErrorStream():connection.getInputStream();
+			if(input==null)return new PeerResult(status,new byte[0]);
+			try(InputStream in=input;ByteArrayOutputStream out=new ByteArrayOutputStream()){byte[] buffer=new byte[8192];int n;while((n=in.read(buffer))!=-1){out.write(buffer,0,n);if(out.size()>16<<20)throw new IOException("peer response too large");}return new PeerResult(status,out.toByteArray());}
+		}finally{connection.disconnect();}
+	}
     private void syncHub()throws Exception{
         String advertised=publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)&&(relayClient==null||!relayClient.isConnected())?"":publicUrl;
         JSONObject node=new JSONObject().put("id",nodeId).put("endpoint",advertised).put("relayed",publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)).put("role","storage");
+		if(lan!=null){JSONArray addresses=lan.addresses();if(addresses.length()>0)node.put("lan",addresses).put("lanKey",lan.fingerprint);}
+		JSONObject links=new JSONObject();int reported=0;for(Map.Entry<String,String> entry:peerLinks.entrySet()){if(reported++>=64)break;String value=entry.getValue();String path=value.startsWith("局域网")?"lan":value.startsWith("WebRTC")?"webrtc":value.startsWith("HTTPS")?"direct":"";links.put(entry.getKey(),new JSONObject().put("state",value.equals("检测中")?"checking":value.equals("不可达")?"unreachable":"connected").put("path",path));}node.put("links",links);
         List<String> blocks=list("blocks"),catalog=list("catalog");
         blockCount=blocks.size();catalogCount=catalog.size();capacityBytes=openlist==null?root.getTotalSpace():0;availableBytes=openlist==null?root.getUsableSpace():0;
         node.put("backend",backend).put("statsReady",true).put("blockCount",blocks.size()).put("catalogCount",catalog.size());
         if(openlist==null){long blockBytes=0;for(String id:blocks)blockBytes+=object("blocks",id).length();node.put("blockBytes",blockBytes).put("capacityBytes",root.getTotalSpace()).put("availableBytes",root.getUsableSpace());}
         HttpURLConnection heartbeat=hubRequest("POST","/cloud/nodes/heartbeat",json(node));try{if(heartbeat.getResponseCode()!=204)throw new IOException("注册 HTTP "+heartbeat.getResponseCode());}finally{heartbeat.disconnect();}
+		HttpURLConnection listingNodes=hubRequest("GET","/cloud/nodes",null);
+		try{if(listingNodes.getResponseCode()!=200)throw new IOException("节点目录 HTTP "+listingNodes.getResponseCode());
+			ByteArrayOutputStream out=new ByteArrayOutputStream();try(InputStream in=listingNodes.getInputStream()){byte[] buffer=new byte[4096];int n;while((n=in.read(buffer))!=-1){out.write(buffer,0,n);if(out.size()>1<<20)throw new IOException("节点目录过大");}}
+			JSONArray nodes=new JSONObject(out.toString("UTF-8")).optJSONArray("nodes");if(nodes!=null)probeNodes(nodes);
+		}finally{listingNodes.disconnect();}
         HttpURLConnection listing=hubRequest("GET","/cloud/catalog",null);JSONArray remote;
         try{if(listing.getResponseCode()!=200)throw new IOException("索引 HTTP "+listing.getResponseCode());ByteArrayOutputStream out=new ByteArrayOutputStream();byte[] buffer=new byte[4096];int n;try(InputStream in=listing.getInputStream()){while((n=in.read(buffer))!=-1){out.write(buffer,0,n);if(out.size()>16<<20)throw new IOException("catalog too large");}}remote=new JSONObject(out.toString("UTF-8")).getJSONArray("records");}finally{listing.disconnect();}
         Set<String> known=new HashSet<>();Set<String> localCatalog=new HashSet<>(catalog);for(int i=0;i<remote.length();i++){String id=remote.optString(i);if(!validId(id))continue;known.add(id);if(localCatalog.contains(id))continue;

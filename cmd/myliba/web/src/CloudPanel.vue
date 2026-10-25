@@ -100,7 +100,11 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
           <p v-if="error" class="form-error" role="alert">{{ error }}</p>
           <p class="hub-current">当前节点 {{ view.nodeId || "未连接" }} · 已发现 {{ view.peers.length }} 个其他在线节点</p>
           <p v-if="!remote && view.peers.length === 0">当前是单节点云层：文件仍会在本机分块、加密、保存索引并可随时读取。只有一份副本时会提示保护不足，不影响使用。</p>
-          <p v-if="!remote && !view.directEndpoint && view.peers.length > 0">本客户端尚未配置直连公开地址；可主动上传到其他节点，但其他设备不能直接从本客户端取块。</p>
+		  <p v-if="!remote && !view.directEndpoint && !view.lan?.length && view.peers.length > 0">本客户端通过 Hub 协商 WebRTC 节点直连；若直连失败，请检查网络或配置可访问的地址。</p>
+		  <div v-for="peer in view.peers" :key="peer.id" class="hub-profile-row">
+		    <div><strong>{{ peer.role === "storage" ? "存储节点" : "客户端" }} · {{ peer.id.slice(0, 12) }}</strong><small>{{ peer.lan?.length ? "已公布局域网地址 · " : "" }}{{ peer.endpoint.startsWith("p2p://") ? "WebRTC 地址" : peer.endpoint ? "HTTPS 地址" : "等待直连地址" }}</small></div>
+		    <span :class="['hub-cloud-status', { offline: view.peerStatus?.[peer.id]?.state !== 'connected' }]">{{ view.peerStatus?.[peer.id]?.state === "connected" ? ({ lan: "局域网直连", webrtc: "WebRTC 直连", direct: "HTTPS 直连" }[view.peerStatus[peer.id].path || 'direct']) : view.peerStatus?.[peer.id]?.state === "unreachable" ? "当前不可达" : "检测中" }}</span>
+		  </div>
           <div class="cloud-heading"><strong>云层文件</strong><button class="quiet-button" type="button" @click="refresh"><RefreshCw :size="15" />刷新</button></div>
           <p v-if="loading">正在读取云层索引…</p>
           <p v-else-if="!view.files.length">云层里还没有可用文件。</p>

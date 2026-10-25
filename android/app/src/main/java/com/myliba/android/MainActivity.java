@@ -37,7 +37,7 @@ public final class MainActivity extends Activity {
     private LinearLayout shell,header,content,navigation,batchDock;
     private ListView files;private ResourceAdapter adapter;private FrameLayout resultArea;
     private TextView resultLabel,footerLabel;private EditText search;
-    private TextView nodeTitle,nodeStatus,nodeCounts,nodeCapacity,nodeAccess,nodeConfigure,nodeStop,resourceNodeStatus;
+    private TextView nodeTitle,nodeStatus,nodeCounts,nodeCapacity,nodeAccess,nodePeers,nodeConfigure,nodeStop,resourceNodeStatus;
     private boolean displayedNodeRunning;
     private boolean home,grid,loading,selecting,busy,scanning,destroyed,needsLogin,storageOnly;
     private int tab,generation,total; private String error="",scanMessage="",activeCollection;
@@ -103,6 +103,7 @@ public final class MainActivity extends Activity {
         card.addView(ui.text("云层块存储："+(openlist?"OpenList · "+settings.getString("openlist_mount",""):"本手机的应用存储空间"),12,MUTED,false),ui.top(15));
         String access=!settings.getString("url","").isEmpty()?"公网直连":!settings.getString("relay","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"Hub 协助节点直连";
         nodeAccess=ui.text("访问："+access,12,MUTED,false);card.addView(nodeAccess,ui.top(6));
+		nodePeers=ui.text("其他节点：等待 Hub 目录",12,MUTED,false);card.addView(nodePeers,ui.top(9));
         nodeCounts=ui.text("",13,INK,false);card.addView(nodeCounts,ui.top(15));
         nodeCapacity=ui.text("",12,MUTED,false);card.addView(nodeCapacity,ui.top(5));
         body.addView(card);
@@ -122,6 +123,7 @@ public final class MainActivity extends Activity {
         if(CloudStorageService.capacityBytes>0)nodeCapacity.setText("可用 "+size(CloudStorageService.availableBytes)+" / "+size(CloudStorageService.capacityBytes));
         android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
         nodeAccess.setText("访问："+(!settings.getString("url","").isEmpty()?"公网直连":!settings.getString("relay","").isEmpty()?"存储节点中继"+(CloudStorageService.relayConnected?"已连接":"待连接"):"Hub 协助节点直连"));
+		if(nodePeers!=null){List<String> links=new ArrayList<>();for(Map.Entry<String,String> entry:CloudStorageService.peerLinks.entrySet())links.add(entry.getKey().substring(0,Math.min(12,entry.getKey().length()))+" · "+entry.getValue());Collections.sort(links);nodePeers.setText(links.isEmpty()?"其他节点：尚未发现":"其他节点：\n"+String.join("\n",links));}
         nodeConfigure.setText(active?"配置并重启":"配置并启动");nodeStop.setVisibility(active?View.VISIBLE:View.GONE);
     }
     private void renderNav(){
@@ -295,7 +297,7 @@ public final class MainActivity extends Activity {
             section(body,"手机资源节点",null,null);
             body.addView(ui.item("server",ResourceNodeService.running?"资源节点运行中":"让其他客户端访问本机资源库",ResourceNodeService.status,this::resourceNodeSheet),ui.top(10));
             resourceNodeStatus=ui.text(ResourceNodeService.status,12,MUTED,false);body.addView(resourceNodeStatus,ui.top(6));
-            section(body,"云层存储节点",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"用这台手机存储加密块",CloudStorageService.running?CloudStorageService.status:"使用主人授权的设备凭据连接 Hub",this::cloudStorageSheet),ui.top(10));body.addView(ui.item("shield","切换为仅存储模式","保留同一 APK，只显示节点运行与配置",this::enterStorageMode),ui.top(9));
+			section(body,"云层存储节点",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"用这台手机存储加密块",CloudStorageService.running?CloudStorageService.status+" · 可连通 "+CloudStorageService.peerLinks.values().stream().filter(value->value.endsWith("直连")).count()+"/"+CloudStorageService.peerLinks.size()+" 节点":"使用主人授权的设备凭据连接 Hub",this::cloudStorageSheet),ui.top(10));body.addView(ui.item("shield","切换为仅存储模式","保留同一 APK，只显示节点运行与配置",this::enterStorageMode),ui.top(9));
         }
         if(!scanMessage.isEmpty()&&!home)body.addView(ui.text(scanMessage,12,GREEN,false),ui.top(12));if(!error.isEmpty())body.addView(errorCard(),ui.top(12));
         section(body,"索引目录",meta.roots.size()+" 个",null);
@@ -348,6 +350,7 @@ public final class MainActivity extends Activity {
         android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
         String storedPassword;try{storedPassword=CloudSecretStore.read(settings,"openlist_password");}catch(Exception ex){toast("OpenList 凭据读取失败，请重新配置节点");storedPassword="";}
         MobileUi.Sheet sheet=ui.sheet("手机云层存储节点","同一应用可浏览文件或只运行存储节点。节点只处理已加密的文件块。");
+		if(CloudStorageService.running){List<String> links=new ArrayList<>();for(Map.Entry<String,String> entry:CloudStorageService.peerLinks.entrySet())links.add(entry.getKey().substring(0,Math.min(12,entry.getKey().length()))+" · "+entry.getValue());Collections.sort(links);sheet.body.addView(ui.text(links.isEmpty()?"其他节点：尚未发现":"其他节点：\n"+String.join("\n",links),12,MUTED,false),ui.top(8));}
         sheet.body.addView(ui.text("存储位置",12,INK,true));
         Spinner backendChoice=new Spinner(this);ArrayAdapter<String> choices=new ArrayAdapter<>(this,android.R.layout.simple_spinner_item,new String[]{"本手机存储（云层节点）","OpenList 云盘（可选后端）"});choices.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);backendChoice.setAdapter(choices);
         backendChoice.setSelection("openlist".equals(settings.getString("backend","disk"))?1:0);sheet.body.addView(backendChoice,ui.top(7));

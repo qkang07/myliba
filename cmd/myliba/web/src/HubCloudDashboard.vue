@@ -73,6 +73,9 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
               <small>{{ node.backend === "s3" ? "S3 / OSS" : node.backend === "openlist" ? "OpenList / 云盘" : node.backend === "webdav" ? "WebDAV / 云盘" : "本地磁盘" }} · {{ node.relayed ? (node.endpoint ? "经存储节点中继" : "中继未连接") : "直连" }} · 最近上报 {{ time(node.seenAt) }}</small>
               <small class="hub-cloud-endpoint">{{ node.endpoint || "当前无访问地址" }}</small>
               <div class="hub-cloud-node-metrics"><span>{{ node.statsReady ? node.blockCount : "未知" }} 块</span><span>副本占用 {{ size(node.blockBytes) }}</span><span>可用 {{ size(node.availableBytes) }} / {{ size(node.capacityBytes) }}</span><span>{{ node.statsReady ? node.catalogCount : "未知" }} 条索引</span></div>
+			  <div v-if="node.online && node.links && Object.keys(node.links).length" class="hub-cloud-links">
+			    <small v-for="[target, link] in Object.entries(node.links)" :key="target">→ {{ target.slice(0, 12) }}：{{ link.state === "connected" ? ({ lan: "局域网直连", webrtc: "WebRTC 直连", direct: "HTTPS 直连" }[link.path || "direct"]) : link.state === "checking" ? "检测中" : "当前不可达" }}</small>
+			  </div>
               <button v-if="!node.online" class="quiet-button" type="button" :aria-label="`移除离线节点 ${node.id}`" @click="removeNode(node)">移除离线记录</button>
             </div>
           </template>
