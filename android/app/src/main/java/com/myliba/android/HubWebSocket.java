@@ -25,6 +25,8 @@ final class HubWebSocket implements Closeable {
         int port=uri.getPort()<0?443:uri.getPort();
         Socket raw=new Socket();raw.connect(new InetSocketAddress(uri.getHost(),port),10000);
         socket=(SSLSocket)((SSLSocketFactory)SSLSocketFactory.getDefault()).createSocket(raw,uri.getHost(),port,true);
+        boolean connected=false;
+        try{
         SSLParameters parameters=socket.getSSLParameters();parameters.setEndpointIdentificationAlgorithm("HTTPS");socket.setSSLParameters(parameters);
         socket.setSoTimeout(12000);socket.startHandshake();
         in=new BufferedInputStream(socket.getInputStream());out=socket.getOutputStream();
@@ -41,7 +43,8 @@ final class HubWebSocket implements Closeable {
         String accept="";for(int i=0;i<64;i++){String header=line(in);if(header.isEmpty())break;int colon=header.indexOf(':');if(colon>0&&header.substring(0,colon).equalsIgnoreCase("Sec-WebSocket-Accept"))accept=header.substring(colon+1).trim();}
         String expected=Base64.encodeToString(MessageDigest.getInstance("SHA-1").digest((key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").getBytes(StandardCharsets.US_ASCII)),Base64.NO_WRAP);
         if(!expected.equals(accept))throw new IOException("Hub WebSocket handshake mismatch");
-        socket.setSoTimeout(0);
+        socket.setSoTimeout(0);connected=true;
+        }finally{if(!connected)try{socket.close();}catch(IOException ignored){}}
     }
 
     synchronized void send(String value)throws IOException{frame(1,value.getBytes(StandardCharsets.UTF_8));}

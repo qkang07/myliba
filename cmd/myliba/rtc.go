@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ type nodeRTCManager struct {
 	mu       sync.Mutex
 	sessions map[string]*nodeRTCSession
 	config   webrtc.Configuration
+	api      *webrtc.API
 	conn     *websocket.Conn
 	writeMu  *sync.Mutex
 }
@@ -46,21 +48,23 @@ type rtcRequest struct {
 	tooLarge bool
 }
 
-func newNodeRTCManager(conn *websocket.Conn, writeMu *sync.Mutex, servers []iceServerConfig) *nodeRTCManager {
-	direct := make([]iceServerConfig, 0, len(servers))
-	for _, server := range servers {
-		filtered := server
-		filtered.URLs = nil
-		for _, endpoint := range server.URLs {
-			if !strings.HasPrefix(strings.ToLower(endpoint), "turn:") && !strings.HasPrefix(strings.ToLower(endpoint), "turns:") {
-				filtered.URLs = append(filtered.URLs, endpoint)
-			}
+func newNodeRTCManager(conn *websocket.Conn, writeMu *sync.Mutex, servers []iceServerConfig) (*nodeRTCManager, error) {
+	setting := webrtc.SettingEngine{}
+	if raw := strings.TrimSpace(os.Getenv("MYLIBA_RESOURCE_UDP_PORT_RANGE")); raw != "" {
+		parts := strings.Split(raw, "-")
+		if len(parts) != 2 {
+			return nil, errors.New("MYLIBA_RESOURCE_UDP_PORT_RANGE must be MIN-MAX")
 		}
-		if len(filtered.URLs) > 0 {
-			direct = append(direct, filtered)
+		min, minErr := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 16)
+		max, maxErr := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 16)
+		if minErr != nil || maxErr != nil || min < 1024 || max < min || max-min < 15 {
+			return nil, errors.New("MYLIBA_RESOURCE_UDP_PORT_RANGE must contain at least 16 ports between 1024 and 65535")
+		}
+		if err := setting.SetEphemeralUDPPortRange(uint16(min), uint16(max)); err != nil {
+			return nil, err
 		}
 	}
-	return &nodeRTCManager{sessions: map[string]*nodeRTCSession{}, config: pionICEConfiguration(direct), conn: conn, writeMu: writeMu}
+	return &nodeRTCManager{sessions: map[string]*nodeRTCSession{}, config: pionICEConfiguration(servers), api: webrtc.NewAPI(webrtc.WithSettingEngine(setting)), conn: conn, writeMu: writeMu}, nil
 }
 
 func (m *nodeRTCManager) handle(sessionID, shareID string, payload json.RawMessage) {
@@ -92,7 +96,7 @@ func (m *nodeRTCManager) handle(sessionID, shareID string, payload json.RawMessa
 }
 
 func (m *nodeRTCManager) acceptOffer(sessionID, shareID string, offer webrtc.SessionDescription) {
-	peer, err := webrtc.NewPeerConnection(m.config)
+	peer, err := m.api.NewPeerConnection(m.config)
 	if err != nil {
 		m.sendSignal(sessionID, rtcSignal{Type: "error"})
 		return

@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Answers authenticated Hub signaling and serves the local library over RTC. */
 final class ResourceNodeRTC {
+    private final Context context;
     private final NodeResourceApi api;private final ExecutorService workers;
     private final PeerConnectionFactory factory;
     private final Map<String,Session> sessions=new ConcurrentHashMap<>();
@@ -20,8 +21,8 @@ final class ResourceNodeRTC {
     private volatile JSONArray servers=new JSONArray();
     private volatile HubWebSocket socket;
     ResourceNodeRTC(Context context,NodeResourceApi api,ExecutorService workers){
-        this.api=api;this.workers=workers;
-        WebRtcRuntime.ensureInitialized(context);
+        this.context=context.getApplicationContext();this.api=api;this.workers=workers;
+        WebRtcRuntime.ensureInitialized(this.context);
         factory=PeerConnectionFactory.builder().createPeerConnectionFactory();
     }
     void setSocket(HubWebSocket value){socket=value;}
@@ -32,31 +33,27 @@ final class ResourceNodeRTC {
         String id=frame.optString("sessionId"),share=frame.optString("shareId");JSONObject signal=frame.optJSONObject("signal");
         if(id.isEmpty()||signal==null||!share.isEmpty())return;
         String type=signal.optString("type");
-        if("offer".equals(type)){AppLog.info("Resource RTC offer received");JSONObject description=signal.optJSONObject("description");if(description!=null&&"offer".equals(description.optString("type")))workers.execute(()->accept(id,description.optString("sdp")));}
+        if("offer".equals(type)){AppLog.info("Resource RTC offer received; "+WebRtcDiagnostics.network(context));JSONObject description=signal.optJSONObject("description");if(description!=null&&"offer".equals(description.optString("type")))workers.execute(()->accept(id,description.optString("sdp")));}
         else if("candidate".equals(type)){
             JSONObject candidate=signal.optJSONObject("candidate");if(candidate==null)return;
             IceCandidate ice=new IceCandidate(candidate.optString("sdpMid"),candidate.optInt("sdpMLineIndex"),candidate.optString("candidate"));
-            Session session=sessions.get(id);if(session==null)earlyCandidates.computeIfAbsent(id,key->new CopyOnWriteArrayList<>()).add(ice);else session.addCandidate(ice);
+            AppLog.info("Resource RTC remote "+WebRtcDiagnostics.candidate(ice.sdp));Session session=sessions.get(id);if(session==null)earlyCandidates.computeIfAbsent(id,key->new CopyOnWriteArrayList<>()).add(ice);else session.addCandidate(ice);
         }else if("close".equals(type)){AppLog.info("Resource RTC session closed by peer");Session gone=sessions.remove(id);if(gone!=null)gone.close();}
     }
     private void accept(String id,String sdp){
         Session session=null;
         try{
             AppLog.info("Resource RTC creating peer");
-            List<PeerConnection.IceServer> ice=new ArrayList<>();
-            JSONArray configured=servers;
-            for(int i=0;i<configured.length();i++){JSONObject server= configured.optJSONObject(i);if(server==null)continue;JSONArray urls=server.optJSONArray("urls");if(urls==null)continue;
-                for(int j=0;j<urls.length();j++){String url=urls.optString(j);if(url.startsWith("stun:")||url.startsWith("stuns:"))ice.add(PeerConnection.IceServer.builder(url).createIceServer());}
-            }
-            if(ice.isEmpty())ice.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer());
+            List<PeerConnection.IceServer> ice=WebRtcIceServers.parse(servers);
+            AppLog.info("Resource RTC "+WebRtcDiagnostics.servers(servers)+"; "+WebRtcDiagnostics.network(context));
             session=new Session(id);
             Session active=session;
             PeerConnection peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
                 @Override public void onSignalingChange(PeerConnection.SignalingState state){}
-                @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Resource RTC ICE "+state);if(state==PeerConnection.IceConnectionState.FAILED||state==PeerConnection.IceConnectionState.CLOSED){sessions.remove(id,active);active.close();}}
+                @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Resource RTC ICE "+state+"; "+WebRtcDiagnostics.network(context));if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(active.peer,"Resource RTC");if(state==PeerConnection.IceConnectionState.FAILED||state==PeerConnection.IceConnectionState.CLOSED){sessions.remove(id,active);active.close();}}
                 @Override public void onIceConnectionReceivingChange(boolean value){}
-                @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){}
-                @Override public void onIceCandidate(IceCandidate candidate){try{sendSignal(id,new JSONObject().put("type","candidate").put("candidate",new JSONObject().put("candidate",candidate.sdp).put("sdpMid",candidate.sdpMid).put("sdpMLineIndex",candidate.sdpMLineIndex)));}catch(Exception ignored){}}
+                @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){AppLog.info("Resource RTC ICE gathering "+state);}
+                @Override public void onIceCandidate(IceCandidate candidate){AppLog.info("Resource RTC local "+WebRtcDiagnostics.candidate(candidate.sdp));try{sendSignal(id,new JSONObject().put("type","candidate").put("candidate",new JSONObject().put("candidate",candidate.sdp).put("sdpMid",candidate.sdpMid).put("sdpMLineIndex",candidate.sdpMLineIndex)));}catch(Exception failure){AppLog.error("Resource RTC local ICE candidate signaling failed",failure);}}
                 @Override public void onIceCandidatesRemoved(IceCandidate[] candidates){}
                 @Override public void onAddStream(MediaStream stream){}
                 @Override public void onRemoveStream(MediaStream stream){}
@@ -65,7 +62,7 @@ final class ResourceNodeRTC {
             });
             if(peer==null)throw new IOException("RTC peer unavailable");session.peer=peer;
             Session previous=sessions.put(id,session);if(previous!=null)previous.close();
-            setDescription(peer,new SessionDescription(SessionDescription.Type.OFFER,sdp),false);
+            WebRtcDiagnostics.sdpCandidates("Resource RTC remote SDP",sdp);setDescription(peer,new SessionDescription(SessionDescription.Type.OFFER,sdp),false);
             AppLog.info("Resource RTC remote offer set");
             session.remoteReady=true;List<IceCandidate> pending=earlyCandidates.remove(id);if(pending!=null)for(IceCandidate candidate:pending)session.addCandidate(candidate);session.flushCandidates();
             SessionDescription answer=createAnswer(peer);setDescription(peer,answer,true);
@@ -108,7 +105,7 @@ final class ResourceNodeRTC {
         synchronized void flushCandidates(){if(peer!=null)for(IceCandidate candidate:candidates)peer.addIceCandidate(candidate);candidates.clear();}
         void close(){if(!closed.compareAndSet(false,true))return;DataChannel current=channel;if(current!=null){current.close();current.dispose();}PeerConnection connection=peer;if(connection!=null){connection.close();connection.dispose();}}
         @Override public void onBufferedAmountChange(long amount){}
-        @Override public void onStateChange(){AppLog.info("Resource RTC data channel state changed");}
+        @Override public void onStateChange(){AppLog.info("Resource RTC data channel "+(channel==null?"unavailable":channel.state())+"; "+WebRtcDiagnostics.network(context));if(channel!=null&&channel.state()==DataChannel.State.OPEN)WebRtcDiagnostics.selectedPair(peer,"Resource RTC");}
         @Override public synchronized void onMessage(DataChannel.Buffer buffer){
             if(buffer.binary)return;ByteBuffer data=buffer.data;byte[] raw=new byte[data.remaining()];data.get(raw);
             try{JSONObject message=new JSONObject(new String(raw,StandardCharsets.UTF_8));String type=message.optString("type"),requestID=message.optString("id");if(requestID.isEmpty())return;

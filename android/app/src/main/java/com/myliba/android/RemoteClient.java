@@ -2,7 +2,6 @@ package com.myliba.android;
 
 import android.content.SharedPreferences;
 import android.content.Context;
-import android.content.Intent;
 import org.json.*;
 import java.io.*;
 import java.net.*;
@@ -49,7 +48,7 @@ final class RemoteClient {
             JSONObject status=new JSONObject(new String(bytes("GET","/api/session",null,8*1024*1024),StandardCharsets.UTF_8));
             configureSession(status);return session;
         }
-        catch(Failure ex){if(ex.status==401){prefs.edit().remove("device_id").remove("device_token").remove("device_hub").apply();if(ResourceNodeService.clearPaired(context,base))context.stopService(new Intent(context,ResourceNodeService.class));}throw ex;}
+        catch(Failure ex){if(ex.status==401)throw new Failure(401,"Hub 拒绝设备凭据。请检查 Hub 授权数据是否恢复，或用主人密码重新授权；本机设备凭据已保留。");throw ex;}
     }
     JSONObject json(String method,String path,JSONObject body)throws Exception{
         byte[] bytes;
@@ -81,7 +80,7 @@ final class RemoteClient {
                 if(reply.status<200||reply.status>=300)throw failure(reply.status,reply.body);
                 return reply.body;
             }catch(Failure ex){throw ex;}
-            catch(Exception ex){if(directRequired||!"GET".equals(method))throw ex;}
+            catch(Exception ex){if(!"GET".equals(method))throw ex;AppLog.info("Remote content falling back to limited Hub relay: "+ex.getClass().getSimpleName());}
         }
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();
         try{
@@ -98,13 +97,27 @@ final class RemoteClient {
     }
     void download(String path,OutputStream out)throws Exception{
         if(!rtcConfigured)json("GET","/api/session",null);
+        try{rtc.ensureConnected();}catch(Exception ex){AppLog.info("Remote download falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,null,out,null);return;}
         RemoteRTC.Reply reply=rtc.stream("GET",path,new byte[0],new JSONObject(),out,Long.MAX_VALUE);
         if(reply.status<200||reply.status>=300)throw new Failure(reply.status,"文件传输失败（"+reply.status+"）");
     }
     void streamFile(String path,String range,OutputStream out,RemoteRTC.ResponseStart start)throws Exception{
         if(!rtcConfigured)json("GET","/api/session",null);
+        try{rtc.ensureConnected();}catch(Exception ex){AppLog.info("Remote media falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start);return;}
         JSONObject headers=new JSONObject();if(range!=null&&!range.isEmpty())headers.put("Range",new JSONArray().put(range));
         rtc.stream("GET",path,new byte[0],headers,out,Long.MAX_VALUE,start);
+    }
+    private void streamFromHub(String path,String range,OutputStream out,RemoteRTC.ResponseStart start)throws Exception{
+        HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();
+        try{
+            c.setRequestMethod("GET");c.setConnectTimeout(12000);c.setReadTimeout(30000);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
+            c.setRequestProperty("Origin",base);c.setRequestProperty("Referer",base+"/");if(!cookie.isEmpty())c.setRequestProperty("Cookie",cookie);
+            if(range!=null&&!range.isEmpty())c.setRequestProperty("Range",range);
+            int status=c.getResponseCode();if(status<200||status>=300){InputStream error=c.getErrorStream();byte[] data=new byte[0];if(error!=null){byte[] buffer=new byte[8192];int n=error.read(buffer);if(n>0)data=java.util.Arrays.copyOf(buffer,n);error.close();}if(status==401)forget();throw failure(status,data);}
+            JSONObject headers=new JSONObject();for(String name:new String[]{"Content-Type","Content-Length","Content-Range","Accept-Ranges"}){String value=c.getHeaderField(name);if(value!=null)headers.put(name,new JSONArray().put(value));}
+            if(start!=null)start.onStart(status,headers);
+            try(InputStream in=c.getInputStream()){byte[] buffer=new byte[8192];int n;while((n=in.read(buffer))!=-1)out.write(buffer,0,n);}
+        }finally{c.disconnect();}
     }
     JSONObject selectNode(String id)throws Exception{
         JSONObject result=json("PUT","/api/hub/nodes/active",object("id",id));

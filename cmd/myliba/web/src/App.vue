@@ -476,12 +476,12 @@ function openResourcePreview(resource: Resource) {
     } else {
       const id = resource.id;
       void getResourceFile(id).then(async (response) => {
-        if (!response.ok) throw new Error("直连读取失败");
+        if (!response.ok) throw new Error("文件读取失败");
         const url = URL.createObjectURL(await response.blob());
         if (previewResource.value?.id !== id) URL.revokeObjectURL(url);
         else { previewURL.value = url; previewError.value = ""; }
       }).catch((cause) => {
-        if (previewResource.value?.id === id) previewError.value = cause instanceof Error ? cause.message : "直连不可用";
+        if (previewResource.value?.id === id) previewError.value = cause instanceof Error ? cause.message : "文件暂时不可用";
       });
     }
   }
@@ -1556,8 +1556,8 @@ onBeforeUnmount(() => {
             <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
               <span class="connection-dot"></span><span>Web · HTTPS 接入</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small>
             </span>
-            <span class="connection-badge traffic-badge" :class="{ offline: !nodeOnline }" :title="nodeTransport === 'webrtc' ? 'WebRTC DataChannel 直连；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'turn' ? 'WebRTC DataChannel 通过 TURN 中继；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'connecting' ? '正在协商 WebRTC；元数据可经 WSS 转发，文件内容等待直连。' : 'WebRTC 不可用；元数据经 WSS 转发，文件内容需要直连。'">
-              <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · WebRTC / TURN' : nodeTransport === 'connecting' ? '节点 · WebRTC 连接中' : '节点 · WSS 转发' }}</span><small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small>
+            <span class="connection-badge traffic-badge" :class="{ offline: !nodeOnline }" :title="nodeTransport === 'webrtc' ? 'WebRTC DataChannel 直连；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'turn' ? 'WebRTC DataChannel 通过 TURN 中继；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'connecting' ? '正在协商 WebRTC；连接失败后文件内容经限速 Hub 中转。' : 'WebRTC 不可用；文件内容经限速 Hub 中转。'">
+              <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · WebRTC / TURN' : nodeTransport === 'connecting' ? '节点 · WebRTC 连接中' : '节点 · Hub 限速中转' }}</span><small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small>
             </span>
           </template>
           <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>

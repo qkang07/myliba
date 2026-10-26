@@ -94,15 +94,14 @@ final class CloudPeerClient {
 		CompletableFuture<JSONObject> answer=new CompletableFuture<>();pendingAnswers.put(session,answer);
 		PeerConnection peer=null;
 		try{
-			JSONArray serverList=request("GET","/cloud/ice",null).optJSONArray("servers");List<PeerConnection.IceServer> ice=new ArrayList<>();
-			if(serverList!=null)for(int i=0;i<serverList.length();i++){JSONObject entry=serverList.optJSONObject(i);if(entry==null)continue;JSONArray urls=entry.optJSONArray("urls");if(urls!=null)for(int j=0;j<urls.length();j++){String url=urls.optString(j);if(url.startsWith("stun:")||url.startsWith("stuns:"))ice.add(PeerConnection.IceServer.builder(url).createIceServer());}}
-			CountDownLatch gathered=new CountDownLatch(1);List<String> candidates=Collections.synchronizedList(new ArrayList<>());
+			JSONArray serverList=request("GET","/cloud/ice",null).optJSONArray("servers");List<PeerConnection.IceServer> ice=WebRtcIceServers.parse(serverList);AppLog.info("Cloud peer outbound connecting; "+WebRtcDiagnostics.network(storage)+"; "+WebRtcDiagnostics.servers(serverList));
+			CountDownLatch gathered=new CountDownLatch(1);List<String> candidates=Collections.synchronizedList(new ArrayList<>());PeerConnection[] peerRef=new PeerConnection[1];
 			peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
 				@Override public void onSignalingChange(PeerConnection.SignalingState state){}
-				@Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){}
+				@Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Cloud peer outbound ICE "+state+"; "+WebRtcDiagnostics.network(storage));if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(peerRef[0],"Cloud peer outbound");}
 				@Override public void onIceConnectionReceivingChange(boolean receiving){}
-				@Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){if(state==PeerConnection.IceGatheringState.COMPLETE)gathered.countDown();}
-				@Override public void onIceCandidate(IceCandidate candidate){candidates.add(candidate.sdp);}
+				@Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){AppLog.info("Cloud peer outbound ICE gathering "+state);if(state==PeerConnection.IceGatheringState.COMPLETE)gathered.countDown();}
+				@Override public void onIceCandidate(IceCandidate candidate){AppLog.info("Cloud peer outbound local "+WebRtcDiagnostics.candidate(candidate.sdp));candidates.add(candidate.sdp);}
 				@Override public void onIceCandidatesRemoved(IceCandidate[] candidates){}
 				@Override public void onAddStream(MediaStream stream){}
 				@Override public void onRemoveStream(MediaStream stream){}
@@ -110,6 +109,7 @@ final class CloudPeerClient {
 				@Override public void onRenegotiationNeeded(){}
 			});
 			if(peer==null)throw new IOException("peer connection unavailable");
+			peerRef[0]=peer;
 			Outbound outbound=new Outbound(method,path,grant,payload==null?new byte[0]:payload);
 			DataChannel channel=peer.createDataChannel("cloud",new DataChannel.Init());if(channel==null)throw new IOException("data channel unavailable");channel.registerObserver(outbound);outbound.channel=channel;
 			CountDownLatch created=new CountDownLatch(1);SessionDescription[] offer=new SessionDescription[1];
@@ -124,7 +124,7 @@ final class CloudPeerClient {
 			if(!gathered.await(12,TimeUnit.SECONDS))throw new IOException("ICE gathering timed out");
 			request("POST","/cloud/signal",new JSONObject().put("from",id).put("to",target).put("session",session).put("type","offer").put("sdp",withCandidates(offer[0].description,candidates)));
 			JSONObject remote=answer.get(15,TimeUnit.SECONDS);if(!target.equals(remote.optString("from")))throw new IOException("unexpected peer answer");
-			setDescription(peer,new SessionDescription(SessionDescription.Type.ANSWER,remote.getString("sdp")),false);
+			WebRtcDiagnostics.sdpCandidates("Cloud peer outbound remote SDP",remote.optString("sdp"));setDescription(peer,new SessionDescription(SessionDescription.Type.ANSWER,remote.getString("sdp")),false);
 			if(!outbound.done.await(20,TimeUnit.SECONDS))throw new IOException("peer response timed out");
 			if(outbound.failure!=null)throw outbound.failure;
 			return new CloudStorageService.PeerResult(outbound.status,outbound.response.toByteArray());
@@ -157,23 +157,20 @@ final class CloudPeerClient {
         boolean answeredSuccessfully=false;
         try{
             AppLog.info("Cloud peer preparing answer");
-            JSONArray serverList=request("GET","/cloud/ice",null).optJSONArray("servers");
-            List<PeerConnection.IceServer> ice=new ArrayList<>();
-            if(serverList!=null)for(int i=0;i<serverList.length();i++){
-                JSONObject entry=serverList.optJSONObject(i);if(entry==null)continue;JSONArray urls=entry.optJSONArray("urls");
-                if(urls!=null)for(int j=0;j<urls.length();j++){String url=urls.optString(j);if(url.startsWith("stun:")||url.startsWith("stuns:"))ice.add(PeerConnection.IceServer.builder(url).createIceServer());}
-            }
+			JSONArray serverList=request("GET","/cloud/ice",null).optJSONArray("servers");AppLog.info("Cloud peer inbound connecting; "+WebRtcDiagnostics.network(storage)+"; "+WebRtcDiagnostics.servers(serverList));
+            List<PeerConnection.IceServer> ice=WebRtcIceServers.parse(serverList);
             CountDownLatch gathered=new CountDownLatch(1);List<String> candidates=Collections.synchronizedList(new ArrayList<>());
             if(closed||factory==null)throw new IOException("Cloud peer is stopping");
             PeerConnection peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
                 @Override public void onSignalingChange(PeerConnection.SignalingState state){}
                 @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){
-                    AppLog.info("Cloud peer ICE "+state);
+                    AppLog.info("Cloud peer inbound ICE "+state+"; "+WebRtcDiagnostics.network(storage));
+                    if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(active.peer,"Cloud peer inbound");
                     if(state==PeerConnection.IceConnectionState.CLOSED||state==PeerConnection.IceConnectionState.FAILED)active.scheduleDispose();
                 }
                 @Override public void onIceConnectionReceivingChange(boolean receiving){}
-                @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){if(state==PeerConnection.IceGatheringState.COMPLETE)gathered.countDown();}
-                @Override public void onIceCandidate(IceCandidate candidate){candidates.add(candidate.sdp);}
+                @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){AppLog.info("Cloud peer inbound ICE gathering "+state);if(state==PeerConnection.IceGatheringState.COMPLETE)gathered.countDown();}
+                @Override public void onIceCandidate(IceCandidate candidate){AppLog.info("Cloud peer inbound local "+WebRtcDiagnostics.candidate(candidate.sdp));candidates.add(candidate.sdp);}
                 @Override public void onIceCandidatesRemoved(IceCandidate[] candidates){}
                 @Override public void onAddStream(MediaStream stream){}
                 @Override public void onRemoveStream(MediaStream stream){}
@@ -182,7 +179,7 @@ final class CloudPeerClient {
             });
             if(peer==null)throw new IOException("WebRTC peer unavailable");active.peer=peer;
             AppLog.info("Cloud peer connection created");
-            setDescription(peer,new SessionDescription(SessionDescription.Type.OFFER,offer.getString("sdp")),false);
+            WebRtcDiagnostics.sdpCandidates("Cloud peer inbound remote SDP",offer.optString("sdp"));setDescription(peer,new SessionDescription(SessionDescription.Type.OFFER,offer.getString("sdp")),false);
             AppLog.info("Cloud peer remote offer set");
             CountDownLatch answered=new CountDownLatch(1);SessionDescription[] answer=new SessionDescription[1];
             peer.createAnswer(new SdpObserver(){

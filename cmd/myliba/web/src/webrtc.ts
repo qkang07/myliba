@@ -184,14 +184,7 @@ export async function connectWebRTC(
   rateListener = onRate;
   emitState("connecting");
   try {
-    // Content is not allowed through relay candidates, including TURN.
-    const directServers = iceServers.flatMap((server) => {
-      const urls = (Array.isArray(server.urls) ? server.urls : [server.urls]).filter(
-        (url) => typeof url === "string" && !/^(turn|turns):/i.test(url),
-      );
-      return urls.length ? [{ ...server, urls }] : [];
-    });
-    const rtc = new RTCPeerConnection({ iceServers: directServers });
+    const rtc = new RTCPeerConnection({ iceServers });
     peer = rtc;
     const socketURL = new URL(share ? "/share/signal" : "/signal", window.location.href);
     socketURL.protocol = socketURL.protocol === "https:" ? "wss:" : "ws:";
@@ -311,6 +304,15 @@ export function closeWebRTC() {
 
 export function webRTCConnected() {
   return channel?.readyState === "open";
+}
+
+export async function waitForWebRTCConnection() {
+  const connectingPeer = peer;
+  if (!connectingPeer || channel?.readyState !== "connecting") return;
+  const deadline = Date.now() + 14000;
+  while (peer === connectingPeer && channel?.readyState === "connecting" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 export async function webRTCFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {

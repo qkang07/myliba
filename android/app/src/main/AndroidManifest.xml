@@ -23,6 +23,9 @@
         <service android:name=".ResourceTransferService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User started direct resource transfer" />
         </service>
+        <service android:name=".LocalThumbnailTaskService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="本机文件缩略图后台处理" />
+        </service>
         <provider android:name=".ResourceDownloadProvider" android:authorities="com.myliba.android.downloads" android:exported="false" android:grantUriPermissions="true" />
         <activity
             android:name=".MainActivity"

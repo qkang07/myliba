@@ -41,7 +41,11 @@ func runHub() error {
 	if err != nil {
 		return err
 	}
-	hub := &remoteHub{waiters: map[string]*remoteWaiter{}, nodes: map[string]*remoteNode{}, selectedNodes: map[string]string{}, password: password, secure: os.Getenv("MYLIBA_HUB_COOKIE_SECURE") != "0", sessions: map[string]time.Time{}, auth: auth, iceServers: iceServers, signalSessions: map[string]signalSession{}}
+	relayBps, err := hubRelayBytesPerSecond()
+	if err != nil {
+		return err
+	}
+	hub := &remoteHub{waiters: map[string]*remoteWaiter{}, nodes: map[string]*remoteNode{}, selectedNodes: map[string]string{}, password: password, secure: os.Getenv("MYLIBA_HUB_COOKIE_SECURE") != "0", sessions: map[string]time.Time{}, auth: auth, iceServers: iceServers, relayLimiter: relayRateLimiter{bps: relayBps}, relaySlots: make(chan struct{}, 8), signalSessions: map[string]signalSession{}}
 	mux := http.NewServeMux()
 	cloud, err := newCloudHub()
 	if err != nil {

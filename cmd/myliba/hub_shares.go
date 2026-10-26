@@ -117,24 +117,12 @@ func (h *remoteHub) shareRedeem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "文件节点响应无效")
 		return
 	}
-	result["iceServers"] = h.directICEServers()
+	result["iceServers"] = h.iceServersForPeers()
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (h *remoteHub) directICEServers() []iceServerConfig {
-	servers := make([]iceServerConfig, 0, len(h.iceServers))
-	for _, server := range h.iceServers {
-		urls := make([]string, 0, len(server.URLs))
-		for _, endpoint := range server.URLs {
-			if strings.HasPrefix(strings.ToLower(endpoint), "stun:") || strings.HasPrefix(strings.ToLower(endpoint), "stuns:") {
-				urls = append(urls, endpoint)
-			}
-		}
-		if len(urls) > 0 {
-			servers = append(servers, iceServerConfig{URLs: urls})
-		}
-	}
-	return servers
+func (h *remoteHub) iceServersForPeers() []iceServerConfig {
+	return append([]iceServerConfig(nil), h.iceServers...)
 }
 
 func (h *remoteHub) shareSignal(w http.ResponseWriter, r *http.Request) {

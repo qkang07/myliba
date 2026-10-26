@@ -34,7 +34,17 @@ export MYLIBA_HUB_DATA_DIR='/srv/myliba/hub-data'
 
 `MYLIBA_HUB_DATA_DIR` 可以不设；默认使用运行 Hub 的系统账号配置目录下的 `myliba-hub`。固定此目录并备份其中的 `auth.json`：它保存主人密码校验值、设备凭据的哈希、设备清单和登录会话。不要通过删除它来处理忘记密码或登录失败，否则原有设备授权会丢失。主人密码本身由启动环境提供，Hub 不把明文写入 `auth.json`。新部署只需设置这一份密码；无需设置 `MYLIBA_NODE_TOKEN` 或 `MYLIBA_CLOUD_TOKEN`。
 
-用 HTTPS 反向代理公开 Hub，Hub 进程只监听回环地址。代理需保留 Host、Authorization 和 WebSocket 升级，并转发 `/`、`/api/`、`/node`、`/signal`；若使用单文件分享，还需转发 `/s/` 和 `/share/signal`。不要在公网把 `MYLIBA_HUB_COOKIE_SECURE` 设为 `0`。`MYLIBA_ICE_SERVERS` 是可选的 WebRTC 网络配置，不是登录密钥。
+用 HTTPS 反向代理公开 Hub，Hub 进程只监听回环地址。代理需保留 Host、Authorization 和 WebSocket 升级，并转发 `/`、`/api/`、`/node`、`/signal`；若使用单文件分享，还需转发 `/s/` 和 `/share/signal`。不要在公网把 `MYLIBA_HUB_COOKIE_SECURE` 设为 `0`。`MYLIBA_ICE_SERVERS` 是可选的 WebRTC 网络配置，不是登录密钥。默认只启用公共 STUN；蜂窝网络、对称 NAT 或严格防火墙常需要配置 TURN 中继，例如：
+
+```sh
+export MYLIBA_ICE_SERVERS='[{"urls":["stun:stun.example.net:3478"]},{"urls":["turn:turn.example.net:3478?transport=udp","turns:turn.example.net:5349?transport=tcp"],"username":"replace-with-turn-user","credential":"replace-with-turn-password"}]'
+```
+
+使用 TURN 时，WebRTC 数据会经过该 TURN 服务，但 DataChannel 仍由两端 DTLS 加密；若 TURN 与 Hub 部署在同一台机器，文件流量会占用该机器带宽。TURN 用户名和密码会随 ICE 配置发给已授权的连接端，因此应使用短期或专用 TURN 凭据，并通过 TLS 保护 Hub。TURN 服务自身的限流需要在 TURN 服务上配置，下面的 Hub 限流只作用于 Myliba 的 HTTP/WebSocket 内容回退。
+
+资源库访问优先尝试 WebRTC；两端有可互通的 IPv6 时，ICE 可使用 IPv6 直连。如果家中 Go 资源节点有公网 IPv4，可在**节点进程**设置 `MYLIBA_RESOURCE_UDP_PORT_RANGE=40000-40031`，同时将路由器 UDP 40000–40031 映射到该节点，并开放主机防火墙。路由器位于运营商共享 NAT 后面时，单靠路由器端口映射无效。Android 资源节点目前没有固定 UDP 端口范围。日志会记录 IPv4/IPv6 候选类型，不记录实际地址。
+
+WebRTC 无法连接时，已登录的 Web/App 用户可以经 Hub 获取资源文件、缩略图和视频数据。Hub 的内容回退默认全局限速 2 MiB/s，并限制同时传输数为 8；设置 `MYLIBA_HUB_RELAY_BYTES_PER_SECOND` 可调整每秒传输的原始内容字节数（范围 4096–1073741824）。此上限由 Hub 进程执行，反向代理仍需允许长时间响应；公开分享链接继续使用独立的 WebRTC 授权链路。
 
 第一次启动时若已提供长度合格的旧节点密钥，Hub 会允许旧资源节点继续使用它，以便迁移；全新部署不需要它。
 
@@ -91,3 +101,7 @@ export MYLIBA_HUB_DATA_DIR='/srv/myliba/hub-data'
 - App 已连 Hub 却仍要求输入主人密码：检查 Hub 是否已经更新到支持设备授权的版本，以及这台手机的授权是否被撤销。首次配对仍需输入一次。
 - Hub 能显示节点和文件索引，但打不开文件内容：先检查两端 WebRTC 直连和节点运行状态。索引可经 Hub 传递，内容不会自动回退到 Hub 中转。
 - Hub 重启后所有设备都要重新配对：检查是否换了运行账号、`MYLIBA_HUB_DATA_DIR` 或丢失了 `auth.json`。
+- 节点断线后持续重试却收到 HTTP 401/403：Hub 已可访问，但拒绝了保存的节点凭据；这不是 WebRTC 或网络重连超时。先核对 Hub 是否使用原来的 `auth.json`，以及设备授权中该设备是否仍存在且未撤销。若旧认证数据可恢复，恢复后节点会继续重试；若确实失效，升级旧客户端并在桌面“服务端连接”或 Android“连接 Hub”中输入主人密码重新授权。不要删除设备上的本地文件或云层恢复密钥。
+- 若 Hub 曾返回 502，恢复后改为 401，说明服务已重新响应，但授权状态与节点保存的凭据不匹配。检查 Hub 数据目录、旧共享密钥迁移设置和设备授权，再决定是否重新配对。
+- 本地日志若出现 `legacy node credentials disabled`，表示 Hub 的“旧共享节点密钥”开关已关闭，并主动断开尚未按设备授权配对的旧节点。之后的 WebSocket 401 是认证拒绝，继续等待或重启旧程序无法恢复。升级客户端后用主人密码为每台电脑或手机分别配对；需要临时恢复旧节点时，可由主人在 Hub“设备授权”中暂时打开旧共享密钥，迁移完再关闭。云层新接口始终需要设备凭据，打开旧密钥不会修复云层 401。
+- 手机蜂窝网络下 WebRTC 一直失败：蜂窝网络常使用运营商级 NAT。仅有 STUN 时两端不一定能建立 UDP 直连；配置 `MYLIBA_ICE_SERVERS` 中的 TURN 或 TURNs 服务，并更新 Hub、节点和 App 到支持 TURN 的版本。连接状态显示 TURN 时，数据经配置的 TURN 服务转发，内容仍在两端间加密。

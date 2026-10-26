@@ -19,6 +19,7 @@ import android.widget.MediaController;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.VideoView;
+import android.widget.FrameLayout;
 import android.view.View;
 import java.util.ArrayList;
 
@@ -32,6 +33,19 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class PreviewActivity extends Activity {
+    private static final class VideoStage extends FrameLayout {
+        private int videoWidth,videoHeight;
+        VideoStage(Activity context){super(context);}
+        void setVideoSize(int width,int height){videoWidth=width;videoHeight=height;requestLayout();}
+        @Override protected void onMeasure(int widthSpec,int heightSpec){
+            int width=MeasureSpec.getSize(widthSpec),height=MeasureSpec.getSize(heightSpec);
+            setMeasuredDimension(width,height);
+            if(getChildCount()==0)return;
+            int childWidth=width,childHeight=height;
+            if(videoWidth>0&&videoHeight>0&&width>0&&height>0){double scale=Math.min((double)width/videoWidth,(double)height/videoHeight);childWidth=Math.max(1,(int)Math.round(videoWidth*scale));childHeight=Math.max(1,(int)Math.round(videoHeight*scale));}
+            getChildAt(0).measure(MeasureSpec.makeMeasureSpec(childWidth,MeasureSpec.EXACTLY),MeasureSpec.makeMeasureSpec(childHeight,MeasureSpec.EXACTLY));
+        }
+    }
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private Uri fileUri;
     private String mime;
@@ -264,9 +278,12 @@ public final class PreviewActivity extends Activity {
                 video.setVideoURI(Uri.parse(mediaProxy.url()));
             }catch(Exception ex){showMessage("无法启动 WebRTC 媒体播放："+ex.getMessage());return;}
         } else video.setVideoURI(fileUri);
-        content.addView(video, new LinearLayout.LayoutParams(-1, -1));
+        VideoStage stage=new VideoStage(this);stage.setBackgroundColor(Color.BLACK);
+        FrameLayout.LayoutParams videoParams=new FrameLayout.LayoutParams(-1,-1,Gravity.CENTER);
+        stage.addView(video,videoParams);
+        content.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
+        video.setOnPreparedListener(player->{stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());video.start();});
         video.setOnErrorListener((player, what, extra) -> { showMessage("视频无法播放，可用其他应用打开。"); return true; });
-        video.start();
     }
 
     private void openExternal() {

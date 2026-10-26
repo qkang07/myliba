@@ -12,6 +12,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -88,8 +90,61 @@ type remoteHub struct {
 	webTraffic        trafficMeter
 	nodeTraffic       trafficMeter
 	iceServers        []iceServerConfig
+	relayLimiter      relayRateLimiter
+	relaySlots        chan struct{}
 	signalMu          sync.Mutex
 	signalSessions    map[string]signalSession
+}
+
+// relayRateLimiter shares a token bucket across authenticated Hub content
+// streams. Signaling and metadata are never charged to this limit.
+type relayRateLimiter struct {
+	mu     sync.Mutex
+	last   time.Time
+	tokens float64
+	bps    int64
+}
+
+func hubRelayBytesPerSecond() (int64, error) {
+	raw := strings.TrimSpace(os.Getenv("MYLIBA_HUB_RELAY_BYTES_PER_SECOND"))
+	if raw == "" {
+		return 2 << 20, nil
+	}
+	rate, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || rate < 4096 || rate > 1<<30 {
+		return 0, errors.New("MYLIBA_HUB_RELAY_BYTES_PER_SECOND must be between 4096 and 1073741824")
+	}
+	return rate, nil
+}
+
+func (l *relayRateLimiter) wait(ctx context.Context, count int) error {
+	if count <= 0 || l.bps <= 0 {
+		return nil
+	}
+	for {
+		l.mu.Lock()
+		now := time.Now()
+		if l.last.IsZero() {
+			l.last = now
+		}
+		capacity := float64(max(l.bps, remoteChunkSize))
+		l.tokens = min(capacity, l.tokens+now.Sub(l.last).Seconds()*float64(l.bps))
+		l.last = now
+		if l.tokens >= float64(count) {
+			l.tokens -= float64(count)
+			l.mu.Unlock()
+			return ctx.Err()
+		}
+		delay := time.Duration((float64(count)-l.tokens)/float64(l.bps)*float64(time.Second)) + time.Millisecond
+		l.mu.Unlock()
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
 }
 
 type remoteNode struct {
@@ -201,6 +256,8 @@ type remoteWaiter struct {
 	node    *websocket.Conn
 }
 
+var errHubNodeUnauthorized = errors.New("Hub rejected node credentials")
+
 func (w *remoteWaiter) finish() {
 	w.once.Do(func() { close(w.done) })
 }
@@ -211,17 +268,24 @@ func runNodeAgent(ctx context.Context, hubURL, token, nodeID, nodeName string, i
 			return
 		}
 		setStatus("connecting")
-		if err := connectNode(ctx, hubURL, token, nodeID, nodeName, iceServers, func() { setStatus("connected") }); err != nil && ctx.Err() == nil {
+		err := connectNode(ctx, hubURL, token, nodeID, nodeName, iceServers, func() { setStatus("connected") })
+		if err != nil && ctx.Err() == nil {
 			log.Printf("Remote hub connection ended: %v", err)
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		setStatus("disconnected")
+		delay := 3 * time.Second
+		if errors.Is(err, errHubNodeUnauthorized) {
+			setStatus("auth_required")
+			delay = 30 * time.Second
+		} else {
+			setStatus("disconnected")
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-time.After(delay):
 		}
 	}
 }
@@ -250,16 +314,22 @@ func connectNode(parent context.Context, hubURL, token, nodeID, nodeName string,
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	headers := http.Header{"Authorization": []string{"Bearer " + token}}
-	conn, _, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPHeader: headers})
+	conn, response, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPHeader: headers})
 	if err != nil {
+		if response != nil && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+			return fmt.Errorf("%w: HTTP %d", errHubNodeUnauthorized, response.StatusCode)
+		}
 		return err
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "node stopped")
 	conn.SetReadLimit(2 << 20)
 	log.Printf("Connected to remote hub %s", parsed.Host)
-	connected()
 	writeMu := &sync.Mutex{}
-	rtc := newNodeRTCManager(conn, writeMu, iceServers)
+	rtc, err := newNodeRTCManager(conn, writeMu, iceServers)
+	if err != nil {
+		return err
+	}
+	connected()
 	defer rtc.closeAll()
 	go func() {
 		ticker := time.NewTicker(25 * time.Second)
@@ -389,7 +459,7 @@ func (h *remoteHub) attachNodeChecked(conn *websocket.Conn, id, name, kind strin
 		_ = previous.Conn.Close(websocket.StatusPolicyViolation, "replaced by a newer connection for this node")
 	}
 	go h.readNode(id, conn)
-	_ = h.send(conn, wireMessage{Type: "node-config", ICEServers: h.directICEServers()})
+	_ = h.send(conn, wireMessage{Type: "node-config", ICEServers: h.iceServersForPeers()})
 	return true
 }
 
@@ -453,6 +523,21 @@ func (h *remoteHub) proxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "远程访问不支持此操作")
 		return
 	}
+	limited := hubRelayContentPath(r.URL.Path)
+	if limited && h.relaySlots != nil {
+		timer := time.NewTimer(15 * time.Second)
+		defer timer.Stop()
+		select {
+		case h.relaySlots <- struct{}{}:
+			defer func() { <-h.relaySlots }()
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+			w.Header().Set("Retry-After", "2")
+			writeError(w, http.StatusTooManyRequests, "Hub 中继繁忙，请稍后重试")
+			return
+		}
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, "请求内容过大")
@@ -492,6 +577,9 @@ func (h *remoteHub) proxy(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(message.Status)
 				started = true
 			case "chunk":
+				if limited && h.relayLimiter.wait(r.Context(), len(message.Data)) != nil {
+					return
+				}
 				if !started {
 					w.WriteHeader(http.StatusBadGateway)
 					started = true
@@ -668,8 +756,8 @@ func allowedRemoteRequest(method, rawURI string) bool {
 	}
 }
 
-// The Hub WebSocket is a control-plane fallback. File bytes and generated media
-// must use a direct connection; this check also runs on the receiving node.
+// Public share content remains bound to its separate share authorization. The
+// authenticated Hub proxy may carry resource content as a last resort.
 func allowedHubRelayRequest(method, rawURI string) bool {
 	if !allowedRemoteRequest(method, rawURI) {
 		return false
@@ -679,28 +767,25 @@ func allowedHubRelayRequest(method, rawURI string) bool {
 		return false
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) == 4 && parts[0] == "api" && parts[1] == "resources" &&
-		(parts[3] == "file" || parts[3] == "thumbnail") {
-		return false
-	}
-	if len(parts) >= 6 && parts[0] == "api" && parts[1] == "resources" && parts[3] == "video" {
-		return false
-	}
 	if len(parts) == 4 && parts[0] == "api" && parts[1] == "shares" && parts[3] == "file" {
 		return false
 	}
 	if len(parts) >= 6 && parts[0] == "api" && parts[1] == "shares" && parts[3] == "video" {
 		return false
 	}
-	if len(parts) == 5 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "file" {
-		return false
-	}
-	if len(parts) >= 7 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" &&
-		(parts[4] == "assets" || parts[4] == "video") {
-		return false
-	}
-	if len(parts) == 7 && parts[0] == "api" && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "versions" && parts[6] == "file" {
-		return false
-	}
 	return true
+}
+
+func hubRelayContentPath(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 4 || parts[0] != "api" {
+		return false
+	}
+	if parts[1] == "resources" {
+		return parts[3] == "file" || parts[3] == "thumbnail" || parts[3] == "video" && len(parts) > 5
+	}
+	if parts[1] == "cloud" && len(parts) >= 5 && parts[2] == "files" {
+		return parts[4] == "file" || parts[4] == "assets" || parts[4] == "video" && len(parts) > 6 || parts[4] == "versions" && len(parts) > 6 && parts[6] == "file"
+	}
+	return false
 }

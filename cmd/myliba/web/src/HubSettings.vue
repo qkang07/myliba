@@ -14,7 +14,7 @@ const ownerPassword = ref("");
 let timer: ReturnType<typeof setInterval> | undefined;
 
 const activeName = () => view.value.profiles.find(profile => profile.id === view.value.activeId)?.name || "未连接";
-const statusText = () => ({ disabled: "未连接", connecting: "连接中", connected: "已连接", disconnected: "连接失败，正在重试" }[view.value.status]);
+const statusText = () => ({ disabled: "未连接", connecting: "连接中", connected: "已连接", disconnected: "连接失败，正在重试", auth_required: "Hub 拒绝节点凭据，需要重新授权" }[view.value.status]);
 
 async function refresh() {
   try { view.value = await getHubProfiles(); }
@@ -77,7 +77,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
 
 <template>
   <button class="button button-secondary hub-settings-toggle" type="button" @click="open = true; refresh()">
-    <Wifi v-if="view.status === 'connected'" :size="14" /><WifiOff v-else :size="14" />服务端 · {{ activeName() }}
+    <Wifi v-if="view.status === 'connected'" :size="14" /><WifiOff v-else :size="14" />服务端 · {{ activeName() }}{{ view.status === 'auth_required' ? ' · 需授权' : '' }}
   </button>
   <Teleport to="body">
   <div v-if="open" class="resource-preview-backdrop" @click.self="open = false">
@@ -88,6 +88,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
       </header>
       <div class="hub-settings-body">
         <p class="hub-current">当前：<strong>{{ activeName() }}</strong> · {{ statusText() }}</p>
+        <p v-if="view.status === 'auth_required'" class="hub-settings-error" role="alert">Hub 已响应，但拒绝了这台电脑保存的节点凭据。请先确认 Hub 使用原数据目录及 auth.json；若授权确已失效，编辑当前服务端并输入主人密码重新授权。</p>
         <div v-for="profile in view.profiles" :key="profile.id" class="hub-profile-row">
           <div><strong>{{ profile.name }}</strong><small>{{ profile.url }}</small></div>
           <button class="button button-secondary" type="button" :disabled="busy || profile.id === view.activeId" @click="select(profile.id)"><Check v-if="profile.id === view.activeId" :size="13" />{{ profile.id === view.activeId ? "当前" : "连接" }}</button>

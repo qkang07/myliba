@@ -16,7 +16,7 @@ import (
 
 func TestCloudHubSignalsOnlyBetweenRegisteredNodes(t *testing.T) {
 	t.Setenv("MYLIBA_HUB_DATA_DIR", t.TempDir())
-	t.Setenv("MYLIBA_ICE_SERVERS", `[{"urls":["stun:stun.example:3478","turn:relay.example:3478"]}]`)
+	t.Setenv("MYLIBA_ICE_SERVERS", `[{"urls":["stun:stun.example:3478","turn:relay.example:3478"],"username":"turn-user","credential":"turn-secret"}]`)
 	hub, err := newCloudHub()
 	if err != nil {
 		t.Fatal(err)
@@ -86,8 +86,8 @@ func TestCloudHubSignalsOnlyBetweenRegisteredNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if len(ice.Servers) != 1 || len(ice.Servers[0].URLs) != 1 || ice.Servers[0].URLs[0] != "stun:stun.example:3478" {
-		t.Fatalf("relay ICE leaked into cloud transfer: %+v", ice)
+	if len(ice.Servers) != 1 || len(ice.Servers[0].URLs) != 2 || ice.Servers[0].URLs[0] != "stun:stun.example:3478" || ice.Servers[0].URLs[1] != "turn:relay.example:3478" || ice.Servers[0].Username != "turn-user" || ice.Servers[0].Credential != "turn-secret" {
+		t.Fatalf("configured ICE servers were not passed to cloud peers: %+v", ice)
 	}
 }
 

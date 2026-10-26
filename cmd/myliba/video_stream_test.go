@@ -27,8 +27,8 @@ func TestVideoStreamRoutesStayDirect(t *testing.T) {
 		t.Fatal("video conversion control request should be available")
 	}
 	for _, path := range []string{init, segment} {
-		if allowedHubRelayRequest(http.MethodGet, path) {
-			t.Errorf("Hub must not relay video bytes: %s", path)
+		if !allowedHubRelayRequest(http.MethodGet, path) || !hubRelayContentPath(path) {
+			t.Errorf("limited Hub video fallback missing: %s", path)
 		}
 	}
 	for _, path := range []string{status + "/segments/../file", status + "/segments/0/extra"} {

@@ -345,8 +345,8 @@ func TestCloudOpaqueCatalogAndRelayBoundary(t *testing.T) {
 		t.Fatal("catalog accepted unauthenticated access")
 	}
 	for _, route := range []string{"/api/resources/abc/file", "/api/resources/abc/thumbnail", "/api/cloud/files/abc/file"} {
-		if allowedHubRelayRequest(http.MethodGet, route) {
-			t.Fatalf("Hub relays content: %s", route)
+		if !allowedHubRelayRequest(http.MethodGet, route) || !hubRelayContentPath(route) {
+			t.Fatalf("limited Hub fallback missing: %s", route)
 		}
 		if !allowedRemoteRequest(http.MethodGet, route) {
 			t.Fatalf("direct route blocked: %s", route)

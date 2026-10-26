@@ -65,6 +65,7 @@ public final class ResourceNodeService extends Service {
 
     private void run(){
         while(!stopped){
+            boolean unauthorized=false;
             try{
                 String wss=hub.replaceFirst("^https:","wss:")+"/node?id="+id+"&name="+java.net.URLEncoder.encode(name,"UTF-8")+"&kind=android";
                 HubWebSocket current=new HubWebSocket(wss,token,null,null);socket=current;rtc.setSocket(current);status="已向 Hub 注册 · 等待客户端直连";
@@ -75,9 +76,9 @@ public final class ResourceNodeService extends Service {
                     else if("rtc-signal".equals(type))rtc.signal(frame);
                     else if("node-config".equals(type))rtc.setICEServers(frame.optJSONArray("iceServers"));
                 }
-            }catch(Exception ex){if(!stopped){AppLog.error("Resource node Hub connection interrupted",ex);status="Hub 连接中断，正在重试："+ex.getMessage();}}
+            }catch(Exception ex){if(!stopped){AppLog.error("Resource node Hub connection interrupted",ex);String reason=ex.getMessage()==null?"":ex.getMessage();unauthorized=reason.contains("HTTP/1.1 401")||reason.contains("HTTP/1.0 401")||reason.contains("HTTP/1.1 403")||reason.contains("HTTP/1.0 403");status=unauthorized?"Hub 拒绝节点凭据；请检查 Hub 授权，或用主人密码重新授权":"Hub 连接中断，正在重试："+reason;}}
             HubWebSocket old=socket;socket=null;if(old!=null)old.close();rtc.closeSessions();
-            if(!stopped)try{Thread.sleep(3000);}catch(InterruptedException ex){Thread.currentThread().interrupt();break;}
+            if(!stopped)try{Thread.sleep(unauthorized?30000:3000);}catch(InterruptedException ex){Thread.currentThread().interrupt();break;}
         }
     }
 

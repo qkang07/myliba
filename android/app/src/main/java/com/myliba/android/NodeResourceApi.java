@@ -28,8 +28,9 @@ final class NodeResourceApi {
     NodeResourceApi(Context context){this.context=context;db=new LocalLibrary(context);}
     void close(){db.close();}
     static String id(String uri){return Base64.encodeToString(uri.getBytes(StandardCharsets.UTF_8),Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING);}
+    static String decodeID(String encoded){try{return new String(Base64.decode(encoded,Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING),StandardCharsets.UTF_8);}catch(Exception ex){return "";}}
     private LocalLibrary.Item item(String encoded){
-        try{String uri=new String(Base64.decode(encoded,Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING),StandardCharsets.UTF_8);return db.item(uri);}catch(Exception ex){return null;}
+        String uri=decodeID(encoded);return uri.isEmpty()?null:db.item(uri);
     }
     private static Result json(int status,Object value)throws Exception{byte[] bytes=value.toString().getBytes(StandardCharsets.UTF_8);return new Result(status,"application/json; charset=utf-8",new ByteArrayInputStream(bytes),bytes.length);}
     private static Result error(int status,String message)throws Exception{return json(status,new JSONObject().put("error",message));}

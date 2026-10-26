@@ -265,19 +265,7 @@ func (c *cloudHub) signalRoutes(mux *http.ServeMux, authorize func(http.Handler)
 			http.Error(w, "ICE unavailable", 503)
 			return
 		}
-		direct := make([]iceServerConfig, 0, len(servers))
-		for _, server := range servers {
-			urls := make([]string, 0, len(server.URLs))
-			for _, u := range server.URLs {
-				if strings.HasPrefix(strings.ToLower(u), "stun:") || strings.HasPrefix(strings.ToLower(u), "stuns:") {
-					urls = append(urls, u)
-				}
-			}
-			if len(urls) > 0 {
-				direct = append(direct, iceServerConfig{URLs: urls})
-			}
-		}
-		writeJSON(w, 200, map[string]any{"servers": direct})
+		writeJSON(w, 200, map[string]any{"servers": servers})
 	})))
 	mux.Handle("POST /cloud/signal", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var signal cloudPeerSignal

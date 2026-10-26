@@ -1,4 +1,4 @@
-import { webRTCConnected, webRTCFetch } from "./webrtc";
+import { waitForWebRTCConnection, webRTCConnected, webRTCFetch } from "./webrtc";
 
 let remoteSession = false;
 const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail|video\/[^/]+\/(?:init|segments\/\d+))|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file|assets\/[^/]+\/parts\/[^/]+|video\/[^/]+\/(?:init|segments\/\d+)))(?:\?|$)/;
@@ -212,7 +212,7 @@ export interface HubProfile {
 export interface HubProfilesView {
   profiles: HubProfile[];
   activeId: string;
-  status: "disabled" | "connecting" | "connected" | "disconnected";
+  status: "disabled" | "connecting" | "connected" | "disconnected" | "auth_required";
 }
 
 export function getHubProfiles() {
@@ -241,10 +241,8 @@ export class ApiError extends Error {
 }
 
 async function apiFetch(url: string, init?: RequestInit) {
-  if (remoteSession && contentPath.test(url) && !webRTCConnected()) {
-    throw new Error("文件内容仅通过节点直连传输；当前直连不可用");
-  }
-  if (url.startsWith("/api/") && url !== "/api/session" && !url.startsWith("/api/hub/") && webRTCConnected()) {
+  if (remoteSession && contentPath.test(url)) await waitForWebRTCConnection();
+  if (remoteSession && url.startsWith("/api/") && url !== "/api/session" && !url.startsWith("/api/hub/") && webRTCConnected()) {
     return webRTCFetch(url, init);
   }
   return fetch(url, init);
