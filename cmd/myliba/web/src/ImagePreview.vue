@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ChevronLeft, ChevronRight, Download, ExternalLink, LoaderCircle, Minus, Plus, RotateCcw, X } from "@lucide/vue";
+import { createThumbnailVariant, getResourceFile, getResourceThumbnailVariant, type Resource } from "./api";
+import { readBlobWithProgress } from "./transferProgress";
 
-const props = defineProps<{ src: string; name: string; position?: number; total?: number; canPrevious?: boolean; canNext?: boolean; loadingNext?: boolean }>();
+const props = defineProps<{ src?: string; resource: Resource; name: string; position?: number; total?: number; canPrevious?: boolean; canNext?: boolean; loadingNext?: boolean }>();
 const emit = defineEmits<{ close: []; download: []; details: []; previous: []; next: []; error: [] }>();
 const dialog = ref<HTMLElement | null>(null);
 const stage = ref<HTMLElement | null>(null);
@@ -12,6 +14,13 @@ const zoom = ref(1);
 const panX = ref(0);
 const panY = ref(0);
 const dragging = ref(false);
+const displayedURL = ref(props.src || "");
+const loadingLabel = ref("正在加载预览图…");
+const progress = ref<number | null>(null);
+const transferLabel = ref("");
+const originalLoading = ref(false);
+const originalShown = ref(false);
+const loadError = ref("");
 const zoomLabel = computed(() => Math.round(zoom.value * 100) + "%");
 const imageStyle = computed(() => ({
   transform: "translate3d(" + panX.value + "px, " + panY.value + "px, 0) scale(" + zoom.value + ")",
@@ -20,6 +29,62 @@ let wheelDelta = 0;
 let drag: { pointerId: number; x: number; y: number; panX: number; panY: number } | null = null;
 let backdropPointerId: number | null = null;
 let previousFocus: HTMLElement | null = null;
+let thumbnailURL = "";
+let originalURL = "";
+const controller = new AbortController();
+
+async function loadThumbnail() {
+  if (!props.resource.available) return;
+  try {
+    let response = await getResourceThumbnailVariant(props.resource, "large");
+    if (response.status === 404) {
+      await createThumbnailVariant(props.resource.id, "large");
+      response = await getResourceThumbnailVariant(props.resource, "large");
+    }
+    const blob = await readBlobWithProgress(response, (value, received, total) => { if (!originalLoading.value) { progress.value = value; transferLabel.value = total ? `${formatBytes(received || 0)} / ${formatBytes(total)}` : `${formatBytes(received || 0)} 已加载`; } }, 0, controller.signal);
+    if (controller.signal.aborted || originalShown.value) return;
+    thumbnailURL = URL.createObjectURL(blob);
+    if (!originalLoading.value) displayedURL.value = thumbnailURL;
+    if (!originalLoading.value) loadingLabel.value = "";
+    loadError.value = "";
+    if (!originalLoading.value) { progress.value = null; resetZoom(); }
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    if (!originalLoading.value) { loadingLabel.value = ""; progress.value = null; }
+    if (!displayedURL.value) loadError.value = error instanceof Error ? error.message : "预览图无法加载";
+  }
+}
+
+async function showOriginal() {
+  if (originalLoading.value || originalShown.value) return;
+  originalLoading.value = true;
+  loadingLabel.value = "正在加载原图…";
+  loadError.value = "";
+  try {
+    const response = await getResourceFile(props.resource.id, false, controller.signal);
+    const blob = await readBlobWithProgress(response, (value, received, total) => { progress.value = value; transferLabel.value = `${formatBytes(received || 0)} / ${formatBytes(total || props.resource.size)}`; }, props.resource.size, controller.signal);
+    if (controller.signal.aborted) return;
+    originalURL = URL.createObjectURL(blob);
+    displayedURL.value = originalURL;
+    originalShown.value = true;
+    resetZoom();
+  } catch (error) {
+    if (!controller.signal.aborted) loadError.value = error instanceof Error ? error.message : "原图无法加载";
+  } finally {
+    originalLoading.value = false;
+    if (!originalShown.value && thumbnailURL) displayedURL.value = thumbnailURL;
+    loadingLabel.value = "";
+    progress.value = null;
+    transferLabel.value = "";
+  }
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${(value / 1024 ** 3).toFixed(1)} GB`;
+}
 
 function clampPan(x: number, y: number, scale = zoom.value) {
   const viewport = stage.value;
@@ -132,8 +197,12 @@ onMounted(() => {
   document.body.classList.add("image-preview-open");
   document.addEventListener("keydown", onKeyDown);
   void nextTick(() => closeButton.value?.focus());
+  void loadThumbnail();
 });
 onBeforeUnmount(() => {
+  controller.abort();
+  if (thumbnailURL) URL.revokeObjectURL(thumbnailURL);
+  if (originalURL) URL.revokeObjectURL(originalURL);
   document.removeEventListener("keydown", onKeyDown);
   document.body.classList.remove("image-preview-open");
   if (previousFocus?.isConnected) previousFocus.focus();
@@ -147,12 +216,14 @@ onBeforeUnmount(() => {
         <span class="image-lightbox-name" :title="props.name">{{ props.name }}</span>
         <span v-if="props.total" class="image-lightbox-position">{{ props.position }} / {{ props.total }}</span>
         <button v-if="props.total" type="button" class="image-lightbox-details" @click="emit('details')"><ExternalLink :size="16" />详情</button>
+        <button type="button" :disabled="originalLoading || originalShown" @click="showOriginal"><LoaderCircle v-if="originalLoading" class="spin" :size="16" />{{ originalShown ? '原图已加载' : '查看原图' }}</button>
         <button type="button" aria-label="下载原图" title="下载原图" @click="emit('download')"><Download :size="18" /></button>
         <button ref="closeButton" type="button" aria-label="关闭图片预览" title="关闭预览" @click="emit('close')"><X :size="20" /></button>
       </header>
       <div ref="stage" class="image-lightbox-stage" :class="{ 'is-pannable': zoom > 1, 'is-dragging': dragging }" @wheel="onWheel" @pointerdown="onPointerDown" @pointermove="onPointerMove" @pointerup="onPointerUp" @pointercancel="onPointerCancel">
         <button v-if="props.total" type="button" class="image-lightbox-navigation image-lightbox-previous" aria-label="上一个文件" :disabled="!props.canPrevious" @click="emit('previous')"><ChevronLeft :size="28" /></button>
-        <img ref="image" :src="props.src" :alt="props.name" :style="imageStyle" draggable="false" @dblclick.stop="onDoubleClick" @error="emit('error')" />
+        <img v-if="displayedURL" ref="image" :src="displayedURL" :alt="props.name" :style="imageStyle" draggable="false" @dblclick.stop="onDoubleClick" @error="loadError = '图片无法显示'" />
+        <div v-if="loadingLabel || loadError" class="image-lightbox-progress" role="status"><p>{{ loadError || loadingLabel }}</p><progress v-if="loadingLabel" :value="progress === null ? undefined : progress" max="100"></progress><span v-if="loadingLabel && progress !== null">{{ progress }}% · {{ transferLabel }}</span></div>
         <button v-if="props.total" type="button" class="image-lightbox-navigation image-lightbox-next" aria-label="下一个文件" :disabled="!props.canNext || props.loadingNext" @click="emit('next')"><LoaderCircle v-if="props.loadingNext" class="spin" :size="22" /><ChevronRight v-else :size="28" /></button>
       </div>
       <footer class="image-lightbox-footer">
@@ -190,6 +261,9 @@ body.image-preview-open { overflow: hidden; }
 .image-lightbox-stage img { display: block; max-width: calc(100vw - 48px); max-height: calc(100dvh - 166px); object-fit: contain; user-select: none; }
 .image-lightbox-stage.is-pannable img { cursor: grab; }
 .image-lightbox-stage.is-dragging img { cursor: grabbing; }
+.image-lightbox-progress { position: absolute; z-index: 2; bottom: 18px; left: 50%; width: min(320px, calc(100vw - 48px)); padding: 10px 14px; transform: translateX(-50%); border-radius: 8px; background: rgb(0 0 0 / 75%); text-align: center; pointer-events: none; font-size: 12px; }
+.image-lightbox-progress p { margin: 0 0 5px; }
+.image-lightbox-progress progress { width: 100%; height: 8px; accent-color: #7fc18e; }
 .image-lightbox-footer { display: flex; min-height: 72px; flex: none; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 8px 16px; background: rgb(0 0 0 / 28%); }
 .image-lightbox-controls { display: flex; align-items: center; gap: 4px; }
 .image-lightbox-controls > span:not(.image-lightbox-divider) { min-width: 48px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }

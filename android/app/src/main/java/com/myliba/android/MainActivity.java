@@ -40,7 +40,7 @@ public final class MainActivity extends Activity {
     private TextView nodeTitle,nodeStatus,nodeCounts,nodeCapacity,nodeAccess,nodePeers,nodeConfigure,nodeStop,resourceNodeStatus;
     private boolean displayedNodeRunning;
     private boolean settingsMetadataLoading;
-    private boolean home,grid,loading,selecting,busy,scanning,destroyed,needsLogin,storageOnly;
+    private boolean home,grid,loading,selecting,busy,scanning,destroyed,needsLogin,storageOnly,multipleTagFilters;
     private TextView networkSpeedStatus;
     private TextView thumbnailTaskStatus;
     private Switch thumbnailTaskSwitch;
@@ -55,7 +55,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle saved){
         super.onCreate(saved);ui=new MobileUi(this);db=new LocalLibrary(this);localStore=new LibraryStore(db,null);
-        prefs=getPreferences(MODE_PRIVATE);thumbs=new ThumbnailLoader(this);grid=prefs.getBoolean("view_grid",false);
+        prefs=getPreferences(MODE_PRIVATE);thumbs=new ThumbnailLoader(this);grid=prefs.getBoolean("view_grid",false);multipleTagFilters=prefs.getBoolean("multiple_tag_filters",false);
         storageOnly=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE).getBoolean("storage_only",false);
         String server=prefs.getString("server_url","");if(!server.isEmpty())hubStore=new LibraryStore(db,new RemoteClient(server,prefs,this));
         if(saved!=null){home=saved.getBoolean("home");tab=saved.getInt("tab");try{localFilters=LocalFilters.parse(saved.getString("local","{}"));hubFilters=LocalFilters.parse(saved.getString("hub","{}"));}catch(Exception ignored){}activeCollection=saved.getString("collection");}
@@ -170,7 +170,8 @@ public final class MainActivity extends Activity {
     private void renderTagChoices(){
         if(tagChoicesContainer==null)return;tagChoicesContainer.removeAllViews();
         ArrayList<View> choices=new ArrayList<>();
-        for(LibraryStore.Facet tag:meta.tags){String key=tag.key;choices.add(ui.chip(tag.name,f().tags.contains(key),()->{LocalFilters next=f().copy();if(next.tags.contains(key))next.tags.remove(key);else next.tags.add(key);applyFilters(next,false);}));}
+        for(LibraryStore.Facet tag:meta.tags){String key=tag.key;choices.add(ui.chip(tag.name,f().tags.contains(key),()->{LocalFilters next=f().copy();toggleFilterSelection(next.tags,key,null);applyFilters(next,false);}));}
+        choices.add(ui.chip(multipleTagFilters?"多选：开":"多选：关",multipleTagFilters,()->setMultipleTagFilters(!multipleTagFilters)));
         if(!choices.isEmpty())tagChoicesContainer.addView(ui.rail(choices),ui.top(5));
     }
     private void updateResults(){
@@ -274,11 +275,12 @@ public final class MainActivity extends Activity {
     }
     private void selectAll(){if(busy)return;LibraryStore s=store();if(s==null)return;LocalFilters snapshot=f().copy();int token=generation;busy=true;io.execute(()->{try{List<String> ids=s.matching(snapshot);runOnUiThread(()->{busy=false;if(destroyed||s!=store()||token!=generation)return;selected.clear();selected.addAll(ids);selecting=true;updateResults();});}catch(Exception e){runOnUiThread(()->{busy=false;if(!destroyed)toast(message(e));});}});}
     private void filterSheet(){
-        MobileUi.Sheet sheet=ui.sheet("筛选资源","多个手动标签需同时满足；同类属性可多选。");LocalFilters draft=f().copy();
+        MobileUi.Sheet sheet=ui.sheet("筛选资源","默认单选；开启多选后，多个手动标签需同时满足。");LocalFilters draft=f().copy();
         fillFilter(sheet,draft);sheet.show();
     }
     private void fillFilter(MobileUi.Sheet sheet,LocalFilters draft){
         sheet.body.removeAllViews();sheet.footer.removeAllViews();
+        sheet.body.addView(ui.button(multipleTagFilters?"多选：开":"多选：关",false,()->{setMultipleTagFilters(!multipleTagFilters);if(!multipleTagFilters){keepSingle(draft.tags,null);keepSingle(draft.attributes,"type:");keepSingle(draft.attributes,"size:");keepSingle(draft.attributes,"extension:");}fillFilter(sheet,draft);}),ui.top(8));
         filterSection(sheet.body,"手动标签",meta.tags,draft.tags,null);
         ArrayList<LibraryStore.Facet> types=new ArrayList<>(),sizes=new ArrayList<>(),formats=new ArrayList<>();
         for(LibraryStore.Facet a:meta.attributes){if(a.key.startsWith("type:"))types.add(a);else if(a.key.startsWith("size:"))sizes.add(a);else formats.add(a);}
@@ -291,7 +293,23 @@ public final class MainActivity extends Activity {
     }
     private void filterSection(LinearLayout parent,String title,List<LibraryStore.Facet> choices,List<String> selected,String prefix){
         section(parent,title,null,null);if(choices.isEmpty()){parent.addView(ui.text("当前资源库暂无"+title,12,MUTED,false),ui.top(8));return;}MobileUi.Flow flow=ui.new Flow();
-        for(LibraryStore.Facet c:choices){TextView chip=ui.chip(c.name+"  "+c.count,selected.contains(c.key),()->{});chip.setOnClickListener(v->{if(selected.contains(c.key))selected.remove(c.key);else selected.add(c.key);boolean active=selected.contains(c.key);chip.setTextColor(active?GREEN:MUTED);chip.setBackground(ui.shape(active?SOFT:PAPER,20,active?0:LINE));chip.setSelected(active);});if(!selected.contains(c.key))chip.setBackground(ui.shape(PAPER,20,LINE));flow.addView(chip);}parent.addView(flow,ui.top(10));
+        for(LibraryStore.Facet c:choices){TextView chip=ui.chip(c.name+"  "+c.count,selected.contains(c.key),()->{});chip.setOnClickListener(v->{toggleFilterSelection(selected,c.key,prefix);for(int i=0;i<flow.getChildCount();i++){View child=flow.getChildAt(i);if(!(child instanceof TextView))continue;TextView choice=(TextView)child;String key=choices.get(i).key;boolean active=selected.contains(key);choice.setTextColor(active?GREEN:MUTED);choice.setBackground(ui.shape(active?SOFT:PAPER,20,active?0:LINE));choice.setSelected(active);}});if(!selected.contains(c.key))chip.setBackground(ui.shape(PAPER,20,LINE));flow.addView(chip);}parent.addView(flow,ui.top(10));
+    }
+    private void toggleFilterSelection(List<String> selected,String key,String prefix){
+        if(selected.contains(key)){selected.remove(key);return;}
+        if(!multipleTagFilters){if(prefix==null)selected.clear();else selected.removeIf(value->value.startsWith(prefix));}
+        selected.add(key);
+    }
+    private static boolean hasMultipleAttributes(List<String> attributes){
+        Set<String> seen=new HashSet<>();for(String key:attributes)if(!seen.add(key.split(":",2)[0]))return true;return false;
+    }
+    private static void keepSingle(List<String> selected,String prefix){
+        boolean found=false;for(int i=selected.size()-1;i>=0;i--){String key=selected.get(i);if(prefix==null||key.startsWith(prefix)){if(found)selected.remove(i);else found=true;}}
+    }
+    private void setMultipleTagFilters(boolean enabled){
+        multipleTagFilters=enabled;prefs.edit().putBoolean("multiple_tag_filters",enabled).apply();
+        if(!enabled){LocalFilters next=f().copy();keepSingle(next.tags,null);keepSingle(next.attributes,"type:");keepSingle(next.attributes,"size:");keepSingle(next.attributes,"extension:");applyFilters(next,false);}
+        else renderTagChoices();
     }
     private void sortSheet(){MobileUi.Sheet s=ui.sheet("排序方式",null);String[] keys={"modified_desc","modified_asc","name_asc","name_desc","size_desc"},names={"最近修改","最早修改","名称 A–Z","名称 Z–A","文件从大到小"};for(int i=0;i<keys.length;i++){String key=keys[i];s.body.addView(ui.item(key.equals(f().sort)?"check":"sort",names[i],null,()->{s.close();f().sort=key;reload(false,false);}));}s.show();}
     private void renderFolders(){
@@ -305,7 +323,7 @@ public final class MainActivity extends Activity {
         section(body,"常用查询","新建查询",()->saveCollection(null));
         body.addView(ui.text("保存搜索和筛选条件，下次打开时按最新文件重新查询。",12,MUTED,false),ui.top(7));
         if(meta.collections.isEmpty())body.addView(ui.item("spark","创建第一个常用查询","例如：旅行标签下的全部图片",()->saveCollection(null)),ui.top(12));
-        for(LibraryStore.Group g:meta.collections){LinearLayout r=ui.item("spark",g.name,collectionSummary(g.filters),()->{setFilters(g.filters.copy());activeCollection=g.id;tab=0;refreshScreen(true);});r.removeViewAt(r.getChildCount()-1);r.addView(ui.iconButton("more",g.name+"的操作",()->collectionMenu(g)));body.addView(r,ui.top(8));}
+        for(LibraryStore.Group g:meta.collections){LinearLayout r=ui.item("spark",g.name,collectionSummary(g.filters),()->{LocalFilters filters=g.filters.copy();if(filters.tags.size()>1||hasMultipleAttributes(filters.attributes)){multipleTagFilters=true;prefs.edit().putBoolean("multiple_tag_filters",true).apply();}setFilters(filters);activeCollection=g.id;tab=0;refreshScreen(true);});r.removeViewAt(r.getChildCount()-1);r.addView(ui.iconButton("more",g.name+"的操作",()->collectionMenu(g)));body.addView(r,ui.top(8));}
     }
     private View folderTile(String id,String name,int count,boolean inbox){LinearLayout card=ui.card();card.addView(ui.icon(inbox?"download":"library",27,GREEN));card.addView(ui.text(name,15,INK,true),ui.top(16));card.addView(ui.text(count+" 个文件",11,MUTED,false),ui.top(6));ui.touch(card,inbox?SOFT:PAPER,20,()->openFolder(id));return card;}
     private void openFolder(String id){LocalFilters next=new LocalFilters();next.folderId=id;setFilters(next);activeCollection=null;tab=0;refreshScreen(true);}
@@ -612,12 +630,12 @@ public final class MainActivity extends Activity {
         boolean remotePreview=s.remote&&localUri.isEmpty();
         Intent intent=new Intent(this,PreviewActivity.class);
         intent.putExtra("uri",remotePreview?s.client.base+"/api/resources/"+RemoteClient.enc(e.id)+"/file":s.remote?localUri:e.id);
-        intent.putExtra("name",e.name).putExtra("mime",e.mime);
+        intent.putExtra("name",e.name).putExtra("mime",e.mime).putExtra("size",e.size);
         if(remotePreview)intent.putExtra("server",s.client.base).putExtra("resource",e.id);
-        ArrayList<String> ids=new ArrayList<>(),names=new ArrayList<>(),mimes=new ArrayList<>();
-        for(LibraryStore.Entry item:entries)if(item.available&&item.kind.equals(e.kind)&&(item.kind.equals("image")||item.kind.equals("video"))){String id=remotePreview?item.id:selfNode?indexedSelfNodeUri(item.id):item.id;if(!id.isEmpty()){ids.add(id);names.add(item.name);mimes.add(item.mime);}}
-        if(ids.contains(e.id)){intent.putStringArrayListExtra("browse_ids",ids);intent.putStringArrayListExtra("browse_names",names);intent.putStringArrayListExtra("browse_mimes",mimes);intent.putExtra("browse_index",ids.indexOf(e.id));}
-        else if(!remotePreview&&ids.contains(localUri)){intent.putStringArrayListExtra("browse_ids",ids);intent.putStringArrayListExtra("browse_names",names);intent.putStringArrayListExtra("browse_mimes",mimes);intent.putExtra("browse_index",ids.indexOf(localUri));}
+        ArrayList<String> ids=new ArrayList<>(),names=new ArrayList<>(),mimes=new ArrayList<>();ArrayList<Long> sizes=new ArrayList<>();
+        for(LibraryStore.Entry item:entries)if(item.available&&item.kind.equals(e.kind)&&(item.kind.equals("image")||item.kind.equals("video"))){String id=remotePreview?item.id:selfNode?indexedSelfNodeUri(item.id):item.id;if(!id.isEmpty()){ids.add(id);names.add(item.name);mimes.add(item.mime);sizes.add(item.size);}}
+        int browseAt=ids.indexOf(remotePreview?e.id:selfNode?localUri:e.id);
+        if(browseAt>=0){intent.putStringArrayListExtra("browse_ids",ids);intent.putStringArrayListExtra("browse_names",names);intent.putStringArrayListExtra("browse_mimes",mimes);long[] browseSizes=new long[sizes.size()];for(int i=0;i<sizes.size();i++)browseSizes[i]=sizes.get(i);intent.putExtra("browse_sizes",browseSizes);intent.putExtra("browse_index",browseAt);}
         startActivity(intent);
     }
     private String indexedSelfNodeUri(String encodedId){String uri=NodeResourceApi.decodeID(encodedId);return !uri.isEmpty()&&db.item(uri)!=null?uri:"";}

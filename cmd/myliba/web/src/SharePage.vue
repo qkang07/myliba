@@ -3,6 +3,7 @@ import { onBeforeUnmount, onMounted, ref } from "vue";
 import { CircleAlert, Download, File, Link2, LoaderCircle } from "@lucide/vue";
 import { closeWebRTC, connectWebRTC, webRTCConnected, webRTCFetch } from "./webrtc";
 import StreamingVideo from "./StreamingVideo.vue";
+import { readBlobWithProgress } from "./transferProgress";
 
 type ShareInfo = { id: string; name: string; size: number; expiresAt: string; contentType: string; kind?: string; iceServers: RTCIceServer[] };
 const shareID = window.location.pathname.split("/").pop() || "";
@@ -13,12 +14,18 @@ const error = ref("");
 const transport = ref<"connecting" | "webrtc" | "turn" | "relay">("connecting");
 const previewURL = ref("");
 const downloading = ref(false);
+const previewProgress = ref<number | null>(null);
+const previewTransfer = ref("");
 
 function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;
   if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KB`;
   if (size < 1024 ** 3) return `${(size / 1024 ** 2).toFixed(1)} MB`;
   return `${(size / 1024 ** 3).toFixed(1)} GB`;
+}
+function onPreviewProgress(percent: number | null, received = 0, total = 0) {
+  previewProgress.value = percent;
+  previewTransfer.value = total ? `${formatBytes(received)} / ${formatBytes(total)}` : `${formatBytes(received)} 已加载`;
 }
 
 async function fileResponse() {
@@ -46,7 +53,7 @@ async function openShare() {
     if (!webRTCConnected()) throw new Error("节点直连不可用，请稍后重试");
     if (body.size <= 128 * 1024 * 1024 && /^(image|audio)\//.test(body.contentType)) {
       const file = await fileResponse();
-      previewURL.value = URL.createObjectURL(await file.blob());
+      previewURL.value = URL.createObjectURL(await readBlobWithProgress(file, onPreviewProgress, body.size));
     }
   } catch (cause) { error.value = cause instanceof Error ? cause.message : "无法打开分享"; }
   finally { loading.value = false; }
@@ -82,11 +89,12 @@ onBeforeUnmount(() => { if (previewURL.value) URL.revokeObjectURL(previewURL.val
       <h1>{{ info?.name || '正在打开分享' }}</h1>
       <p v-if="info" class="share-meta">{{ formatBytes(info.size) }} · 有效至 {{ new Date(info.expiresAt).toLocaleString() }}</p>
       <p v-if="loading" class="share-status"><LoaderCircle class="spin" :size="17" />正在验证分享并连接文件节点…</p>
+      <div v-if="loading && previewTransfer" class="share-preview-progress" role="status"><progress :value="previewProgress === null ? undefined : previewProgress" max="100"></progress><span>{{ previewProgress === null ? '' : `${previewProgress}% · ` }}{{ previewTransfer }}</span></div>
       <p v-else-if="error" class="detail-error" role="alert"><CircleAlert :size="17" />{{ error }}</p>
       <button v-if="error && !webRTCConnected()" class="button button-secondary" @click="openShare">重试连接</button>
       <template v-if="info && !loading">
         <div v-if="previewURL || info.kind === 'video' || info.contentType.startsWith('video/')" class="share-preview">
-          <StreamingVideo v-if="info.kind === 'video' || info.contentType.startsWith('video/')" :id="shareID" :name="info.name" :remote="true" :share-key="key" />
+          <StreamingVideo v-if="info.kind === 'video' || info.contentType.startsWith('video/')" :id="shareID" :name="info.name" :remote="true" :share-key="key" :file-size="info.size" />
           <img v-else-if="info.contentType.startsWith('image/')" :src="previewURL" :alt="info.name" />
           <audio v-else-if="info.contentType.startsWith('audio/')" :src="previewURL" controls />
         </div>

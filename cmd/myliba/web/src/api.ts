@@ -243,7 +243,15 @@ export class ApiError extends Error {
 async function apiFetch(url: string, init?: RequestInit) {
   if (remoteSession && contentPath.test(url)) await waitForWebRTCConnection();
   if (remoteSession && url.startsWith("/api/") && url !== "/api/session" && !url.startsWith("/api/hub/") && webRTCConnected()) {
-    return webRTCFetch(url, init);
+    try {
+      const response = await webRTCFetch(url, init);
+      if (response.status < 500 || !contentPath.test(url) || (init?.method && init.method !== "GET")) return response;
+      // Retry server-side content failures through the authenticated Hub relay.
+    } catch (error) {
+      if (!contentPath.test(url) || (init?.method && init.method !== "GET")) throw error;
+      // A data channel can look connected while the content request itself fails.
+      // Retry the safe read through the authenticated Hub relay.
+    }
   }
   return fetch(url, init);
 }
@@ -506,8 +514,8 @@ export function thumbnailURL(resource: Pick<Resource, "id" | "size" | "modified"
   return `/api/resources/${resource.id}/thumbnail?v=${version}&r=${revision}`;
 }
 
-export function getResourceFile(id: string, download = false) {
-  return apiFetch(fileURL(id, download));
+export function getResourceFile(id: string, download = false, signal?: AbortSignal) {
+  return apiFetch(fileURL(id, download), { signal });
 }
 
 export function getResourceThumbnail(resource: Pick<Resource, "id" | "size" | "modified">, revision = 0) {

@@ -91,10 +91,10 @@ final class NodeResourceApi {
         }
         if(parts.length==2&&"tags".equals(parts[1])&&"GET".equals(method)){
             JSONArray tags=new JSONArray();String folder=uri.getQueryParameter("folderId");
-            for(LocalLibrary.Attribute tag:db.tagCatalog(folder==null?"all":folder))tags.put(new JSONObject().put("id",tag.key).put("name",tag.label).put("count",tag.count));return json(200,tags);
+            for(LocalLibrary.Attribute tag:db.tagCatalog(folder==null?"all":folder))tags.put(new JSONObject().put("id","tag-"+id(tag.key)).put("name",tag.label).put("count",tag.count));return json(200,tags);
         }
         if(parts.length==2&&"attribute-tags".equals(parts[1])&&"GET".equals(method)){
-            JSONArray attributes=new JSONArray();for(LocalLibrary.Attribute attribute:db.attributeCatalog(filters(uri)))attributes.put(new JSONObject().put("key",attribute.key).put("label",attribute.label).put("count",attribute.count));return json(200,attributes);
+            JSONArray attributes=new JSONArray();for(LocalLibrary.Attribute attribute:db.attributeCatalog(filters(uri)))attributes.put(new JSONObject().put("key",attribute.key).put("category",attribute.key.split(":",2)[0]).put("label",attribute.label).put("count",attribute.count));return json(200,attributes);
         }
         if(parts.length==2&&"preprocess".equals(parts[1])&&"GET".equals(method))return json(200,new JSONObject().put("counts",new JSONObject().put("pending",0).put("running",0).put("done",0).put("failed",0)).put("jobs",new JSONArray()).put("visible",new JSONObject()));
         if(parts.length==2&&"tag-batch-suggestions".equals(parts[1])&&"GET".equals(method))return json(200,new JSONObject().put("suggestions",new JSONArray()).put("scanned",0));
@@ -163,7 +163,7 @@ final class NodeResourceApi {
             LocalLibrary.Item found=item(parts[2]);if(found==null)return error(404,"资源不存在");db.addTag(found.uri,body(data).optString("name"));return json(200,new JSONObject().put("ok",true));
         }
         if(parts.length==5&&"resources".equals(parts[1])&&"tags".equals(parts[3])&&"DELETE".equals(method)){
-            LocalLibrary.Item found=item(parts[2]);if(found==null)return error(404,"资源不存在");db.removeTag(found.uri,Uri.decode(parts[4]));return json(200,new JSONObject().put("ok",true));
+            LocalLibrary.Item found=item(parts[2]);if(found==null)return error(404,"资源不存在");String tag=parts[4].startsWith("tag-")?decodeID(parts[4].substring(4)):parts[4];if(tag.isEmpty())return error(400,"标签 ID 无效");db.removeTag(found.uri,tag);return json(200,new JSONObject().put("ok",true));
         }
         if(parts.length==2&&"folders".equals(parts[1])&&"POST".equals(method)){
             String name=body(data).getString("name"),id=db.createFolder(name);return json(201,new JSONObject().put("id",id).put("name",name).put("count",0).put("createdAt",""));

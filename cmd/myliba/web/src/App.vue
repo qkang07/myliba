@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { closeWebRTC, connectWebRTC } from "./webrtc";
+import { singleFilters, toggleFilter } from "./filterSelection";
 import ResourceDetail from "./ResourceDetail.vue";
 import ImagePreview from "./ImagePreview.vue";
 import StreamingVideo from "./StreamingVideo.vue";
@@ -146,6 +147,7 @@ const editingFolderName = ref("");
 const total = ref(0);
 const query = ref("");
 const selectedTags = ref<string[]>([]);
+const multipleFilters = ref(false);
 const selectedKind = ref("");
 const selectedRootID = ref("");
 const sortOrder = ref<ResourceSort>("modified_desc");
@@ -470,7 +472,7 @@ function openResourcePreview(resource: Resource) {
   previewResource.value = resource;
   previewMimeType.value = getPreviewMimeType(resource);
   previewError.value = resource.available ? "" : "源文件当前不可用。";
-  if (remoteMode.value && resource.available && resource.kind !== "video") {
+  if (remoteMode.value && resource.available && resource.kind !== "video" && resource.kind !== "image") {
     if (resource.size > 128 * 1024 * 1024) {
       previewError.value = "此文件超过直连网页预览的大小限制，请下载后打开。";
     } else {
@@ -857,18 +859,22 @@ function chooseUnorganized() {
 
 function toggleTag(name: string) {
   if (detailResourceID.value) closeDetail();
-  selectedTags.value = selectedTags.value.includes(name)
-    ? selectedTags.value.filter((tag) => tag !== name)
-    : [...selectedTags.value, name];
+  selectedTags.value = toggleFilter(selectedTags.value, name, multipleFilters.value);
   unorganizedOnly.value = false;
   void loadResources();
 }
 
 function chooseSidebarTag(name: string) {
-  if (detailResourceID.value) closeDetail();
-  selectedTags.value = selectedTags.value.length === 1 && selectedTags.value[0] === name ? [] : [name];
-  unorganizedOnly.value = false;
-  void loadResources();
+  toggleTag(name);
+}
+
+function changeFilterMode() {
+  if (!multipleFilters.value) {
+    selectedTags.value = singleFilters(selectedTags.value);
+    selectedAttributes.value = singleFilters(activeAttributeKeys.value, true);
+    selectedKind.value = "";
+    void loadResources();
+  }
 }
 
 function clearSelectedTags() {
@@ -888,9 +894,7 @@ function attributeLabel(key: string): string {
 
 function toggleAttribute(key: string) {
   if (detailResourceID.value) closeDetail();
-  const selected = new Set(activeAttributeKeys.value);
-  if (selected.has(key)) selected.delete(key);
-  else selected.add(key);
+  const selected = toggleFilter(activeAttributeKeys.value, key, multipleFilters.value, key.split(":", 1)[0] + ":");
   selectedKind.value = "";
   selectedAttributes.value = [...selected];
   void loadResources();
@@ -929,6 +933,7 @@ async function chooseCollection(item: SmartCollection) {
   selectedTags.value = [...item.filters.tags];
   selectedKind.value = item.filters.kind;
   selectedAttributes.value = [...(item.filters.attributes || [])];
+  multipleFilters.value = selectedTags.value.length > 1 || singleFilters(activeAttributeKeys.value, true).length < activeAttributeKeys.value.length;
   selectedRootID.value = item.filters.rootId;
   unorganizedOnly.value = item.filters.unorganized;
   sortOrder.value = item.filters.sort;
@@ -1234,6 +1239,7 @@ async function changeResourceNode(event: Event) {
   try {
     await selectResourceNode(id);
     closeWebRTC();
+    try { window.localStorage.setItem("myliba:selected-resource-node", id); } catch { /* Session polling still detects the change. */ }
     window.location.reload();
   } catch (error) {
     (event.target as HTMLSelectElement).value = selectedResourceNodeID.value;
@@ -1333,12 +1339,31 @@ function handleUnauthorized() {
   clearRemoteSession();
 }
 
+function reloadForSelectedNode() {
+  clearRemoteSession();
+  const url = new URL(window.location.href);
+  url.searchParams.delete("resource");
+  url.searchParams.delete("folder");
+  window.location.replace(url.href);
+}
+
+function handleNodeStorageChange(event: StorageEvent) {
+  if (event.key === "myliba:selected-resource-node" && remoteMode.value && authenticated.value && event.newValue !== selectedResourceNodeID.value) reloadForSelectedNode();
+}
+
 async function refreshNodeStatus() {
+  const generation = authGeneration;
   try {
     const session = await getSession();
+    if (generation !== authGeneration) return;
     if (session) {
       if (!session.authenticated) {
         clearRemoteSession();
+        return;
+      }
+      if ((session.selectedNodeId ?? "") !== selectedResourceNodeID.value) {
+        reloadForSelectedNode();
+        return;
       }
       nodeOnline.value = session.nodeOnline;
       ownerSession.value = session.owner ?? true;
@@ -1429,6 +1454,7 @@ watch(query, () => {
 
 onMounted(async () => {
   window.addEventListener("myliba:unauthorized", handleUnauthorized);
+  window.addEventListener("storage", handleNodeStorageChange);
   window.addEventListener("keydown", onShortcut);
   window.addEventListener("popstate", syncDetailRoute);
   document.addEventListener("click", onTagEditorOutside, true);
@@ -1461,6 +1487,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (previewURL.value) URL.revokeObjectURL(previewURL.value);
   window.removeEventListener("myliba:unauthorized", handleUnauthorized);
+  window.removeEventListener("storage", handleNodeStorageChange);
   window.removeEventListener("keydown", onShortcut);
   window.removeEventListener("popstate", syncDetailRoute);
   document.removeEventListener("click", onTagEditorOutside, true);
@@ -1514,9 +1541,9 @@ onBeforeUnmount(() => {
         <div v-if="activeFolderID !== 'all'" class="sidebar-section-label tag-section-title">
           <span>手动标签</span><span class="label-count">{{ tags.length }}</span>
         </div>
-        <nav v-if="activeFolderID !== 'all'" class="tag-nav" aria-label="手动标签单选导航">
-          <button v-for="tag in tags" :key="tag.id" class="tag-nav-link" :class="{ active: selectedTags.length === 1 && selectedTags[0] === tag.name }" :aria-pressed="selectedTags.length === 1 && selectedTags[0] === tag.name" @click="chooseSidebarTag(tag.name)">
-            <Tag :size="15" /><span class="tag-nav-name">{{ tag.name }}</span><span class="tag-count">{{ tag.count }}</span><Check v-if="selectedTags.length === 1 && selectedTags[0] === tag.name" :size="13" />
+        <nav v-if="activeFolderID !== 'all'" class="tag-nav" aria-label="手动标签筛选导航">
+          <button v-for="tag in tags" :key="tag.id" class="tag-nav-link" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="chooseSidebarTag(tag.name)">
+            <Tag :size="15" /><span class="tag-nav-name">{{ tag.name }}</span><span class="tag-count">{{ tag.count }}</span><Check v-if="selectedTags.includes(tag.name)" :size="13" />
           </button>
           <p v-if="!tags.length" class="sidebar-empty">给资源添加标签后，会显示在这里。</p>
         </nav>
@@ -1689,7 +1716,7 @@ onBeforeUnmount(() => {
         <section v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-panel" aria-label="标签筛选">
           <div class="tag-filter-panel-heading"><strong>标签筛选</strong><button type="button" aria-label="收起标签筛选" @click="tagFilterOpen = false"><ChevronDown :size="15" /></button></div>
           <div class="tag-filter-group">
-            <div class="tag-filter-group-heading"><strong>手动标签</strong><span>可多选，结果同时包含所选标签</span></div>
+            <div class="tag-filter-group-heading"><strong>手动标签</strong><label class="tag-filter-mode"><input v-model="multipleFilters" type="checkbox" @change="changeFilterMode" />多选</label><span>{{ multipleFilters ? "同时满足所选手动标签；同类属性可多选" : "单选；点击新标签替换旧标签，同类属性只选一项" }}</span></div>
             <label class="tag-filter-search" for="tag-filter-search"><Search :size="14" /><input id="tag-filter-search" v-model="tagFilterQuery" type="search" placeholder="查找手动标签" autocomplete="off" /></label>
             <div class="tag-filter-list">
               <button v-for="tag in matchingTags" :key="tag.id" class="tag-filter-option" type="button" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)"><span>{{ tag.name }}</span><small>{{ tag.count }}</small><Check v-if="selectedTags.includes(tag.name)" :size="14" /></button>
@@ -1873,7 +1900,7 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <ImagePreview v-if="previewResource && previewMimeType.startsWith('image/') && !previewError && (!remoteMode || previewURL)" :key="previewResource.id" :src="remoteMode ? previewURL : fileURL(previewResource.id)" :name="previewResource.name" :position="previewPosition" :total="previewTotal" :can-previous="canPreviewPrevious" :can-next="canPreviewNext" :loading-next="previewLoadingNext" @close="closeResourcePreview" @download="startRelayDownload(previewResource)" @details="openDetail(previewResource); closeResourcePreview()" @previous="moveResourcePreview(-1)" @next="moveResourcePreview(1)" @error="previewError = '无法加载此图片。请检查文件是否仍可访问。'" />
+    <ImagePreview v-if="previewResource && previewMimeType.startsWith('image/') && !previewError" :key="previewResource.id" :src="thumbnailURLs.get(previewResource.id)" :resource="previewResource" :name="previewResource.name" :position="previewPosition" :total="previewTotal" :can-previous="canPreviewPrevious" :can-next="canPreviewNext" :loading-next="previewLoadingNext" @close="closeResourcePreview" @download="startRelayDownload(previewResource)" @details="openDetail(previewResource); closeResourcePreview()" @previous="moveResourcePreview(-1)" @next="moveResourcePreview(1)" />
     <div v-else-if="previewResource" class="resource-preview-backdrop resource-browser-preview" @click.self="closeResourcePreview">
       <section class="resource-preview-dialog" role="dialog" aria-modal="true" :aria-label="'预览 ' + previewResource.name">
         <header class="resource-preview-header">
@@ -1892,7 +1919,7 @@ onBeforeUnmount(() => {
         </header>
         <div class="resource-preview-stage">
           <template v-if="previewMimeType && !previewError">
-              <StreamingVideo v-if="previewMimeType.startsWith('video/')" :key="previewResource.id" :id="previewResource.id" :name="previewResource.name" :remote="remoteMode" :phone-node="selectedResourceNodeKind === 'android'" />
+              <StreamingVideo v-if="previewMimeType.startsWith('video/')" :key="previewResource.id" :id="previewResource.id" :name="previewResource.name" :remote="remoteMode" :phone-node="selectedResourceNodeKind === 'android'" :resource="previewResource" :poster="thumbnailURLs.get(previewResource.id)" :file-size="previewResource.size" />
               <audio v-else-if="previewMimeType.startsWith('audio/') && (!remoteMode || previewURL)" :src="remoteMode ? previewURL : fileURL(previewResource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式。你可以下载后打开。'"></audio>
               <iframe v-else-if="!remoteMode || previewURL" :src="remoteMode ? previewURL : fileURL(previewResource.id)" :title="'预览 ' + previewResource.name"></iframe>
           </template>

@@ -79,7 +79,7 @@ final class RemoteClient {
                 RemoteRTC.Reply reply=rtc.fetch(method,path,payload,max);
                 if(reply.status<200||reply.status>=300)throw failure(reply.status,reply.body);
                 return reply.body;
-            }catch(Failure ex){throw ex;}
+            }catch(Failure ex){if(!"GET".equals(method)||ex.status<500)throw ex;AppLog.info("Remote content falling back to limited Hub relay after RTC HTTP "+ex.status);}
             catch(Exception ex){if(!"GET".equals(method))throw ex;AppLog.info("Remote content falling back to limited Hub relay: "+ex.getClass().getSimpleName());}
         }
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();
@@ -96,16 +96,28 @@ final class RemoteClient {
         }finally{c.disconnect();}
     }
     void download(String path,OutputStream out)throws Exception{
-        if(!rtcConfigured)json("GET","/api/session",null);
-        try{rtc.ensureConnected();}catch(Exception ex){AppLog.info("Remote download falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,null,out,null);return;}
-        RemoteRTC.Reply reply=rtc.stream("GET",path,new byte[0],new JSONObject(),out,Long.MAX_VALUE);
-        if(reply.status<200||reply.status>=300)throw new Failure(reply.status,"文件传输失败（"+reply.status+"）");
+        streamFile(path,null,out,(status,headers)->{if(status<200||status>=300)throw new Failure(status,"文件传输失败（"+status+"）");});
     }
     void streamFile(String path,String range,OutputStream out,RemoteRTC.ResponseStart start)throws Exception{
         if(!rtcConfigured)json("GET","/api/session",null);
         try{rtc.ensureConnected();}catch(Exception ex){AppLog.info("Remote media falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start);return;}
         JSONObject headers=new JSONObject();if(range!=null&&!range.isEmpty())headers.put("Range",new JSONArray().put(range));
-        rtc.stream("GET",path,new byte[0],headers,out,Long.MAX_VALUE,start);
+        final int[] statusCode={0};
+        final long[] forwarded={0};
+        OutputStream counted=new OutputStream(){
+            @Override public void write(int value)throws IOException{if(statusCode[0]<500){out.write(value);forwarded[0]++;}}
+            @Override public void write(byte[] data,int offset,int length)throws IOException{if(statusCode[0]<500){out.write(data,offset,length);forwarded[0]+=length;}}
+        };
+        final boolean[] started={false};
+        try{
+            RemoteRTC.Reply reply=rtc.stream("GET",path,new byte[0],headers,counted,Long.MAX_VALUE,(status,responseHeadersValue)->{
+                statusCode[0]=status;
+                if(status<500){started[0]=true;if(start!=null)start.onStart(status,responseHeadersValue);}
+            });
+            if(reply.status>=500&&!started[0]){AppLog.info("Remote media falling back to limited Hub relay after RTC HTTP "+reply.status);streamFromHub(path,range,out,start);}
+            else if(!started[0]&&start!=null)start.onStart(reply.status,reply.headers);
+        }
+        catch(Exception ex){if(forwarded[0]>0||started[0])throw ex;AppLog.info("Remote media falling back to limited Hub relay after RTC content failure: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start);}
     }
     private void streamFromHub(String path,String range,OutputStream out,RemoteRTC.ResponseStart start)throws Exception{
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();

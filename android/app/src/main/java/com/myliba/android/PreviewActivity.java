@@ -10,6 +10,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.util.Size;
 import android.view.Gravity;
 import android.view.WindowInsets;
 import android.widget.Button;
@@ -20,6 +21,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.VideoView;
 import android.widget.FrameLayout;
+import android.widget.ProgressBar;
 import android.view.View;
 import java.util.ArrayList;
 
@@ -28,6 +30,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.OutputStream;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -64,6 +69,12 @@ public final class PreviewActivity extends Activity {
     private ArrayList<String> browseIds, browseNames, browseMimes;
     private int browseIndex;
     private boolean imageControlsVisible = true;
+    private ProgressBar loadingBar;
+    private TextView loadingText;
+    private TextView originalAction;
+    private boolean showingOriginal;
+    private boolean videoStarted;
+    private long fileSize;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -74,6 +85,7 @@ public final class PreviewActivity extends Activity {
         remote = getIntent().hasExtra("server");
         mime = getIntent().getStringExtra("mime");
         if (mime == null) mime = "application/octet-stream";
+        fileSize=getIntent().getLongExtra("size",-1);
         String name = getIntent().getStringExtra("name");
         if (name == null) name = "文件预览";
         browseIds=getIntent().getStringArrayListExtra("browse_ids");browseNames=getIntent().getStringArrayListExtra("browse_names");browseMimes=getIntent().getStringArrayListExtra("browse_mimes");browseIndex=getIntent().getIntExtra("browse_index",-1);
@@ -106,6 +118,10 @@ public final class PreviewActivity extends Activity {
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         toolbar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        if(mime.startsWith("image/")||mime.startsWith("video/")){
+            originalAction=button(mime.startsWith("image/")?"查看原图":"播放原片",mime.startsWith("image/")?this::showOriginalImage:this::showVideo);
+            toolbar.addView(originalAction);
+        }
         if (!remote){ImageView external=ui.iconButton("link", "用其他应用打开", this::openExternal);if(media)external.setImageDrawable(new MobileUi.Icon("link",Color.WHITE));toolbar.addView(external);}
         layout.addView(toolbar);
         content = new LinearLayout(this);
@@ -124,66 +140,137 @@ public final class PreviewActivity extends Activity {
     }
 
     private void openPreview() {
-        if (mime.startsWith("image/")) loadImage();
+        if (mime.startsWith("image/")) loadThumbnail();
         else if (mime.equals("application/pdf")) loadPdf();
         else if (mime.startsWith("text/") || mime.equals("application/json") || mime.endsWith("+xml")) loadText();
-        else if (mime.startsWith("video/")) showVideo();
+        else if (mime.startsWith("video/")) loadThumbnail();
         else showMessage(remote ? "此格式没有内置预览，请返回详情下载原文件。" : "此格式没有内置预览，可用其他应用打开。");
     }
 
     private void loadRemote() {
-        RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE), this);
-        if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+        if (mime.startsWith("image/") || mime.startsWith("video/")) {
+            loadThumbnail();
+            return;
+        }
+        if (mime.startsWith("audio/")) {
             showVideo();
             return;
         }
+        RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE), this);
         if (!(mime.startsWith("image/") || mime.equals("application/pdf") || mime.startsWith("text/") || mime.equals("application/json") || mime.endsWith("+xml"))) {
             showMessage("此格式没有内置预览，请返回详情下载原文件。");
             return;
         }
-        showMessage("正在读取原文件…");
+        showLoading("正在读取预览文件…",fileSize>0?0:-1);
         worker.execute(() -> {
             try {
                 remoteCache = File.createTempFile("preview-", ".bin", getCacheDir());
-                try (FileOutputStream out = new FileOutputStream(remoteCache)) { client.download("/api/resources/" + RemoteClient.enc(getIntent().getStringExtra("resource")) + "/file", out); }
+                try (FileOutputStream out = new FileOutputStream(remoteCache)) { downloadWithProgress(client,"/api/resources/" + RemoteClient.enc(getIntent().getStringExtra("resource")) + "/file",out,fileSize,"正在读取预览文件"); }
                 runOnUiThread(() -> { if (!closing) { fileUri = Uri.fromFile(remoteCache); openPreview(); } });
             } catch (Exception error) { fail(error); }finally{client.close();}
         });
     }
 
-    private void loadImage() {
+    private void loadThumbnail() {
+        showLoading("正在加载预览图…",-1);
         worker.execute(() -> {
             try {
-                BitmapFactory.Options bounds = new BitmapFactory.Options();
-                bounds.inJustDecodeBounds = true;
-                try (InputStream stream = getContentResolver().openInputStream(fileUri)) {
-                    if (stream == null) throw new IOException("无法读取图片");
-                    BitmapFactory.decodeStream(stream, null, bounds);
-                }
-                BitmapFactory.Options options = new BitmapFactory.Options();
-                options.inPreferredConfig = Bitmap.Config.ARGB_8888;
-                options.inSampleSize = 1;
-                while (bounds.outWidth / options.inSampleSize > 2048 || bounds.outHeight / options.inSampleSize > 2048) {
-                    options.inSampleSize *= 2;
-                }
                 Bitmap bitmap;
-                try (InputStream stream = getContentResolver().openInputStream(fileUri)) {
-                    if (stream == null) throw new IOException("无法读取图片");
-                    bitmap = BitmapFactory.decodeStream(stream, null, options);
+                if(remote){
+                    RemoteClient client=new RemoteClient(getIntent().getStringExtra("server"),getSharedPreferences("MainActivity",MODE_PRIVATE),this);
+                    try{
+                        String path="/api/resources/"+RemoteClient.enc(getIntent().getStringExtra("resource"))+"/thumbnail?size=mobile";
+                        ByteArrayOutputStream bytes=new ByteArrayOutputStream();
+                        try{downloadWithProgress(client,path,bytes,-1,"正在加载预览图");}
+                        catch(RemoteClient.Failure missing){if(missing.status!=404)throw missing;client.json("POST",path,null);bytes.reset();downloadWithProgress(client,path,bytes,-1,"正在加载预览图");}
+                        byte[] data=bytes.toByteArray();bitmap=BitmapFactory.decodeByteArray(data,0,data.length);
+                    }finally{client.close();}
+                }else if(Build.VERSION.SDK_INT>=29){
+                    try{bitmap=getContentResolver().loadThumbnail(fileUri,new Size(720,960),null);}
+                    catch(Exception ignored){bitmap=decodeImage(mime.startsWith("video/")?0:960);}
+                }else bitmap=decodeImage(mime.startsWith("video/")?0:960);
+                if(bitmap==null)throw new IOException("无法生成预览图");
+                Bitmap result=bitmap;
+                runOnUiThread(()->{if(closing||showingOriginal||videoStarted){result.recycle();return;}showBitmap(result);});
+            }catch(Exception error){if(!showingOriginal&&!videoStarted)fail(error);}
+        });
+    }
+
+    private Bitmap decodeImage(int maxDimension)throws Exception{
+        if(mime.startsWith("video/"))return ThumbnailLoader.videoFrame(this,fileUri,0);
+        BitmapFactory.Options bounds=new BitmapFactory.Options();bounds.inJustDecodeBounds=true;
+        try(InputStream stream=getContentResolver().openInputStream(fileUri)){if(stream==null)throw new IOException("无法读取图片");BitmapFactory.decodeStream(stream,null,bounds);}
+        if(bounds.outWidth<1||bounds.outHeight<1)throw new IOException("图片格式不受支持");
+        BitmapFactory.Options options=new BitmapFactory.Options();options.inPreferredConfig=Bitmap.Config.ARGB_8888;
+        int limit=maxDimension==0?8192:maxDimension;
+        options.inSampleSize=1;
+        while(bounds.outWidth/options.inSampleSize>limit||bounds.outHeight/options.inSampleSize>limit)options.inSampleSize*=2;
+        try(InputStream stream=getContentResolver().openInputStream(fileUri)){if(stream==null)throw new IOException("无法读取图片");return BitmapFactory.decodeStream(stream,null,options);}
+    }
+
+    private void showOriginalImage(){
+        if(showingOriginal)return;
+        showingOriginal=true;
+        originalAction.setEnabled(false);
+        showLoading("正在读取原图…",-1);
+        worker.execute(() -> {
+            try {
+                if(remote){
+                    RemoteClient client=new RemoteClient(getIntent().getStringExtra("server"),getSharedPreferences("MainActivity",MODE_PRIVATE),this);
+                    try{
+                        remoteCache=File.createTempFile("preview-original-",".bin",getCacheDir());
+                        try(FileOutputStream out=new FileOutputStream(remoteCache)){downloadWithProgress(client,"/api/resources/"+RemoteClient.enc(getIntent().getStringExtra("resource"))+"/file",out,fileSize,"正在读取原图");}
+                        fileUri=Uri.fromFile(remoteCache);
+                    }finally{client.close();}
                 }
+                Bitmap bitmap=decodeImage(0);
                 if (bitmap == null) throw new IOException("图片格式不受支持");
                 runOnUiThread(() -> {
                     if (closing) { bitmap.recycle(); return; }
-                    clearContent();
-                    ImageView image = new ZoomImageView(this, this::navigateMedia);
-                    image.setOnClickListener(v->toggleImageControls());
-                    image.setImageBitmap(bitmap);
-                    currentBitmap = bitmap;
-                    content.addView(image, new LinearLayout.LayoutParams(-1, -1));
+                    showBitmap(bitmap);
+                    originalAction.setText("正在查看原图");
                 });
-            } catch (Exception error) { fail(error); }
+            } catch (Exception error) {runOnUiThread(()->{if(closing)return;showingOriginal=false;originalAction.setEnabled(true);hideLoading();android.widget.Toast.makeText(this,"原图读取失败："+error.getMessage(),android.widget.Toast.LENGTH_LONG).show();});}
         });
     }
+
+    private void showBitmap(Bitmap bitmap){
+        clearContent();
+        ImageView image=new ZoomImageView(this,this::navigateMedia);
+        image.setOnClickListener(v->toggleImageControls());
+        image.setImageBitmap(bitmap);currentBitmap=bitmap;
+        content.addView(image,new LinearLayout.LayoutParams(-1,-1));
+        hideLoading();
+    }
+
+    private void showLoading(String message,int percent){
+        if(loadingBar==null){
+            LinearLayout strip=new LinearLayout(this);strip.setOrientation(LinearLayout.VERTICAL);strip.setPadding(dp(12),dp(6),dp(12),dp(6));strip.setBackgroundColor(0xff171b19);
+            loadingText=ui.text(message,12,Color.WHITE,false);strip.addView(loadingText);
+            loadingBar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);loadingBar.setMax(100);strip.addView(loadingBar);
+            ((LinearLayout)content.getParent()).addView(strip,((LinearLayout)content.getParent()).indexOfChild(content)+1);
+            loadingBar.setTag(strip);
+        }
+        loadingBar.setIndeterminate(percent<0);if(percent>=0)loadingBar.setProgress(percent);
+        loadingText.setText(message+(percent>=0?" "+percent+"%":""));
+    }
+    private void hideLoading(){if(loadingBar!=null){View strip=(View)loadingBar.getTag();((LinearLayout)strip.getParent()).removeView(strip);loadingBar=null;loadingText=null;}}
+
+    private void downloadWithProgress(RemoteClient client,String path,OutputStream target,long expected,String label)throws Exception{
+        final long[] total={expected},received={0};
+        OutputStream counted=new OutputStream(){
+            @Override public void write(int value)throws IOException{target.write(value);received[0]++;update();}
+            @Override public void write(byte[] data,int offset,int length)throws IOException{target.write(data,offset,length);received[0]+=length;update();}
+            private void update(){if(total[0]>0){int percent=(int)Math.min(100,received[0]*100/total[0]);String detail=formatBytes(received[0])+" / "+formatBytes(total[0]);runOnUiThread(()->{if(!closing&&loadingBar!=null)showLoading(label+" · "+detail,percent);});}else{String detail=formatBytes(received[0])+" 已加载";runOnUiThread(()->{if(!closing&&loadingBar!=null)showLoading(label+" · "+detail,-1);});}}
+        };
+        client.streamFile(path,null,counted,(status,headers)->{
+            if(status<200||status>=300)throw new RemoteClient.Failure(status,"预览图读取失败（"+status+"）");
+            JSONArray lengths=headers.optJSONArray("Content-Length");if(lengths!=null&&lengths.length()>0){long length=lengths.optLong(0,-1);if(length>0)total[0]=length;}
+            String detail=total[0]>0?"0 B / "+formatBytes(total[0]):"文件大小未知";
+            runOnUiThread(()->{if(!closing&&loadingBar!=null)showLoading(label+" · "+detail,total[0]>0?0:-1);});
+        });
+    }
+    private static String formatBytes(long value){if(value<1024)return value+" B";if(value<1024L*1024)return String.format(java.util.Locale.ROOT,"%.1f KB",value/1024.0);if(value<1024L*1024*1024)return String.format(java.util.Locale.ROOT,"%.1f MB",value/(1024.0*1024));return String.format(java.util.Locale.ROOT,"%.1f GB",value/(1024.0*1024*1024));}
 
     private void loadText() {
         worker.execute(() -> {
@@ -266,6 +353,10 @@ public final class PreviewActivity extends Activity {
     }
 
     private void showVideo() {
+        if(videoStarted)return;
+        videoStarted=true;
+        showLoading("正在缓冲原片"+(fileSize>0?" · "+formatBytes(fileSize):" · 文件大小未知"),-1);
+        if(originalAction!=null)originalAction.setEnabled(false);
         clearContent();
         video = new VideoView(this);
         MediaController controls = new MediaController(this);
@@ -276,14 +367,14 @@ public final class PreviewActivity extends Activity {
                 RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE), this);
                 mediaProxy=new RtcMediaProxy(client,getIntent().getStringExtra("resource"));
                 video.setVideoURI(Uri.parse(mediaProxy.url()));
-            }catch(Exception ex){showMessage("无法启动 WebRTC 媒体播放："+ex.getMessage());return;}
+            }catch(Exception ex){hideLoading();showMessage("无法启动 WebRTC 媒体播放："+ex.getMessage());if(originalAction!=null)originalAction.setEnabled(true);return;}
         } else video.setVideoURI(fileUri);
         VideoStage stage=new VideoStage(this);stage.setBackgroundColor(Color.BLACK);
         FrameLayout.LayoutParams videoParams=new FrameLayout.LayoutParams(-1,-1,Gravity.CENTER);
         stage.addView(video,videoParams);
         content.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
-        video.setOnPreparedListener(player->{stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());video.start();});
-        video.setOnErrorListener((player, what, extra) -> { showMessage("视频无法播放，可用其他应用打开。"); return true; });
+        video.setOnPreparedListener(player->{stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());hideLoading();player.setOnBufferingUpdateListener((mp,percent)->{if(percent<100)showLoading("正在缓冲原片…",percent);else hideLoading();});video.start();});
+        video.setOnErrorListener((player, what, extra) -> {hideLoading();showMessage(remote?"视频无法播放，请返回详情下载原片。":"视频无法播放，可用其他应用打开。");if(originalAction!=null)originalAction.setEnabled(true);return true;});
     }
 
     private void openExternal() {
@@ -294,9 +385,9 @@ public final class PreviewActivity extends Activity {
         catch (RuntimeException error) { showMessage("没有可打开此文件的应用，或目录授权已失效。"); }
     }
     private void toggleImageControls(){if(!mime.startsWith("image/"))return;imageControlsVisible=!imageControlsVisible;toolbar.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);if(browserNav!=null)browserNav.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);}
-    private void navigateMedia(int step){int target=browseIndex+step;if(browseIds==null||target<0||target>=browseIds.size())return;Intent next=new Intent(this,PreviewActivity.class);String id=browseIds.get(target);next.putExtra("uri",remote?getIntent().getStringExtra("server")+"/api/resources/"+RemoteClient.enc(id)+"/file":id);next.putExtra("name",browseNames.get(target));next.putExtra("mime",browseMimes.get(target));if(remote)next.putExtra("server",getIntent().getStringExtra("server")).putExtra("resource",id);next.putStringArrayListExtra("browse_ids",browseIds);next.putStringArrayListExtra("browse_names",browseNames);next.putStringArrayListExtra("browse_mimes",browseMimes);next.putExtra("browse_index",target);startActivity(next);finish();}
+    private void navigateMedia(int step){int target=browseIndex+step;if(browseIds==null||target<0||target>=browseIds.size())return;Intent next=new Intent(this,PreviewActivity.class);String id=browseIds.get(target);next.putExtra("uri",remote?getIntent().getStringExtra("server")+"/api/resources/"+RemoteClient.enc(id)+"/file":id);next.putExtra("name",browseNames.get(target));next.putExtra("mime",browseMimes.get(target));if(remote)next.putExtra("server",getIntent().getStringExtra("server")).putExtra("resource",id);next.putStringArrayListExtra("browse_ids",browseIds);next.putStringArrayListExtra("browse_names",browseNames);next.putStringArrayListExtra("browse_mimes",browseMimes);long[] sizes=getIntent().getLongArrayExtra("browse_sizes");if(sizes!=null){next.putExtra("browse_sizes",sizes);if(target<sizes.length)next.putExtra("size",sizes[target]);}next.putExtra("browse_index",target);startActivity(next);finish();}
 
-    private void fail(Exception error) { runOnUiThread(() -> { if (!closing) showMessage("预览失败：" + error.getMessage()); }); }
+    private void fail(Exception error) { runOnUiThread(() -> { if (!closing) {hideLoading();showMessage("预览失败：" + error.getMessage());} }); }
 
     private void showMessage(String message) {
         clearContent();

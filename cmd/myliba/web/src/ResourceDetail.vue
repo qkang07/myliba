@@ -148,7 +148,7 @@ async function refreshResource() {
     loading.value = false;
     shareURL.value = "";
     if (!props.phoneNode) void listFileShares(item.id).then((items) => { if (current === generation) shares.value = items; }).catch(() => { if (current === generation) shares.value = []; });
-    if (props.remote && item.available && item.kind !== "video") {
+    if (props.remote && item.available && item.kind !== "video" && item.kind !== "image") {
       if (item.size > 128 * 1024 * 1024) {
         previewError.value = "此文件超过直连网页预览的大小限制，请下载后打开。";
       } else {
@@ -360,9 +360,9 @@ onBeforeUnmount(() => {
           <section class="detail-panel detail-preview-panel" :class="{ 'is-preview-expanded': expandedPreview }">
             <div class="detail-panel-heading detail-preview-heading"><h2>文件预览</h2><div class="detail-preview-tools"><span>{{ mimeType || "无法在网页中预览" }}</span><button v-if="resource.available && mimeType.startsWith('image/') && !previewError" class="detail-fullscreen-button" aria-label="查看大图" @click="openImageViewer"><Expand :size="14" />查看大图</button><button v-else-if="resource.available && mimeType && !previewError" class="detail-fullscreen-button" :aria-label="expandedPreview ? '退出窗口预览' : '铺满窗口预览'" @click="toggleExpandedPreview"><Minimize v-if="expandedPreview" :size="14" /><Expand v-else :size="14" />{{ expandedPreview ? '退出窗口预览' : '铺满窗口' }}</button></div></div>
             <div class="detail-preview">
-              <template v-if="resource.available && mimeType && !previewError && (resource.kind === 'video' || !remote || previewURL)">
-                <button v-if="mimeType.startsWith('image/')" type="button" class="detail-image-trigger" :aria-label="'预览图片 ' + resource.name" @click="openImageViewer"><img :src="remote ? previewURL : fileURL(resource.id)" :alt="resource.name" @error="previewError = '图片无法加载'" /><span class="detail-image-trigger-hint"><Expand :size="14" />点击查看大图</span></button>
-                <StreamingVideo v-else-if="mimeType.startsWith('video/')" :id="resource.id" :name="resource.name" :remote="remote" :phone-node="phoneNode" @metadata="onVideoMetadata" />
+              <template v-if="resource.available && mimeType && !previewError && (resource.kind === 'video' || resource.kind === 'image' || !remote || previewURL)">
+                <button v-if="mimeType.startsWith('image/')" type="button" class="detail-image-trigger" :aria-label="'预览图片 ' + resource.name" @click="openImageViewer"><img v-if="images.has('large')" :src="images.get('large')" :alt="resource.name" /><span v-else>点击加载预览图</span><span class="detail-image-trigger-hint"><Expand :size="14" />点击查看大图</span></button>
+                <StreamingVideo v-else-if="mimeType.startsWith('video/')" :id="resource.id" :name="resource.name" :remote="remote" :phone-node="phoneNode" :resource="resource" :file-size="resource.size" @metadata="onVideoMetadata" />
                 <audio v-else-if="mimeType.startsWith('audio/')" :src="remote ? previewURL : fileURL(resource.id)" controls preload="metadata" @error="previewError = '浏览器无法播放此音频格式'"></audio>
                 <iframe v-else sandbox="" :src="remote ? previewURL : fileURL(resource.id)" :title="'预览 ' + resource.name"></iframe>
               </template>
@@ -413,6 +413,6 @@ onBeforeUnmount(() => {
         </aside>
       </div>
     </template>
-    <ImagePreview v-if="imageViewerOpen && resource" :src="remote ? previewURL : fileURL(resource.id)" :name="resource.name" @close="closeImageViewer" @download="download" />
+    <ImagePreview v-if="imageViewerOpen && resource" :src="images.get('large')" :resource="resource" :name="resource.name" @close="closeImageViewer" @download="download" />
   </section>
 </template>

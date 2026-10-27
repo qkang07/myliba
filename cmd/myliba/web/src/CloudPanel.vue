@@ -117,7 +117,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
               <LoaderCircle v-if="activeDownload === file.id" class="spin" :size="14" /><Download v-else :size="14" />下载
             </button>
           </div>
-          <div v-if="activeVideo === file.id" class="cloud-video-preview"><StreamingVideo :id="file.id" :name="file.name" :remote="remote" cloud :qualities="file.variants" /></div>
+          <div v-if="activeVideo === file.id" class="cloud-video-preview"><StreamingVideo :id="file.id" :name="file.name" :remote="remote" cloud :qualities="file.variants" :file-size="file.originalSize" /></div>
           </template>
           <div v-for="file in view.files.filter((item) => versions[item.id])" :key="file.id + '-history'" class="cloud-history">
             <div v-for="version in versions[file.id]" :key="version.revisionId" class="hub-profile-row">

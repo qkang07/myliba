@@ -519,6 +519,11 @@ body.detail-preview-open { overflow: hidden; }
 .stream-video-controls label { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
 .stream-video-controls select { padding: 4px 7px; border: 1px solid #738179; border-radius: 5px; background: #27332c; color: white; }
 .stream-video-controls span { overflow: hidden; text-overflow: ellipsis; }
+.stream-video-controls progress { width: min(140px, 30vw); height: 7px; accent-color: #7fc18e; }
+.stream-video-cover { position: relative; display: grid; min-height: 220px; flex: 1; place-items: center; overflow: hidden; background: #171a18; }
+.stream-video-cover > img { position: absolute; width: 100%; height: 100%; object-fit: contain; opacity: .8; }
+.stream-video-cover-actions { position: relative; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; padding: 20px; }
+.stream-video-cover-actions button { min-height: 38px; padding: 7px 14px; border: 1px solid rgb(255 255 255 / 70%); border-radius: 7px; background: rgb(0 0 0 / 75%); color: white; cursor: pointer; }
 .detail-preview > audio { width: min(540px, calc(100% - 30px)); }
 .detail-preview > iframe { width: 100%; height: 560px; border: 0; background: white; }
 .detail-preview-fallback { display: grid; justify-items: center; gap: 12px; padding: 25px; color: #e8eee9; text-align: center; }
@@ -615,6 +620,10 @@ body.detail-preview-open { overflow: hidden; }
 .tag-filter-group { display: grid; gap: 7px; }
 .tag-filter-group + .tag-filter-group { padding-top: 9px; border-top: 1px solid var(--line); }
 .tag-filter-group-heading span { color: var(--text-muted); font-size: 10px; }
+.tag-filter-mode { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; white-space: nowrap; color: var(--text); font-size: 11px; cursor: pointer; }
+.tag-filter-mode input { accent-color: var(--green); }
+.tag-filter-group-heading { flex-wrap: wrap; }
+.tag-filter-group-heading > span { flex-basis: 100%; }
 .tag-filter-panel .tag-filter-search { width: min(250px, 100%); }
 .tag-filter-panel .tag-filter-list { display: flex; flex-wrap: wrap; gap: 4px; max-height: 100px; margin-top: 0; }
 .tag-filter-panel .tag-filter-option { min-height: 27px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-subtle); }
