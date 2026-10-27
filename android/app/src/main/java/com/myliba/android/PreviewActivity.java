@@ -355,7 +355,7 @@ public final class PreviewActivity extends Activity {
     private void showVideo() {
         if(videoStarted)return;
         videoStarted=true;
-        showLoading("正在缓冲原片"+(fileSize>0?" · "+formatBytes(fileSize):" · 文件大小未知"),-1);
+        showLoading("正在连接并缓冲视频…",-1);
         if(originalAction!=null)originalAction.setEnabled(false);
         clearContent();
         video = new VideoView(this);

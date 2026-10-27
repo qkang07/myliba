@@ -214,7 +214,14 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(static)))
 	addr := "127.0.0.1:4317"
 	log.Printf("Myliba is ready at http://%s (data: %s)", addr, dataDir)
-	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
+	httpServer := &http.Server{Addr: addr, Handler: securityHeaders(mux)}
+	if handled, err := runWindowsTray(httpServer, hubs); handled {
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	log.Fatal(httpServer.ListenAndServe())
 }
 
 func localSession(w http.ResponseWriter, _ *http.Request) {

@@ -6,7 +6,10 @@ require github.com/mattn/go-sqlite3 v1.14.32
 
 require github.com/coder/websocket v1.8.13
 
+require github.com/godbus/dbus/v5 v5.1.0 // indirect
+
 require (
+	fyne.io/systray v1.12.2
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v3 v3.0.9 // indirect
@@ -25,7 +28,7 @@ require (
 	github.com/pion/turn/v4 v4.1.3 // indirect
 	github.com/pion/webrtc/v4 v4.2.0
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/crypto v0.33.0 // indirect
+	golang.org/x/crypto v0.33.0
 	golang.org/x/net v0.35.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/sys v0.30.0
 )

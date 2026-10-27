@@ -108,6 +108,13 @@ async function start() {
   progress.value = null;
   if (!currentVideo) return;
   if (selected.value === "original") {
+    // Let the browser's media stack issue byte-range requests for local files.
+    // Reading the response into a Blob first would block playback until EOF.
+    if (!props.remote && !props.cloud && !props.shareKey) {
+      currentVideo.src = fileURL(props.id);
+      currentVideo.load();
+      return;
+    }
     if (props.remote || props.cloud || props.shareKey) {
       loading.value = true;
       message.value = "正在读取视频原片…";

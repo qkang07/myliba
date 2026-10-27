@@ -136,6 +136,21 @@ func (h *hubProfiles) setStatus(generation uint64, status string) {
 	h.mu.Unlock()
 }
 
+func (h *hubProfiles) trayState() (active bool, status string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.activeID != "", h.status
+}
+
+func (h *hubProfiles) close() {
+	h.mu.Lock()
+	if h.cancel != nil {
+		h.cancel()
+		h.cancel = nil
+	}
+	h.mu.Unlock()
+}
+
 func (h *hubProfiles) activate(id string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()

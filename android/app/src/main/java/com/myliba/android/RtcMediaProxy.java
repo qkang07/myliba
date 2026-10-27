@@ -35,5 +35,12 @@ final class RtcMediaProxy implements AutoCloseable {
             out.flush();
         }catch(Exception ignored){}
     }
-    @Override public void close(){closed=true;try{listener.close();}catch(IOException ignored){}workers.shutdownNow();client.close();}
+    @Override public void close(){
+        closed=true;
+        try{listener.close();}catch(IOException ignored){}
+        workers.shutdownNow();
+        // Activity teardown runs on the UI thread; closing the RTC WebSocket can
+        // perform a blocking TLS socket write, so dispose the client off-thread.
+        new Thread(client::close,"resource-media-rtc-close").start();
+    }
 }

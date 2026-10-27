@@ -70,7 +70,7 @@ try {
         throw 'Embedded web build is missing'
     }
     $env:GOCACHE = Join-Path $repoRoot '.gocache'
-    & go build -tags sqlite_fts5 -buildvcs=false -o (Join-Path $releaseDir 'myliba.exe') ./cmd/myliba
+    & go build -tags sqlite_fts5 -buildvcs=false -ldflags '-H=windowsgui' -o (Join-Path $releaseDir 'myliba.exe') ./cmd/myliba
     if ($LASTEXITCODE -ne 0) { throw 'Go build failed' }
 } finally {
     Pop-Location
