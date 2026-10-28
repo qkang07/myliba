@@ -50,7 +50,7 @@ final class ResourceNodeRTC {
             Session active=session;
             PeerConnection peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
                 @Override public void onSignalingChange(PeerConnection.SignalingState state){}
-                @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Resource RTC ICE "+state+"; "+WebRtcDiagnostics.network(context));if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(active.peer,"Resource RTC");if(state==PeerConnection.IceConnectionState.FAILED||state==PeerConnection.IceConnectionState.CLOSED){sessions.remove(id,active);active.close();}}
+                @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Resource RTC ICE "+state+"; "+WebRtcDiagnostics.network(context));if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(active.peer,"Resource RTC");if(state==PeerConnection.IceConnectionState.FAILED||state==PeerConnection.IceConnectionState.CLOSED){sessions.remove(id,active);new Thread(active::close,"resource-node-rtc-close").start();}}
                 @Override public void onIceConnectionReceivingChange(boolean value){}
                 @Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){AppLog.info("Resource RTC ICE gathering "+state);}
                 @Override public void onIceCandidate(IceCandidate candidate){AppLog.info("Resource RTC local "+WebRtcDiagnostics.candidate(candidate.sdp));try{sendSignal(id,new JSONObject().put("type","candidate").put("candidate",new JSONObject().put("candidate",candidate.sdp).put("sdpMid",candidate.sdpMid).put("sdpMLineIndex",candidate.sdpMLineIndex)));}catch(Exception failure){AppLog.error("Resource RTC local ICE candidate signaling failed",failure);}}
@@ -97,45 +97,48 @@ final class ResourceNodeRTC {
         if(!done.await(15,TimeUnit.SECONDS)||failure[0]!=null)throw new IOException("RTC SDP failed: "+failure[0]);
     }
     private final class Session implements DataChannel.Observer {
-        final String id;final Map<String,Request> requests=new HashMap<>();final List<IceCandidate> candidates=new ArrayList<>();
+        final String id;final Map<String,Request> requests=new HashMap<>();final Map<String,Request> active=new ConcurrentHashMap<>();final Object sendLock=new Object();final List<IceCandidate> candidates=new ArrayList<>();
         final AtomicBoolean closed=new AtomicBoolean();
         volatile PeerConnection peer;volatile DataChannel channel;volatile boolean remoteReady;
         Session(String id){this.id=id;}
         synchronized void addCandidate(IceCandidate candidate){if(remoteReady&&peer!=null)peer.addIceCandidate(candidate);else candidates.add(candidate);}
         synchronized void flushCandidates(){if(peer!=null)for(IceCandidate candidate:candidates)peer.addIceCandidate(candidate);candidates.clear();}
-        void close(){if(!closed.compareAndSet(false,true))return;DataChannel current=channel;if(current!=null){current.close();current.dispose();}PeerConnection connection=peer;if(connection!=null){connection.close();connection.dispose();}}
+        void close(){if(!closed.compareAndSet(false,true))return;for(Request request:active.values())request.cancelled=true;synchronized(sendLock){DataChannel current=channel;channel=null;PeerConnection connection=peer;peer=null;if(current!=null)current.unregisterObserver();if(connection!=null)connection.close();if(current!=null)current.dispose();if(connection!=null)connection.dispose();}}
         @Override public void onBufferedAmountChange(long amount){}
         @Override public void onStateChange(){AppLog.info("Resource RTC data channel "+(channel==null?"unavailable":channel.state())+"; "+WebRtcDiagnostics.network(context));if(channel!=null&&channel.state()==DataChannel.State.OPEN)WebRtcDiagnostics.selectedPair(peer,"Resource RTC");}
         @Override public synchronized void onMessage(DataChannel.Buffer buffer){
             if(buffer.binary)return;ByteBuffer data=buffer.data;byte[] raw=new byte[data.remaining()];data.get(raw);
             try{JSONObject message=new JSONObject(new String(raw,StandardCharsets.UTF_8));String type=message.optString("type"),requestID=message.optString("id");if(requestID.isEmpty())return;
-                if("request".equals(type))requests.put(requestID,new Request(message));
+                if("request".equals(type)){if(!active.containsKey(requestID)&&!requests.containsKey(requestID))requests.put(requestID,new Request(message));}
                 else if("request-chunk".equals(type)){Request request=requests.get(requestID);if(request!=null)request.add(Base64.decode(message.optString("data",""),Base64.DEFAULT));}
-                else if("request-end".equals(type)){Request request=requests.remove(requestID);if(request!=null)workers.execute(()->serve(request));}
+                else if("request-end".equals(type)){Request request=requests.remove(requestID);if(request!=null){active.put(requestID,request);workers.execute(()->serve(request));}}
+                else if("request-cancel".equals(type)){requests.remove(requestID);Request request=active.get(requestID);if(request!=null)request.cancelled=true;}
             }catch(Exception ignored){}
         }
         private void serve(Request request){
             boolean started=false;long sent=0;
             try(NodeResourceApi.Result result=api.handle(request.method,request.path,request.body.toByteArray(),request.headers)){
+                if(request.cancelled)return;
                 AppLog.info("Resource RTC request status "+result.status);
-                send(new JSONObject().put("type","start").put("id",request.id).put("status",result.status).put("headers",result.headers));
+                send(new JSONObject().put("type","start").put("id",request.id).put("status",result.status).put("headers",result.headers),request);
                 started=true;
-                byte[] buffer=new byte[24<<10];int count;while((count=result.body.read(buffer))!=-1){
-                    send(new JSONObject().put("type","chunk").put("id",request.id).put("data",Base64.encodeToString(buffer,0,count,Base64.NO_WRAP)));
+                byte[] buffer=new byte[24<<10];int count;while(!request.cancelled&&(count=result.body.read(buffer))!=-1){
+                    send(new JSONObject().put("type","chunk").put("id",request.id).put("data",Base64.encodeToString(buffer,0,count,Base64.NO_WRAP)),request);
                     sent+=count;
                 }
                 AppLog.info("Resource RTC response bytes "+sent);
-            }catch(Exception ex){AppLog.error("Resource RTC request failed",ex);try{if(!started)send(new JSONObject().put("type","start").put("id",request.id).put("status",500));else send(new JSONObject().put("type","error").put("id",request.id).put("error","手机文件读取中断"));}catch(Exception ignored){}}
-            finally{try{send(new JSONObject().put("type","end").put("id",request.id));}catch(Exception ignored){}}
+            }catch(Exception ex){if(!request.cancelled){AppLog.error("Resource RTC request failed",ex);try{if(!started)send(new JSONObject().put("type","start").put("id",request.id).put("status",500),request);else send(new JSONObject().put("type","error").put("id",request.id).put("error","手机文件读取中断"),request);}catch(Exception ignored){}}}
+            finally{if(!request.cancelled)try{send(new JSONObject().put("type","end").put("id",request.id),request);}catch(Exception ignored){}active.remove(request.id,request);}
         }
-        private synchronized void send(JSONObject value)throws Exception{
+        private void send(JSONObject value,Request request)throws Exception{synchronized(sendLock){
             DataChannel current=channel;if(current==null)throw new IOException("RTC data channel unavailable");
-            while(current.bufferedAmount()>512<<10){if(current.state()!=DataChannel.State.OPEN)throw new IOException("RTC data channel closed");Thread.sleep(5);}
+            while(current.bufferedAmount()>512<<10){if(closed.get()||request.cancelled||current.state()!=DataChannel.State.OPEN)throw new IOException("RTC request closed");Thread.sleep(5);}
+            if(closed.get()||request.cancelled)throw new IOException("RTC request cancelled");
             if(!current.send(new DataChannel.Buffer(ByteBuffer.wrap(value.toString().getBytes(StandardCharsets.UTF_8)),false)))throw new IOException("RTC send failed");
-        }
+        }}
     }
     private static final class Request {
-        final String id,method,path;final JSONObject headers;final ByteArrayOutputStream body=new ByteArrayOutputStream();
+        final String id,method,path;final JSONObject headers;final ByteArrayOutputStream body=new ByteArrayOutputStream();volatile boolean cancelled;
         Request(JSONObject value)throws Exception{id=value.getString("id");method=value.getString("method");path=value.getString("path");headers=value.optJSONObject("headers")==null?new JSONObject():value.getJSONObject("headers");
             String initial=value.optString("body","");if(!initial.isEmpty())add(Base64.decode(initial,Base64.DEFAULT));}
         void add(byte[] chunk)throws IOException{if(body.size()+chunk.length>2<<20)throw new IOException("request too large");body.write(chunk);}

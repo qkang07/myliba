@@ -216,7 +216,7 @@ onBeforeUnmount(() => {
         <span class="image-lightbox-name" :title="props.name">{{ props.name }}</span>
         <span v-if="props.total" class="image-lightbox-position">{{ props.position }} / {{ props.total }}</span>
         <button v-if="props.total" type="button" class="image-lightbox-details" @click="emit('details')"><ExternalLink :size="16" />详情</button>
-        <button type="button" :disabled="originalLoading || originalShown" @click="showOriginal"><LoaderCircle v-if="originalLoading" class="spin" :size="16" />{{ originalShown ? '原图已加载' : '查看原图' }}</button>
+        <span v-if="/\.arw$/i.test(name)">ARW 内嵌预览</span><button v-else type="button" :disabled="originalLoading || originalShown" @click="showOriginal"><LoaderCircle v-if="originalLoading" class="spin" :size="16" />{{ originalShown ? '原图已加载' : '查看原图' }}</button>
         <button type="button" aria-label="下载原图" title="下载原图" @click="emit('download')"><Download :size="18" /></button>
         <button ref="closeButton" type="button" aria-label="关闭图片预览" title="关闭预览" @click="emit('close')"><X :size="20" /></button>
       </header>

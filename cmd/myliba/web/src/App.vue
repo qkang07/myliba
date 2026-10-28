@@ -456,7 +456,7 @@ function canPreviewInline(contentType: string) {
 function getPreviewMimeType(resource: Resource) {
   const extension = resource.name.split(".").pop()?.toLowerCase() || "";
   const types: Record<string, string> = {
-    avif: "image/avif", bmp: "image/bmp", gif: "image/gif", heic: "image/heic", heif: "image/heif",
+    arw: "image/x-sony-arw", avif: "image/avif", bmp: "image/bmp", gif: "image/gif", heic: "image/heic", heif: "image/heif",
     jpeg: "image/jpeg", jpg: "image/jpeg", png: "image/png", tif: "image/tiff", tiff: "image/tiff", webp: "image/webp",
     mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska", avi: "video/x-msvideo", webm: "video/webm", ogv: "video/ogg",
     mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", oga: "audio/ogg", ogg: "audio/ogg", wav: "audio/wav", flac: "audio/flac",

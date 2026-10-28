@@ -96,7 +96,7 @@ final class LocalLibrary extends SQLiteOpenHelper {
     }
 
     LocalLibrary(Context context) {
-        super(context, "local-library.db", null, 2);
+        super(context, "local-library.db", null, 3);
     }
 
     @Override public void onConfigure(SQLiteDatabase db) {
@@ -113,7 +113,8 @@ final class LocalLibrary extends SQLiteOpenHelper {
     }
 
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        if (oldVersion != 1 || newVersion != 2) throw new IllegalStateException("Missing local library migration from " + oldVersion);
+        if (oldVersion == 2) { db.execSQL("UPDATE items SET kind='image' WHERE lower(name) LIKE '%.arw'"); return; }
+        if (oldVersion != 1) throw new IllegalStateException("Missing local library migration from " + oldVersion);
         createOrganizationTables(db);
         db.execSQL("ALTER TABLE items ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'");
         db.execSQL("ALTER TABLE items ADD COLUMN folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL");
@@ -144,7 +145,7 @@ final class LocalLibrary extends SQLiteOpenHelper {
         if (dot < 0) return "file";
         String ext = name.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
         switch (ext) {
-            case "jpg": case "jpeg": case "png": case "gif": case "webp": case "bmp": case "avif": case "heic": return "image";
+            case "jpg": case "jpeg": case "png": case "gif": case "webp": case "bmp": case "avif": case "heic": case "arw": return "image";
             case "mp4": case "mov": case "mkv": case "avi": case "webm": case "m4v": return "video";
             case "mp3": case "wav": case "flac": case "m4a": case "aac": case "ogg": return "audio";
             case "pdf": return "document";

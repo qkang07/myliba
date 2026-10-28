@@ -134,9 +134,10 @@ final class NodeResourceApi {
         Bitmap bitmap=null;Uri uri=Uri.parse(item.uri);
         try{
             if("video".equals(kind(item))){MediaMetadataRetriever retriever=new MediaMetadataRetriever();try{retriever.setDataSource(context,uri);bitmap=retriever.getFrameAtTime(0);}finally{retriever.release();}}
+            else if(item.name.toLowerCase(java.util.Locale.ROOT).endsWith(".arw")){bitmap=ThumbnailLoader.arwPreview(context,uri);}
             else if("image".equals(kind(item))){BitmapFactory.Options options=new BitmapFactory.Options();options.inJustDecodeBounds=true;try(InputStream in=context.getContentResolver().openInputStream(uri)){BitmapFactory.decodeStream(in,null,options);}int sample=1;while(Math.max(options.outWidth,options.outHeight)/sample>1024)sample*=2;options.inJustDecodeBounds=false;options.inSampleSize=sample;try(InputStream in=context.getContentResolver().openInputStream(uri)){bitmap=BitmapFactory.decodeStream(in,null,options);}}
         }catch(Exception ignored){}
-        if(bitmap==null)return error(404,"暂无缩略图");
+        if(bitmap==null)return error(404,item.name.toLowerCase(java.util.Locale.ROOT).endsWith(".arw")?"ARW 文件没有可用的内嵌 JPEG 预览":"暂无缩略图");
         try{ThumbnailLoader.saveLocalThumbnail(cached,bitmap);}finally{bitmap.recycle();}
         return new Result(200,"image/jpeg",new FileInputStream(cached),cached.length());
     }

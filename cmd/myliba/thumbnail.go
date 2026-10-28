@@ -13,6 +13,7 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -97,6 +98,8 @@ func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
 		log.Printf("thumbnail generation failed for %s: %v", filepath.Base(sourcePath), err)
 		if kind == "video" && s.ffmpegPath == "" {
 			writeError(w, http.StatusNotImplemented, "提取视频首帧需要安装 FFmpeg 并将其加入 PATH")
+		} else if strings.EqualFold(filepath.Ext(sourcePath), ".arw") {
+			writeError(w, http.StatusUnsupportedMediaType, "ARW 文件无法提取内嵌 JPEG 预览")
 		} else {
 			writeError(w, http.StatusUnsupportedMediaType, "无法为该文件生成缩略图")
 		}
@@ -175,7 +178,7 @@ func thumbnailSize(level string) (int, int) {
 }
 
 func (s *server) generateThumbnail(parent context.Context, sourcePath, kind string, width, height int, at float64) ([]byte, error) {
-	if s.ffmpegPath != "" {
+	if s.ffmpegPath != "" && !strings.EqualFold(filepath.Ext(sourcePath), ".arw") {
 		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 		defer cancel()
 		args := []string{"-v", "error", "-nostdin"}
@@ -211,17 +214,25 @@ func makeImageThumbnail(path string, maxWidth, maxHeight int) ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	config, _, err := image.DecodeConfig(file)
+	var input io.ReadSeeker = file
+	if strings.EqualFold(filepath.Ext(path), ".arw") {
+		preview, err := arwPreview(file)
+		if err != nil {
+			return nil, err
+		}
+		input = bytes.NewReader(preview)
+	}
+	config, _, err := image.DecodeConfig(input)
 	if err != nil {
 		return nil, err
 	}
 	if config.Width < 1 || config.Height < 1 || int64(config.Width)*int64(config.Height) > maxImagePixels {
 		return nil, fmt.Errorf("image dimensions are unsupported")
 	}
-	if _, err := file.Seek(0, 0); err != nil {
+	if _, err := input.Seek(0, 0); err != nil {
 		return nil, err
 	}
-	source, _, err := image.Decode(file)
+	source, _, err := image.Decode(input)
 	if err != nil {
 		return nil, err
 	}

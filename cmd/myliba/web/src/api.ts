@@ -1,7 +1,7 @@
 import { waitForWebRTCConnection, webRTCConnected, webRTCFetch } from "./webrtc";
 
 let remoteSession = false;
-const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail|video\/[^/]+\/(?:init|segments\/\d+))|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file|assets\/[^/]+\/parts\/[^/]+|video\/[^/]+\/(?:init|segments\/\d+)))(?:\?|$)/;
+const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail|video-preview|video\/[^/]+\/(?:init|segments\/\d+))|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file|assets\/[^/]+\/parts\/[^/]+|video\/[^/]+\/(?:init|segments\/\d+)))(?:\?|$)/;
 
 export interface Resource {
   id: string;
@@ -610,4 +610,15 @@ export function retryPreprocessJob(id: string) {
 }
 export function retryFailedPreprocessJobs() {
   return request<{ retried: number }>("/api/preprocess/retry-failed", { method: "POST" });
+}
+export interface PreviewClip { start: number; end: number }
+export interface PreviewSpec { quality: "360p" | "720p" | "1080p"; clips: PreviewClip[] }
+export function getVideoPreview(id: string) {
+  return request<{ status: string; error?: string; spec?: PreviewSpec }>(`/api/resources/${encodeURIComponent(id)}/video-preview`);
+}
+export function createVideoPreview(id: string, spec: PreviewSpec) {
+  return request<{ status: string }>(`/api/resources/${encodeURIComponent(id)}/video-preview`, { method: "POST", body: JSON.stringify(spec) });
+}
+export function getVideoPreviewFile(id: string) {
+  return apiFetch(`/api/resources/${encodeURIComponent(id)}/video-preview?file=1`);
 }

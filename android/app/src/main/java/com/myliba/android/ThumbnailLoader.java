@@ -74,11 +74,13 @@ final class ThumbnailLoader {
             }
             uri=Uri.parse(localUri);
         }else uri=Uri.parse(e.id);
+        if(e.name.toLowerCase(java.util.Locale.ROOT).endsWith(".arw"))return fitMobile(arwPreview(context,uri));
         if(Build.VERSION.SDK_INT>=29){try{return fitMobile(context.getContentResolver().loadThumbnail(uri,new Size(720,960),null));}catch(Exception ignored){}}
         if(e.kind.equals("video"))return videoFrame(context,uri,0);
         if(e.mime.equals("application/pdf")){try(ParcelFileDescriptor fd=context.getContentResolver().openFileDescriptor(uri,"r");PdfRenderer r=new PdfRenderer(fd);PdfRenderer.Page p=r.openPage(0)){float scale=Math.min(1f,Math.min(720f/p.getWidth(),960f/p.getHeight()));Bitmap b=Bitmap.createBitmap(Math.max(1,Math.round(p.getWidth()*scale)),Math.max(1,Math.round(p.getHeight()*scale)),Bitmap.Config.ARGB_8888);b.eraseColor(Color.WHITE);p.render(b,null,null,PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);return b;}}
         BitmapFactory.Options options=new BitmapFactory.Options();options.inJustDecodeBounds=true;try(InputStream in=context.getContentResolver().openInputStream(uri)){BitmapFactory.decodeStream(in,null,options);}options.inJustDecodeBounds=false;options.inSampleSize=1;while(options.outWidth/options.inSampleSize>720||options.outHeight/options.inSampleSize>960)options.inSampleSize*=2;options.inPreferredConfig=Bitmap.Config.RGB_565;try(InputStream in=context.getContentResolver().openInputStream(uri)){return fitMobile(BitmapFactory.decodeStream(in,null,options));}
     }
+    static Bitmap arwPreview(Context context,Uri uri)throws IOException{return ArwPreview.decode(context,uri);}
     private static Bitmap fitMobile(Bitmap source){
         return fit(source,720,960);
     }

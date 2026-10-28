@@ -88,6 +88,7 @@ public final class PreviewActivity extends Activity {
         fileSize=getIntent().getLongExtra("size",-1);
         String name = getIntent().getStringExtra("name");
         if (name == null) name = "文件预览";
+        if(name.toLowerCase(java.util.Locale.ROOT).endsWith(".arw"))mime="image/x-sony-arw";
         browseIds=getIntent().getStringArrayListExtra("browse_ids");browseNames=getIntent().getStringArrayListExtra("browse_names");browseMimes=getIntent().getStringArrayListExtra("browse_mimes");browseIndex=getIntent().getIntExtra("browse_index",-1);
         boolean media=mime.startsWith("image/")||mime.startsWith("video/");
 
@@ -118,7 +119,7 @@ public final class PreviewActivity extends Activity {
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         toolbar.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        if(mime.startsWith("image/")||mime.startsWith("video/")){
+        if((mime.startsWith("image/")&&!mime.equals("image/x-sony-arw"))||mime.startsWith("video/")){
             originalAction=button(mime.startsWith("image/")?"查看原图":"播放原片",mime.startsWith("image/")?this::showOriginalImage:this::showVideo);
             toolbar.addView(originalAction);
         }
@@ -185,6 +186,7 @@ public final class PreviewActivity extends Activity {
                         catch(RemoteClient.Failure missing){if(missing.status!=404)throw missing;client.json("POST",path,null);bytes.reset();downloadWithProgress(client,path,bytes,-1,"正在加载预览图");}
                         byte[] data=bytes.toByteArray();bitmap=BitmapFactory.decodeByteArray(data,0,data.length);
                     }finally{client.close();}
+                }else if(mime.equals("image/x-sony-arw")){bitmap=ThumbnailLoader.arwPreview(this,fileUri);
                 }else if(Build.VERSION.SDK_INT>=29){
                     try{bitmap=getContentResolver().loadThumbnail(fileUri,new Size(720,960),null);}
                     catch(Exception ignored){bitmap=decodeImage(mime.startsWith("video/")?0:960);}

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { ArrowLeft, Check, CircleAlert, Copy, Download, Expand, File, FileText, Image, Link2, LoaderCircle, Minimize, Music2, Play, Plus, RefreshCw, Tag, Trash2 } from "@lucide/vue";
 import ImagePreview from "./ImagePreview.vue";
 import StreamingVideo from "./StreamingVideo.vue";
+import VideoPreviewEditor from "./VideoPreviewEditor.vue";
 import {
   addResourceTag, createFileShare, createThumbnailVariant, fileURL, getResource, getResourceFile, getResourceThumbnailVariant, listFileShares, revokeFileShare, uploadResourceToCloud,
   getTagSuggestions, getTags, getVideoInfo, moveResourcesToFolder, removeResourceTag,
@@ -42,7 +43,7 @@ let generation = 0;
 const mimeType = computed(() => {
   const ext = resource.value?.name.split(".").pop()?.toLowerCase() || "";
   const types: Record<string, string> = {
-    avif: "image/avif", bmp: "image/bmp", gif: "image/gif", jpeg: "image/jpeg", jpg: "image/jpeg",
+    arw: "image/x-sony-arw", avif: "image/avif", bmp: "image/bmp", gif: "image/gif", jpeg: "image/jpeg", jpg: "image/jpeg",
     png: "image/png", tif: "image/tiff", tiff: "image/tiff", webp: "image/webp",
     mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska", avi: "video/x-msvideo", webm: "video/webm", ogv: "video/ogg",
     mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", oga: "audio/ogg", ogg: "audio/ogg",
@@ -379,6 +380,7 @@ onBeforeUnmount(() => {
               </article>
             </div>
           </section>
+          <VideoPreviewEditor v-if="resource.available && resource.kind === 'video' && !phoneNode" :id="resource.id" :duration="duration" />
           <section v-if="resource.available && resource.kind === 'video' && !phoneNode" class="detail-panel">
             <div class="detail-panel-heading"><div><h2>分段截图</h2><p>{{ duration ? `视频时长 ${formatTime(duration)}，均分为 6 段并截取每段中点。` : durationError || "正在读取视频时长…" }}</p></div><button v-if="captures.length" class="button button-secondary" :disabled="captureBusy" @click="generateAllCaptures"><LoaderCircle v-if="captureBusy" class="spin" :size="14" /><Image v-else :size="14" />生成全部</button></div>
             <div v-if="captures.length" class="detail-captures">

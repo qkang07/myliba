@@ -37,6 +37,7 @@ type nodeRTCSession struct {
 	dataSendMu sync.Mutex
 	requestMu  sync.Mutex
 	requests   map[string]*rtcRequest
+	active     map[string]context.CancelFunc
 	localQueue []rtcSignal
 	answerSent bool
 	closeOnce  sync.Once
@@ -101,7 +102,7 @@ func (m *nodeRTCManager) acceptOffer(sessionID, shareID string, offer webrtc.Ses
 		m.sendSignal(sessionID, rtcSignal{Type: "error"})
 		return
 	}
-	session := &nodeRTCSession{peer: peer, shareID: shareID, requests: map[string]*rtcRequest{}}
+	session := &nodeRTCSession{peer: peer, shareID: shareID, requests: map[string]*rtcRequest{}, active: map[string]context.CancelFunc{}}
 	m.mu.Lock()
 	previous := m.sessions[sessionID]
 	m.sessions[sessionID] = session
@@ -184,7 +185,7 @@ func (m *nodeRTCManager) handleDataMessage(session *nodeRTCSession, channel *web
 	session.requestMu.Lock()
 	switch message.Type {
 	case "request":
-		if _, exists := session.requests[message.ID]; !exists {
+		if _, exists := session.requests[message.ID]; !exists && session.active[message.ID] == nil {
 			session.requests[message.ID] = &rtcRequest{request: message}
 		}
 	case "request-chunk":
@@ -199,16 +200,30 @@ func (m *nodeRTCManager) handleDataMessage(session *nodeRTCSession, channel *web
 	case "request-end":
 		request := session.requests[message.ID]
 		delete(session.requests, message.ID)
+		var ctx context.Context
+		if request != nil && !request.tooLarge {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.Background(), 2*time.Hour)
+			if session.active == nil {
+				session.active = make(map[string]context.CancelFunc)
+			}
+			session.active[message.ID] = cancel
+		}
 		session.requestMu.Unlock()
 		if request != nil {
 			if request.tooLarge {
 				go m.sendRTCError(session, channel, request.request.ID, http.StatusRequestEntityTooLarge, "request body too large")
 			} else {
 				request.request.Body = request.body.Bytes()
-				go m.serveRTCRequest(session, channel, request.request)
+				go m.serveRTCRequest(ctx, session, channel, request.request)
 			}
 		}
 		return
+	case "request-cancel":
+		delete(session.requests, message.ID)
+		if cancel := session.active[message.ID]; cancel != nil {
+			cancel()
+		}
 	}
 	session.requestMu.Unlock()
 }
@@ -224,10 +239,19 @@ func (m *nodeRTCManager) sendRTCError(session *nodeRTCSession, channel *webrtc.D
 	_ = channel.SendText(string(data))
 }
 
-func (m *nodeRTCManager) serveRTCRequest(session *nodeRTCSession, channel *webrtc.DataChannel, input wireMessage) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
-	defer cancel()
+func (m *nodeRTCManager) serveRTCRequest(ctx context.Context, session *nodeRTCSession, channel *webrtc.DataChannel, input wireMessage) {
+	defer func() {
+		session.requestMu.Lock()
+		if cancel := session.active[input.ID]; cancel != nil {
+			cancel()
+			delete(session.active, input.ID)
+		}
+		session.requestMu.Unlock()
+	}()
 	write := func(message wireMessage) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		data, err := json.Marshal(message)
 		if err != nil {
 			return err
@@ -235,6 +259,9 @@ func (m *nodeRTCManager) serveRTCRequest(session *nodeRTCSession, channel *webrt
 		session.dataSendMu.Lock()
 		defer session.dataSendMu.Unlock()
 		for channel.BufferedAmount() > 1<<20 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if channel.ReadyState() != webrtc.DataChannelStateOpen {
 				return errors.New("WebRTC data channel is closed")
 			}
@@ -343,6 +370,11 @@ func (m *nodeRTCManager) closeAll() {
 
 func (s *nodeRTCSession) close() {
 	s.closeOnce.Do(func() {
+		s.requestMu.Lock()
+		for _, cancel := range s.active {
+			cancel()
+		}
+		s.requestMu.Unlock()
 		if s.peer != nil {
 			_ = s.peer.Close()
 		}

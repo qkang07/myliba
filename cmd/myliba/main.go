@@ -171,6 +171,8 @@ func main() {
 	mux.HandleFunc("POST /api/media-stores", app.addMediaStore)
 	mux.HandleFunc("PUT /api/media-stores/{id}/default", app.selectMediaStore)
 	mux.HandleFunc("GET /api/resources/{id}/video-info", app.videoInfo)
+	mux.HandleFunc("GET /api/resources/{id}/video-preview", app.videoPreview)
+	mux.HandleFunc("POST /api/resources/{id}/video-preview", app.videoPreview)
 	mux.HandleFunc("GET /api/resources/{id}/video/{quality}", app.videoVariant)
 	mux.HandleFunc("POST /api/resources/{id}/video/{quality}", app.videoVariant)
 	mux.HandleFunc("GET /api/resources/{id}/video/{quality}/init", app.videoInit)
@@ -367,6 +369,9 @@ CREATE TABLE IF NOT EXISTS file_asset_locations (
 	columns.Close()
 	if !hasAutoPreprocess {
 		_, err = db.Exec(`ALTER TABLE roots ADD COLUMN auto_preprocess INTEGER NOT NULL DEFAULT 1`)
+	}
+	if err == nil {
+		_, err = db.Exec(`UPDATE resources SET kind='image' WHERE lower(name) LIKE '%.arw' AND kind <> 'image'`)
 	}
 	return err
 }
@@ -1055,7 +1060,7 @@ func safeInlineContentType(contentType string) bool {
 
 func fileKind(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".heic":
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".heic", ".arw":
 		return "image"
 	case ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v":
 		return "video"

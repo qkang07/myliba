@@ -16,6 +16,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Native counterpart of the Hub browser's authenticated RTC API channel. */
 final class RemoteRTC implements AutoCloseable {
     interface ResponseStart {void onStart(int status,JSONObject headers)throws Exception;}
+    private static final class ConsumerFailure extends IOException {
+        ConsumerFailure(Exception cause){super("媒体读取方已关闭",cause);}
+    }
     static final class Reply {final int status;final JSONObject headers;final byte[] body;Reply(int status,JSONObject headers,byte[] body){this.status=status;this.headers=headers;this.body=body;}}
     private final Context context;private final String base;
     private volatile String cookie;
@@ -172,14 +175,18 @@ final class RemoteRTC implements AutoCloseable {
             int status=0;JSONObject responseHeaders=new JSONObject();long total=0;
             while(true){JSONObject message=queue.poll(30,TimeUnit.SECONDS);if(message==null||!connected())throw new IOException("RTC 文件传输中断");
                 String type=message.optString("type");
-                if("start".equals(type)){status=message.optInt("status",502);responseHeaders=message.optJSONObject("headers");if(responseHeaders==null)responseHeaders=new JSONObject();if(startHandler!=null)startHandler.onStart(status,responseHeaders);}
-                else if("chunk".equals(type)){byte[] chunk=Base64.decode(message.optString("data",""),Base64.DEFAULT);total+=chunk.length;if(total>max)throw new IOException("响应内容过大");output.write(chunk);}
+                if("start".equals(type)){status=message.optInt("status",502);responseHeaders=message.optJSONObject("headers");if(responseHeaders==null)responseHeaders=new JSONObject();if(startHandler!=null)try{startHandler.onStart(status,responseHeaders);}catch(Exception ex){throw new ConsumerFailure(ex);}}
+                else if("chunk".equals(type)){byte[] chunk=Base64.decode(message.optString("data",""),Base64.DEFAULT);total+=chunk.length;if(total>max)throw new IOException("响应内容过大");try{output.write(chunk);}catch(IOException ex){throw new ConsumerFailure(ex);}}
                 else if("error".equals(type))throw new IOException(message.optString("error","RTC 文件传输中断"));
                 else if("end".equals(type)){if(status==0)throw new IOException("RTC 响应无状态");JSONArray lengths=responseHeaders.optJSONArray("Content-Length");
                     if(lengths!=null&&lengths.length()>0){try{long expected=Long.parseLong(lengths.optString(0));if(expected!=total)throw new IOException("RTC 传输不完整");}catch(NumberFormatException ignored){}}
                     AppLog.info("Remote RTC response status "+status+" bytes "+total);
                     return new Reply(status,responseHeaders,new byte[0]);}
             }
+        }catch(ConsumerFailure failure){
+            AppLog.info("Remote RTC response consumer closed; cancelling request");
+            try{if(channel==requestChannel&&connected())send(new JSONObject().put("type","request-cancel").put("id",id));}catch(Exception ignored){}
+            throw failure;
         }catch(Exception failure){AppLog.error("Remote RTC request failed",failure);if(channel==requestChannel)closeConnection();throw failure;}finally{pending.remove(id);}
     }
     private synchronized void send(JSONObject value)throws Exception{
@@ -188,8 +195,13 @@ final class RemoteRTC implements AutoCloseable {
         if(!current.send(new DataChannel.Buffer(ByteBuffer.wrap(value.toString().getBytes(StandardCharsets.UTF_8)),false)))throw new IOException("RTC send failed");
     }
     private void closeConnection(){synchronized(lock){
-        HubWebSocket old=socket;socket=null;if(old!=null)old.close();DataChannel data=channel;channel=null;if(data!=null){data.close();data.dispose();}
-        PeerConnection connection=peer;peer=null;if(connection!=null){connection.close();connection.dispose();}remoteReady=false;earlyCandidates.clear();connectionEpoch=-1;
+        HubWebSocket old=socket;socket=null;if(old!=null)old.close();DataChannel data=channel;channel=null;
+        PeerConnection connection=peer;peer=null;
+        if(data!=null)data.unregisterObserver();
+        if(connection!=null)connection.close();
+        if(data!=null)data.dispose();
+        if(connection!=null)connection.dispose();
+        remoteReady=false;earlyCandidates.clear();connectionEpoch=-1;
         for(BlockingQueue<JSONObject> queue:pending.values())queue.offer(new JSONObject());
     }}
     @Override public void close(){closed=true;CountDownLatch connecting=connectingLatch;if(connecting!=null)connecting.countDown();synchronized(lock){wantsConnection=false;if(watchingNetwork&&connectivity!=null){connectivity.unregisterNetworkCallback(networkCallback);watchingNetwork=false;}closeConnection();if(factory!=null){factory.dispose();factory=null;}}}

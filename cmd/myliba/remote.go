@@ -741,7 +741,7 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet
 	case len(parts) == 4 && parts[1] == "resources" && parts[3] == "tags":
 		return method == http.MethodPost
-	case len(parts) == 4 && parts[1] == "resources" && parts[3] == "thumbnail":
+	case len(parts) == 4 && parts[1] == "resources" && (parts[3] == "thumbnail" || parts[3] == "video-preview"):
 		return method == http.MethodGet || method == http.MethodPost
 	case len(parts) == 5 && parts[1] == "resources" && parts[3] == "tags":
 		return method == http.MethodDelete
@@ -782,7 +782,7 @@ func hubRelayContentPath(path string) bool {
 		return false
 	}
 	if parts[1] == "resources" {
-		return parts[3] == "file" || parts[3] == "thumbnail" || parts[3] == "video" && len(parts) > 5
+		return parts[3] == "file" || parts[3] == "thumbnail" || parts[3] == "video-preview" || parts[3] == "video" && len(parts) > 5
 	}
 	if parts[1] == "cloud" && len(parts) >= 5 && parts[2] == "files" {
 		return parts[4] == "file" || parts[4] == "assets" || parts[4] == "video" && len(parts) > 6 || parts[4] == "versions" && len(parts) > 6 && parts[6] == "file"
