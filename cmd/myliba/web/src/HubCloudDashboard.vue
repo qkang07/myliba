@@ -36,6 +36,21 @@ function time(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "未知" : date.toLocaleString();
 }
+function pathName(path: string) {
+  return ({ lan: "局域网 TLS", webrtc: "WebRTC", https: "HTTPS", relay: "存储节点中继", direct: "HTTPS" } as Record<string, string>)[path] ?? path;
+}
+function speed(value?: number) {
+  if (!value) return "未测出吞吐";
+  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
+  return `${value.toFixed(1)} ${units[index]}`;
+}
+function checkDetail(path: string, check: { state: string; rttMillis?: number; connectMillis?: number; speedBps?: number }) {
+  if (check.state !== "connected") return "不可达";
+  const latency = path === "webrtc" ? `建链 ${check.connectMillis ?? "?"} ms` : `${check.rttMillis ?? "?"} ms`;
+  return `可达 · ${latency} · ${speed(check.speedBps)}`;
+}
 watch(open, (value) => {
   if (timer) clearInterval(timer);
   timer = value ? setInterval(() => void refresh(), 10000) : undefined;
@@ -74,7 +89,10 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
               <small class="hub-cloud-endpoint">{{ node.endpoint || "当前无访问地址" }}</small>
               <div class="hub-cloud-node-metrics"><span>{{ node.statsReady ? node.blockCount : "未知" }} 块</span><span>副本占用 {{ size(node.blockBytes) }}</span><span>可用 {{ size(node.availableBytes) }} / {{ size(node.capacityBytes) }}</span><span>{{ node.statsReady ? node.catalogCount : "未知" }} 条索引</span></div>
 			  <div v-if="node.online && node.links && Object.keys(node.links).length" class="hub-cloud-links">
-			    <small v-for="[target, link] in Object.entries(node.links)" :key="target">→ {{ target.slice(0, 12) }}：{{ link.state === "connected" ? ({ lan: "局域网直连", webrtc: "WebRTC 直连", direct: "HTTPS 直连" }[link.path || "direct"]) : link.state === "checking" ? "检测中" : "当前不可达" }}</small>
+			    <div v-for="[target, link] in Object.entries(node.links)" :key="target">
+			      <small>→ {{ target.slice(0, 12) }}：{{ link.state === "connected" ? `首选 ${pathName(link.path || "")}` : link.state === "checking" ? "检测中" : "当前不可达" }}<template v-if="link.checkedAt"> · {{ time(link.checkedAt) }}</template></small>
+			      <small v-for="[path, check] in Object.entries(link.checks || {})" :key="path" class="hub-cloud-endpoint">{{ pathName(path) }}：{{ checkDetail(path, check) }}</small>
+			    </div>
 			  </div>
               <button v-if="!node.online" class="quiet-button" type="button" :aria-label="`移除离线节点 ${node.id}`" @click="removeNode(node)">移除离线记录</button>
             </div>

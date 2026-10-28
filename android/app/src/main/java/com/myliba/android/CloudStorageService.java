@@ -20,7 +20,7 @@ public final class CloudStorageService extends Service {
     static volatile long blockCount,catalogCount,capacityBytes,availableBytes;
     static volatile String activeBackend="disk";
     static volatile boolean relayConnected;
-	static final ConcurrentHashMap<String,String> peerLinks=new ConcurrentHashMap<>();
+	static final ConcurrentHashMap<String,JSONObject> peerLinks=new ConcurrentHashMap<>();
 	private final Set<String> probingPeers=ConcurrentHashMap.newKeySet();
     private final ExecutorService workers=Executors.newFixedThreadPool(12);
     private ServerSocket listener;
@@ -131,6 +131,7 @@ public final class CloudStorageService extends Service {
             if(!verifyPeer(suppliedToken))return new PeerResult(401,new byte[0]);
 			if("GET".equals(method)&&"/cloud/ping".equals(path))return new PeerResult(204,new byte[0]);
             URI uri=new URI(path);String route=uri.getPath();
+			if("GET".equals(method)&&"/cloud/diagnostic-payload".equals(route)){int size=diagnosticSize(uri);return size<1?new PeerResult(400,new byte[0]):new PeerResult(200,new byte[size]);}
             if("GET".equals(method)&&"/cloud/catalog".equals(route))return new PeerResult(200,json(new JSONObject().put("records",new JSONArray(list("catalog")))));
             if("GET".equals(method)&&"/cloud/inventory".equals(route)){
                 String after=uri.getRawQuery()==null?"":uri.getRawQuery().replaceFirst("^after=","");if(!after.isEmpty()&&!validId(after))return new PeerResult(400,new byte[0]);
@@ -152,6 +153,7 @@ public final class CloudStorageService extends Service {
             String authorization=headers.getOrDefault("authorization","");
             if(!authorization.startsWith("Bearer ")||!verifyPeer(authorization.substring(7))){respond(out,401,"text/plain",new byte[0],false);return;}
 			if("GET".equals(method)&&"/cloud/ping".equals(route)){respond(out,204,"text/plain",new byte[0],false);return;}
+			if("GET".equals(method)&&"/cloud/diagnostic-payload".equals(route)){int size=diagnosticSize(uri);respond(out,size<1?400:200,"application/octet-stream",size<1?new byte[0]:new byte[size],false);return;}
             if("GET".equals(method)&&"/cloud/catalog".equals(route)){try{respond(out,200,"application/json",json(new JSONObject().put("records",new JSONArray(list("catalog")))),false);}catch(Exception ex){respond(out,503,"text/plain",new byte[0],false);}return;}
             if("GET".equals(method)&&"/cloud/inventory".equals(route)){
                 String after="";if(uri.getRawQuery()!=null)for(String p:uri.getRawQuery().split("&"))if(p.startsWith("after="))after=URLDecoder.decode(p.substring(6),"UTF-8");
@@ -167,6 +169,7 @@ public final class CloudStorageService extends Service {
             respond(out,400,"text/plain",new byte[0],false);
         }catch(Exception ignored){}
     }
+    private static int diagnosticSize(URI uri){try{String query=uri.getRawQuery();if(query==null||!query.startsWith("bytes=")||query.indexOf('&')>=0)return -1;int size=Integer.parseInt(query.substring(6));return size>0&&size<=(1<<20)?size:-1;}catch(Exception ex){return -1;}}
     private HttpURLConnection hubRequest(String method,String path,byte[] data)throws Exception{
         String base=hub.replaceFirst("^wss:","https:").replaceFirst("^ws:","http:").replaceAll("/node/?$","");
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();c.setRequestMethod(method);c.setConnectTimeout(10000);c.setReadTimeout(30000);c.setInstanceFollowRedirects(false);c.setRequestProperty("Authorization","Bearer "+token);
@@ -178,26 +181,34 @@ public final class CloudStorageService extends Service {
 			JSONObject node=nodes.optJSONObject(i);if(node==null)continue;
 			String id=node.optString("id"),endpoint=node.optString("endpoint");
 			if(id.equals(nodeId)||!id.matches("[0-9a-f]{32}"))continue;
-			active.add(id);peerLinks.putIfAbsent(id,"检测中");
+			active.add(id);peerLinks.putIfAbsent(id,checkingPeerLink());
 			if(!probingPeers.add(id))continue;
 			try{probes.execute(()->{
 				try{
-				String result="不可达";
-				try{
-					JSONArray addresses=node.optJSONArray("lan");String key=node.optString("lanKey");
-					if(addresses!=null&&addresses.length()>0){String grant=peerGrant();if(!grant.isEmpty()&&CloudLan.request(addresses,key,"GET","/cloud/ping",grant,null).status==204)result="局域网直连";}
-				}catch(Exception ex){AppLog.info("Cloud LAN probe "+id+": "+ex.getMessage());}
-				if(result.equals("不可达"))try{
-					PeerResult response=null;
-					if(endpoint.equals("p2p://"+id)&&peerClient!=null)response=peerClient.request(id,"GET","/cloud/ping",null);
-					else if(endpoint.startsWith("https://")){String grant=peerGrant();if(!grant.isEmpty())response=httpsPeerRequest(endpoint,"GET","/cloud/ping",grant,null);}
-					if(response!=null&&response.status==204)result=endpoint.startsWith("p2p://")?"WebRTC 直连":"HTTPS 直连";
-				}catch(Exception ex){AppLog.info("Cloud peer probe "+id+": "+ex.getMessage());}
+				JSONObject checks=new JSONObject();JSONArray addresses=node.optJSONArray("lan");String key=node.optString("lanKey");
+				if(addresses!=null&&addresses.length()>0)try{checks.put("lan",probePath(path->{String grant=peerGrant();if(grant.isEmpty())throw new IOException("cloud grant unavailable");return CloudLan.request(addresses,key,"GET",path,grant,null);},false));}catch(Exception ex){AppLog.info("Cloud LAN probe "+id+": "+ex.getMessage());}
+				if(endpoint.equals("p2p://"+id)&&peerClient!=null)try{checks.put("webrtc",probePath(path->peerClient.request(id,"GET",path,null),true));}catch(Exception ex){AppLog.info("Cloud WebRTC probe "+id+": "+ex.getMessage());}
+				else if(endpoint.startsWith("https://"))try{String path=endpoint.contains("/cloud/relay/")?"relay":"https";checks.put(path,probePath(route->{String grant=peerGrant();if(grant.isEmpty())throw new IOException("cloud grant unavailable");return httpsPeerRequest(endpoint,"GET",route,grant,null);},false));}catch(Exception ex){AppLog.info("Cloud HTTPS probe "+id+": "+ex.getMessage());}
+				JSONObject result=new JSONObject().put("state","unreachable").put("checkedAt",peerCheckTime()).put("checks",checks);
+				for(String path:new String[]{"lan","webrtc","https","relay"}){JSONObject check=checks.optJSONObject(path);if(check!=null&&"connected".equals(check.optString("state"))){result.put("state","connected").put("path",path);break;}}
 				if(!stopped)peerLinks.put(id,result);
+				}catch(Exception ex){AppLog.error("Cloud peer diagnostics failed for "+id,ex);
 				}finally{probingPeers.remove(id);}
 			});}catch(RejectedExecutionException ignored){probingPeers.remove(id);}
 		}
 		peerLinks.keySet().retainAll(active);
+	}
+	private interface PeerProbe {PeerResult request(String path)throws Exception;}
+	private static JSONObject checkingPeerLink(){try{return new JSONObject().put("state","checking");}catch(Exception ignored){return new JSONObject();}}
+	private static String peerCheckTime(){java.text.SimpleDateFormat format=new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",Locale.ROOT);format.setTimeZone(TimeZone.getTimeZone("UTC"));return format.format(new Date());}
+	private JSONObject probePath(PeerProbe probe,boolean negotiated)throws Exception{
+		if(negotiated){long start=SystemClock.elapsedRealtime();PeerResult sample=probe.request("/cloud/diagnostic-payload?bytes=262144");long elapsed=SystemClock.elapsedRealtime()-start;JSONObject check=new JSONObject().put("state",sample!=null&&sample.status==200&&sample.data.length>0?"connected":"unreachable").put("connectMillis",elapsed);if(sample!=null&&sample.status==200&&sample.data.length>0&&elapsed>0)check.put("speedBps",sample.data.length*1000L/elapsed);return check;}
+		long total=0;
+		for(int i=0;i<3;i++){long start=SystemClock.elapsedRealtime();PeerResult result=probe.request("/cloud/ping");if(result==null||result.status!=204)return new JSONObject().put("state","unreachable");total+=SystemClock.elapsedRealtime()-start;}
+		JSONObject check=new JSONObject().put("state","connected").put("rttMillis",total/3);
+		long start=SystemClock.elapsedRealtime();PeerResult sample=probe.request("/cloud/diagnostic-payload?bytes=262144");long elapsed=SystemClock.elapsedRealtime()-start;
+		if(sample!=null&&sample.status==200&&sample.data.length>0&&elapsed>0)check.put("speedBps",sample.data.length*1000L/elapsed);
+		return check;
 	}
 	private static PeerResult httpsPeerRequest(String endpoint,String method,String path,String grant,byte[] data)throws Exception{
 		HttpURLConnection connection=(HttpURLConnection)new URL(endpoint+path).openConnection();
@@ -213,7 +224,7 @@ public final class CloudStorageService extends Service {
         String advertised=publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)&&(relayClient==null||!relayClient.isConnected())?"":publicUrl;
         JSONObject node=new JSONObject().put("id",nodeId).put("endpoint",advertised).put("relayed",publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)).put("role","storage");
 		if(lan!=null){JSONArray addresses=lan.addresses();if(addresses.length()>0)node.put("lan",addresses).put("lanKey",lan.fingerprint);}
-		JSONObject links=new JSONObject();int reported=0;for(Map.Entry<String,String> entry:peerLinks.entrySet()){if(reported++>=64)break;String value=entry.getValue();String path=value.startsWith("局域网")?"lan":value.startsWith("WebRTC")?"webrtc":value.startsWith("HTTPS")?"direct":"";links.put(entry.getKey(),new JSONObject().put("state",value.equals("检测中")?"checking":value.equals("不可达")?"unreachable":"connected").put("path",path));}node.put("links",links);
+		JSONObject links=new JSONObject();int reported=0;for(Map.Entry<String,JSONObject> entry:peerLinks.entrySet()){if(reported++>=64)break;links.put(entry.getKey(),entry.getValue());}node.put("links",links);
         List<String> blocks=list("blocks"),catalog=list("catalog");
         blockCount=blocks.size();catalogCount=catalog.size();capacityBytes=openlist==null?root.getTotalSpace():0;availableBytes=openlist==null?root.getUsableSpace():0;
         node.put("backend",backend).put("statsReady",true).put("blockCount",blocks.size()).put("catalogCount",catalog.size());

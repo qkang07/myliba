@@ -136,6 +136,7 @@ final class RemoteClient {
         rtc.close();rtc=new RemoteRTC(context,base);rtcConfigured=false;json("GET","/api/session",null);return result;
     }
     boolean directConnected(){return rtc.connected();}
+    String connectionDetails(){return rtc.connectionSummary();}
     void close(){rtc.close();}
     private static boolean contentPath(String path){
         return path.matches("/api/resources/[^/]+/(file|thumbnail)(\\?.*)?")||path.matches("/api/resources/[^/]+/video/.*")||path.matches("/api/cloud/files/[^/]+/(file|assets/.*|video/.*|versions/.*/file)(\\?.*)?");

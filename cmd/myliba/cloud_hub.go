@@ -75,8 +75,13 @@ func validCloudNode(node cloudNode) bool {
 		return false
 	}
 	for id, status := range node.Links {
-		if !validCloudNodeID(id) || (status.State != "checking" && status.State != "connected" && status.State != "unreachable") || (status.Path != "" && status.Path != "lan" && status.Path != "webrtc" && status.Path != "direct") {
+		if !validCloudNodeID(id) || (status.State != "checking" && status.State != "connected" && status.State != "unreachable") || (status.Path != "" && status.Path != "lan" && status.Path != "webrtc" && status.Path != "https" && status.Path != "relay" && status.Path != "direct") || len(status.Checks) > 4 {
 			return false
+		}
+		for path, check := range status.Checks {
+			if (path != "lan" && path != "webrtc" && path != "https" && path != "relay") || (check.State != "connected" && check.State != "unreachable") || check.RTTMillis < 0 || check.RTTMillis > 60000 || check.ConnectMillis < 0 || check.ConnectMillis > 60000 || check.SpeedBps < 0 || check.SpeedBps > 1<<40 {
+				return false
+			}
 		}
 	}
 	if relayID := cloudRelayEndpointID(node.Endpoint); (relayID != "" && node.ID != relayID) || (node.Relayed && node.Endpoint != "" && relayID == "") {

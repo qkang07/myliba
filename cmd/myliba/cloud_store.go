@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -278,6 +279,15 @@ func (d *cloudDisk) routes(mux *http.ServeMux, token string) {
 func (d *cloudDisk) routesWithAuth(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
 	mux.Handle("GET /cloud/ping", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
+	})))
+	mux.Handle("GET /cloud/diagnostic-payload", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		size, err := strconv.Atoi(r.URL.Query().Get("bytes"))
+		if err != nil || size < 1 || size > 1<<20 {
+			http.Error(w, "invalid diagnostic size", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(make([]byte, size))
 	})))
 	mux.Handle("GET /cloud/inventory", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		after := r.URL.Query().Get("after")

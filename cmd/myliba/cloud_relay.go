@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,6 +80,18 @@ func cloudRelayPath(method, path string) bool {
 	u, err := url.ParseRequestURI(path)
 	if err != nil || u.Fragment != "" || u.RawPath != "" {
 		return false
+	}
+	if method == http.MethodGet && u.Path == "/cloud/ping" {
+		return u.RawQuery == ""
+	}
+	if method == http.MethodGet && u.Path == "/cloud/diagnostic-payload" {
+		query := u.Query()
+		values, ok := query["bytes"]
+		if !ok || len(query) != 1 || len(values) != 1 {
+			return false
+		}
+		size, err := strconv.Atoi(values[0])
+		return err == nil && size > 0 && size <= 1<<20
 	}
 	if method == http.MethodGet && u.Path == "/cloud/inventory" {
 		return u.RawQuery == "" || (len(u.Query()) == 1 && validCloudHash(u.Query().Get("after")))

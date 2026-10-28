@@ -24,6 +24,9 @@ let offerSent = false;
 let localCandidates: RTCIceCandidateInit[] = [];
 let remoteCandidates: RTCIceCandidateInit[] = [];
 let remoteDescriptionSet = false;
+let selectedPathSummary = "";
+
+export function webRTCPathSummary() { return selectedPathSummary; }
 
 function emitState(state: "connecting" | "webrtc" | "turn" | "relay") {
   stateListener?.(state);
@@ -126,6 +129,7 @@ function cleanup(sendClose: boolean) {
   localCandidates = [];
   remoteCandidates = [];
   remoteDescriptionSet = false;
+  selectedPathSummary = "";
   failPending(new Error("WebRTC 连接已断开"));
 }
 
@@ -140,6 +144,7 @@ function watchRates(connection: RTCPeerConnection, dataChannel: RTCDataChannel) 
       let bytesSent = 0;
       let bytesReceived = 0;
       let usingTurn = false;
+      let pathSummary = "";
       report.forEach((stat) => {
         if (stat.type === "data-channel") {
           const counters = stat as RTCStats & { bytesSent?: number; bytesReceived?: number };
@@ -147,14 +152,18 @@ function watchRates(connection: RTCPeerConnection, dataChannel: RTCDataChannel) 
           bytesReceived = Number(counters.bytesReceived ?? bytesReceived);
         }
         if (stat.type === "candidate-pair") {
-          const pair = stat as RTCStats & { nominated?: boolean; state?: string; localCandidateId?: string; remoteCandidateId?: string };
+          const pair = stat as RTCStats & { nominated?: boolean; state?: string; localCandidateId?: string; remoteCandidateId?: string; currentRoundTripTime?: number };
           if (pair.nominated && pair.state === "succeeded" && pair.localCandidateId && pair.remoteCandidateId) {
-            const local = report.get(pair.localCandidateId) as (RTCStats & { candidateType?: string }) | undefined;
-            const remote = report.get(pair.remoteCandidateId) as (RTCStats & { candidateType?: string }) | undefined;
+            const local = report.get(pair.localCandidateId) as (RTCStats & { candidateType?: string; protocol?: string; address?: string; ip?: string }) | undefined;
+            const remote = report.get(pair.remoteCandidateId) as (RTCStats & { candidateType?: string; protocol?: string; address?: string; ip?: string }) | undefined;
             usingTurn = local?.candidateType === "relay" || remote?.candidateType === "relay";
+            const family = (candidate: typeof local) => (candidate?.address ?? candidate?.ip ?? "").includes(":") ? "IPv6" : "IPv4";
+            const describe = (candidate: typeof local) => `${candidate?.candidateType ?? "?"}/${(candidate?.protocol ?? "?").toUpperCase()}/${family(candidate)}`;
+            pathSummary = `${describe(local)} ↔ ${describe(remote)}${pair.currentRoundTripTime === undefined ? "" : ` · RTT ${Math.round(pair.currentRoundTripTime * 1000)} ms`}`;
           }
         }
       });
+      selectedPathSummary = pathSummary;
       emitState(usingTurn ? "turn" : "webrtc");
       const now = performance.now();
       if (lastSample && now > lastSample) {

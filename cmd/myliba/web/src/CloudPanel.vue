@@ -79,6 +79,9 @@ function formatSize(value: number) {
   if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
   return `${(value / 1024 ** 3).toFixed(1)} GB`;
 }
+function pathLabel(path?: string) { return ({ lan: "局域网 TLS", webrtc: "WebRTC", https: "HTTPS", relay: "存储节点中继", direct: "HTTPS" } as Record<string, string>)[path || ""] || "节点连接"; }
+function formatRate(value?: number) { if (!value) return "吞吐未测出"; return value >= 1024 ** 2 ? `${(value / 1024 ** 2).toFixed(1)} MB/s` : `${(value / 1024).toFixed(0)} KB/s`; }
+function peerCheckDetail(path: string, check: { state: string; rttMillis?: number; connectMillis?: number; speedBps?: number }) { if (check.state !== "connected") return "不可达"; return `${path === "webrtc" ? `建链 ${check.connectMillis ?? "?"} ms` : `${check.rttMillis ?? "?"} ms`} · ${formatRate(check.speedBps)}`; }
 watch(open, (value) => {
   if (timer) clearInterval(timer);
   if (value) timer = setInterval(() => void refresh(), 3000);
@@ -103,7 +106,8 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
 		  <p v-if="!remote && !view.directEndpoint && !view.lan?.length && view.peers.length > 0">本客户端通过 Hub 协商 WebRTC 节点直连；若直连失败，请检查网络或配置可访问的地址。</p>
 		  <div v-for="peer in view.peers" :key="peer.id" class="hub-profile-row">
 		    <div><strong>{{ peer.role === "storage" ? "存储节点" : "客户端" }} · {{ peer.id.slice(0, 12) }}</strong><small>{{ peer.lan?.length ? "已公布局域网地址 · " : "" }}{{ peer.endpoint.startsWith("p2p://") ? "WebRTC 地址" : peer.endpoint ? "HTTPS 地址" : "等待直连地址" }}</small></div>
-		    <span :class="['hub-cloud-status', { offline: view.peerStatus?.[peer.id]?.state !== 'connected' }]">{{ view.peerStatus?.[peer.id]?.state === "connected" ? ({ lan: "局域网直连", webrtc: "WebRTC 直连", direct: "HTTPS 直连" }[view.peerStatus[peer.id].path || 'direct']) : view.peerStatus?.[peer.id]?.state === "unreachable" ? "当前不可达" : "检测中" }}</span>
+		    <span :class="['hub-cloud-status', { offline: view.peerStatus?.[peer.id]?.state !== 'connected' }]">{{ view.peerStatus?.[peer.id]?.state === "connected" ? `${pathLabel(view.peerStatus[peer.id].path)} 直连` : view.peerStatus?.[peer.id]?.state === "unreachable" ? "当前不可达" : "检测中" }}</span>
+		    <small v-if="view.peerStatus?.[peer.id]?.checks" class="cloud-peer-checks">{{ Object.entries(view.peerStatus[peer.id].checks || {}).map(([path, check]) => `${pathLabel(path)}：${peerCheckDetail(path, check)}`).join("　/　") }}</small>
 		  </div>
           <div class="cloud-heading"><strong>云层文件</strong><button class="quiet-button" type="button" @click="refresh"><RefreshCw :size="15" />刷新</button></div>
           <p v-if="loading">正在读取云层索引…</p>

@@ -1,6 +1,12 @@
 import { waitForWebRTCConnection, webRTCConnected, webRTCFetch } from "./webrtc";
 
 let remoteSession = false;
+let activeFolderAccessID = "";
+const folderAccessKey = (id: string) => `myliba-folder-access:${id}`;
+
+export function setActiveFolderAccess(id: string | null) {
+  activeFolderAccessID = id || "";
+}
 const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail|video-preview|video\/[^/]+\/(?:init|segments\/\d+))|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file|assets\/[^/]+\/parts\/[^/]+|video\/[^/]+\/(?:init|segments\/\d+)))(?:\?|$)/;
 
 export interface Resource {
@@ -103,6 +109,7 @@ export interface VirtualFolder {
   name: string;
   count: number;
   createdAt: string;
+  passwordProtected: boolean;
 }
 
 export interface AttributeTag {
@@ -257,11 +264,16 @@ async function apiFetch(url: string, init?: RequestInit) {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  let folderAccessToken = "";
+  if (activeFolderAccessID) {
+    try { folderAccessToken = sessionStorage.getItem(folderAccessKey(activeFolderAccessID)) || ""; } catch { /* session storage may be disabled */ }
+  }
   const response = await apiFetch(url, {
     credentials: "same-origin",
     ...init,
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(folderAccessToken ? { "X-Myliba-Folder-Access": folderAccessToken } : {}),
       ...init?.headers,
     },
   });
@@ -312,7 +324,7 @@ export interface CloudNode {
   id: string;
   endpoint: string;
 	lan?: string[];
-	links?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "direct" }>;
+	links?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "https" | "relay" | "direct"; checkedAt?: string; checks?: Record<string, { state: "connected" | "unreachable"; rttMillis?: number; connectMillis?: number; speedBps?: number }> }>;
   relayed?: boolean;
   role: "client" | "storage";
   seenAt: string;
@@ -357,7 +369,7 @@ export interface CloudView {
   nodeId: string;
   libraryId: string;
   peers: CloudNode[];
-	peerStatus?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "direct"; checkedAt?: string }>;
+	peerStatus?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "https" | "relay" | "direct"; checkedAt?: string; checks?: Record<string, { state: "connected" | "unreachable"; rttMillis?: number; connectMillis?: number; speedBps?: number }> }>;
   directEndpoint: string;
 	lan?: string[];
 }
@@ -450,6 +462,26 @@ export function getFolders() {
 
 export function createFolder(name: string) {
   return request<VirtualFolder>("/api/folders", { method: "POST", body: JSON.stringify({ name }) });
+}
+
+export function unlockFolder(id: string, password: string) {
+  return request<{ ok: boolean; accessToken: string }>(`/api/folders/${encodeURIComponent(id)}/unlock`, { method: "POST", body: JSON.stringify({ password }) }).then((result) => {
+    try { sessionStorage.setItem(folderAccessKey(id), result.accessToken); } catch { /* HttpOnly cookie still authorizes local requests */ }
+    activeFolderAccessID = id;
+    return result;
+  });
+}
+
+export function getFolderAccess(id: string) {
+  return request<{ protected: boolean; unlocked: boolean }>(`/api/folders/${encodeURIComponent(id)}/access`);
+}
+
+export function setFolderPassword(id: string, password: string) {
+  return request<{ ok: boolean; passwordProtected: boolean }>(`/api/folders/${encodeURIComponent(id)}/password`, { method: "PUT", body: JSON.stringify({ password }) });
+}
+
+export function assignRootToFolder(id: string, rootId: string) {
+  return request<{ ok: boolean; updated: number }>(`/api/folders/${encodeURIComponent(id)}/scan`, { method: "POST", body: JSON.stringify({ rootId }) });
 }
 
 export function renameFolder(id: string, name: string) {

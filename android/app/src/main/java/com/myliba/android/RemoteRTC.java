@@ -28,6 +28,8 @@ final class RemoteRTC implements AutoCloseable {
     private final List<IceCandidate> earlyCandidates=new CopyOnWriteArrayList<>();
     private volatile PeerConnection peer;private volatile DataChannel channel;private volatile HubWebSocket socket;
     private volatile boolean remoteReady;private volatile boolean closed;
+    private volatile String pathSummary="尚未建立 ICE 路径";
+    private volatile long lastSpeedBps;
     private final ConnectivityManager connectivity;
     private final ConnectivityManager.NetworkCallback networkCallback;
     private final AtomicBoolean reconnecting=new AtomicBoolean();
@@ -52,6 +54,7 @@ final class RemoteRTC implements AutoCloseable {
     void configure(String cookie,JSONArray servers){this.cookie=cookie;this.servers=servers==null?new JSONArray():servers;}
     private boolean channelOpen(){DataChannel current=channel;return current!=null&&current.state()==DataChannel.State.OPEN;}
     boolean connected(){return !closed&&channelOpen()&&connectionEpoch==networkEpoch;}
+    String connectionSummary(){if(!connected())return "WebRTC 数据通道未连接 · 内容请求回退到 Hub HTTPS";String summary="WebRTC DataChannel · "+pathSummary;if(lastSpeedBps>0)summary+=" · 最近响应 "+(lastSpeedBps>=1L<<20?String.format(Locale.ROOT,"%.1f MB/s",lastSpeedBps/(double)(1<<20)):String.format(Locale.ROOT,"%.0f KB/s",lastSpeedBps/(double)(1<<10)));return summary;}
     private void networkChanged(){
         AppLog.info("Remote RTC default network changed");
         CountDownLatch connecting=connectingLatch;if(connecting!=null)connecting.countDown();
@@ -124,7 +127,7 @@ final class RemoteRTC implements AutoCloseable {
             DataChannel localChannel=channel;
             channel.registerObserver(new DataChannel.Observer(){
                 @Override public void onBufferedAmountChange(long amount){}
-                @Override public void onStateChange(){AppLog.info("Remote RTC data channel "+localChannel.state()+"; "+WebRtcDiagnostics.network(context));if(channelOpen())open.countDown();else if(localChannel.state()==DataChannel.State.CLOSED){open.countDown();connectionBroken(localChannel);}}
+                @Override public void onStateChange(){AppLog.info("Remote RTC data channel "+localChannel.state()+"; "+WebRtcDiagnostics.network(context));if(channelOpen()){open.countDown();WebRtcDiagnostics.selectedPair(peer,"Remote RTC",value->pathSummary=value);}else if(localChannel.state()==DataChannel.State.CLOSED){open.countDown();connectionBroken(localChannel);}}
                 @Override public void onMessage(DataChannel.Buffer buffer){if(buffer.binary)return;ByteBuffer data=buffer.data;byte[] raw=new byte[data.remaining()];data.get(raw);
                     try{JSONObject message=new JSONObject(new String(raw,StandardCharsets.UTF_8));BlockingQueue<JSONObject> queue=pending.get(message.optString("id"));if(queue!=null)queue.offer(message);}catch(Exception ignored){}
                 }
@@ -167,7 +170,7 @@ final class RemoteRTC implements AutoCloseable {
         return stream(method,path,body,headers,output,max,null);
     }
     Reply stream(String method,String path,byte[] body,JSONObject headers,OutputStream output,long max,ResponseStart startHandler)throws Exception{
-        ensureConnected();DataChannel requestChannel=channel;String id=UUID.randomUUID().toString();BlockingQueue<JSONObject> queue=new LinkedBlockingQueue<>();pending.put(id,queue);
+        ensureConnected();long transferStarted=android.os.SystemClock.elapsedRealtime();DataChannel requestChannel=channel;String id=UUID.randomUUID().toString();BlockingQueue<JSONObject> queue=new LinkedBlockingQueue<>();pending.put(id,queue);
         try{
             send(new JSONObject().put("type","request").put("id",id).put("method",method).put("path",path).put("headers",headers));
             if(body!=null)for(int offset=0;offset<body.length;offset+=24<<10)send(new JSONObject().put("type","request-chunk").put("id",id).put("data",Base64.encodeToString(body,offset,Math.min(24<<10,body.length-offset),Base64.NO_WRAP)));
@@ -181,6 +184,7 @@ final class RemoteRTC implements AutoCloseable {
                 else if("end".equals(type)){if(status==0)throw new IOException("RTC 响应无状态");JSONArray lengths=responseHeaders.optJSONArray("Content-Length");
                     if(lengths!=null&&lengths.length()>0){try{long expected=Long.parseLong(lengths.optString(0));if(expected!=total)throw new IOException("RTC 传输不完整");}catch(NumberFormatException ignored){}}
                     AppLog.info("Remote RTC response status "+status+" bytes "+total);
+                    long elapsed=android.os.SystemClock.elapsedRealtime()-transferStarted;if(total>0&&elapsed>0)lastSpeedBps=total*1000/elapsed;
                     return new Reply(status,responseHeaders,new byte[0]);}
             }
         }catch(ConsumerFailure failure){

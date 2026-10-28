@@ -592,6 +592,14 @@ body.detail-preview-open { overflow: hidden; }
 .folder-scope-hint { margin: -12px 0 20px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
 .folder-context-actions { display: flex; gap: 10px; margin-left: auto; }
 .folder-rename-form { display: flex; gap: 8px; margin: -8px 0 18px; }
+.folder-gate-backdrop { position: fixed; z-index: 110; inset: 0; display: grid; place-items: center; padding: 20px; background: rgb(20 31 24 / 54%); backdrop-filter: blur(4px); }
+.folder-gate-dialog { display: grid; width: min(100%, 390px); gap: 12px; padding: 25px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: 0 24px 70px rgb(15 35 20 / 22%); }
+.folder-gate-dialog h2 { margin: 0; font-size: 19px; }
+.folder-gate-dialog p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.folder-gate-dialog input { width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: white; color: var(--text); outline: 0; }
+.folder-gate-dialog input:focus { border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
+.folder-gate-dialog .folder-gate-error { color: #b74236; }
+.folder-gate-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 3px; }
 .bulk-folder-picker { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
 .bulk-folder-picker select, .detail-folder-field select { min-height: 34px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 7px; background: white; color: var(--text); }
 .detail-folder-field { display: grid; gap: 7px; padding: 15px 16px 0; color: var(--text-secondary); font-size: 11px; }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { closeWebRTC, connectWebRTC } from "./webrtc";
+import { closeWebRTC, connectWebRTC, webRTCPathSummary } from "./webrtc";
 import { singleFilters, toggleFilter } from "./filterSelection";
 import ResourceDetail from "./ResourceDetail.vue";
 import ImagePreview from "./ImagePreview.vue";
@@ -27,6 +27,7 @@ import {
   FileVideo,
   FolderOpen,
   FolderSync,
+  KeyRound,
   HardDrive,
   House,
   Image,
@@ -71,6 +72,8 @@ import {
   renameFolder,
   deleteFolder,
   moveResourcesToFolder,
+  assignRootToFolder,
+  getFolderAccess,
   getRoots,
   getMediaStores,
   getDirectories,
@@ -81,6 +84,9 @@ import {
   login,
   logout,
   scanRoot,
+  setFolderPassword,
+  unlockFolder as unlockFolderAPI,
+  setActiveFolderAccess,
   selectResourceNode,
   removeResourceNode,
   selectMediaStore,
@@ -109,6 +115,7 @@ const resourceNodes = ref<HubResourceNode[]>([]);
 const selectedResourceNodeID = ref("");
 const selectedResourceNodeKind = computed(() => resourceNodes.value.find((node) => node.id === selectedResourceNodeID.value)?.kind);
 const nodeTransport = ref<"connecting" | "webrtc" | "turn" | "relay">("relay");
+const nodePathSummary = ref("");
 const webTraffic = ref<TrafficRate>({ downloadBps: 0, uploadBps: 0 });
 const nodeTraffic = ref<TrafficRate>({ downloadBps: 0, uploadBps: 0 });
 const loading = ref(false);
@@ -142,6 +149,11 @@ const newFolderName = ref("");
 const folderBusy = ref(false);
 const bulkFolderID = ref("");
 const folderEditorOpen = ref(false);
+const folderGateOpen = ref(false);
+const folderGateMode = ref<"unlock" | "set">("unlock");
+const folderGatePassword = ref("");
+const folderGateError = ref("");
+const folderScanTarget = ref("");
 const sidebarFolderCreateOpen = ref(false);
 const editingFolderName = ref("");
 const total = ref(0);
@@ -688,7 +700,22 @@ async function loadCollections() {
 }
 
 async function loadWorkspace() {
-  await Promise.all([loadRoots(), loadMediaStores(), loadFolders(), loadTags(), loadCollections(), loadResources()]);
+	const id = activeFolderID.value;
+	setActiveFolderAccess(id);
+	await Promise.all([loadRoots(), loadMediaStores(), loadFolders(), loadCollections()]);
+	const folder = folders.value.find((item) => item.id === id);
+	if (folder?.passwordProtected) {
+		try {
+			const access = await getFolderAccess(id!);
+			if (!access.unlocked) {
+				folderGateMode.value = "unlock";
+				folderGateOpen.value = true;
+				return;
+			}
+		} catch (error) { showError(error); return; }
+	}
+	folderGateOpen.value = false;
+	await Promise.all([loadTags(), loadResources()]);
 }
 
 function setDetailRoute(id: string) {
@@ -714,8 +741,21 @@ function syncDetailRoute() {
   const nextFolder = params.get("folder");
   if (nextFolder !== activeFolderID.value) {
     activeFolderID.value = nextFolder;
+    setActiveFolderAccess(nextFolder);
     resetFolderFilters();
-    void Promise.all([loadTags(), loadResources()]);
+		const folder = folders.value.find((item) => item.id === nextFolder);
+		if (folder?.passwordProtected) {
+			clearLockedFolderView();
+			folderGateMode.value = "unlock";
+			folderGateOpen.value = true;
+			void getFolderAccess(nextFolder!).then((access) => {
+				if (activeFolderID.value !== nextFolder) return;
+				if (access.unlocked) { folderGateOpen.value = false; void Promise.all([loadFolders(), loadTags(), loadResources()]); }
+			}).catch(showError);
+		} else {
+			folderGateOpen.value = false;
+			void Promise.all([loadTags(), loadResources()]);
+		}
   }
 }
 
@@ -740,17 +780,77 @@ function resetFolderFilters() {
   clearSelection();
 }
 
+function clearLockedFolderView() {
+	resources.value = [];
+	total.value = 0;
+	tags.value = [];
+	attributeCatalog.value = [];
+	batchSuggestions.value = [];
+	batchSuggestionsOpen.value = false;
+	clearSelection();
+}
+
 function openFolder(id: string | null) {
   if (detailResourceID.value) detailResourceID.value = "";
   activeFolderID.value = id;
+  setActiveFolderAccess(id);
   resetFolderFilters();
   const url = new URL(window.location.href);
   url.searchParams.delete("resource");
   if (id === null) url.searchParams.delete("folder");
   else url.searchParams.set("folder", id);
   window.history.pushState({}, "", url.pathname + url.search + url.hash);
-  void Promise.all([loadTags(), loadResources()]);
+	const folder = folders.value.find((item) => item.id === id);
+	if (folder?.passwordProtected) {
+		clearLockedFolderView();
+		folderGateMode.value = "unlock";
+		folderGatePassword.value = "";
+		folderGateError.value = "";
+		folderGateOpen.value = true;
+		void getFolderAccess(id!).then((access) => {
+			if (activeFolderID.value !== id) return;
+			if (access.unlocked) { folderGateOpen.value = false; void Promise.all([loadFolders(), loadTags(), loadResources()]); }
+		}).catch(showError);
+	} else {
+		folderGateOpen.value = false;
+		void Promise.all([loadTags(), loadResources()]);
+	}
   window.scrollTo(0, 0);
+}
+
+async function submitFolderGate() {
+	const id = activeFolderID.value;
+	if (!id || folderBusy.value || folderGatePassword.value.trim().length < 4) return;
+	folderBusy.value = true;
+	folderGateError.value = "";
+	try {
+		if (folderGateMode.value === "unlock") await unlockFolderAPI(id, folderGatePassword.value);
+		else await setFolderPassword(id, folderGatePassword.value);
+		folderGatePassword.value = "";
+		folderGateOpen.value = false;
+		await loadFolders();
+		if (folderGateMode.value === "set") {
+			folderGateMode.value = "unlock";
+			folderGateOpen.value = true;
+			return;
+		}
+		await Promise.all([loadTags(), loadResources()]);
+	} catch (error) {
+		folderGateError.value = error instanceof Error ? error.message : "操作失败";
+	} finally { folderBusy.value = false; }
+}
+
+async function removeFolderPassword() {
+	const id = activeFolderID.value;
+	if (!id || folderBusy.value) return;
+	folderBusy.value = true;
+	try {
+		await setFolderPassword(id, "");
+		await loadFolders();
+		folderGateOpen.value = false;
+		notify("已取消文件夹密码");
+	} catch (error) { showError(error); }
+	finally { folderBusy.value = false; }
 }
 
 async function toggleSidebarFolderCreate() {
@@ -937,10 +1037,24 @@ async function chooseCollection(item: SmartCollection) {
   selectedRootID.value = item.filters.rootId;
   unorganizedOnly.value = item.filters.unorganized;
   sortOrder.value = item.filters.sort;
-  activeFolderID.value = item.filters.folderId || "all";
+  const folderID = item.filters.folderId || "all";
+  activeFolderID.value = folderID;
+  setActiveFolderAccess(folderID);
   const url = new URL(window.location.href);
-  url.searchParams.set("folder", activeFolderID.value);
+  url.searchParams.set("folder", folderID);
   window.history.pushState({}, "", url.pathname + url.search + url.hash);
+	const folder = folders.value.find((entry) => entry.id === folderID);
+	if (folder?.passwordProtected) {
+		clearLockedFolderView();
+		let unlocked = false;
+		try { unlocked = (await getFolderAccess(folderID)).unlocked; }
+		catch (error) { showError(error); return; }
+		if (!unlocked) {
+			folderGateMode.value = "unlock";
+			folderGateOpen.value = true;
+			return;
+		}
+	}
   await nextTick();
   void loadTags();
   suppressQueryWatch = false;
@@ -1173,8 +1287,9 @@ async function submitRoot() {
   finally { rootBusy.value = false; }
 }
 
-async function openFolderPicker() {
+async function openFolderPicker(targetFolderID = "") {
   if (rootBusy.value || directoryPickerOpen.value) return;
+  folderScanTarget.value = targetFolderID;
   directoryPickerOpen.value = true;
   directoryListing.value = null;
   directoryError.value = "";
@@ -1197,6 +1312,21 @@ async function selectCurrentDirectory() {
   const path = directoryListing.value?.current;
   if (!path) return;
   directoryPickerOpen.value = false;
+  const targetFolderID = folderScanTarget.value;
+  folderScanTarget.value = "";
+  if (targetFolderID) {
+    rootBusy.value = true;
+    try {
+      const root = await addRoot(path, rootAutoPreprocess.value);
+      scanningRootID.value = root.id;
+      const result = await scanRoot(root.id);
+      const assigned = await assignRootToFolder(targetFolderID, root.id);
+      notify(`扫描完成，收录 ${result.indexed} 个文件，已加入文件夹 ${assigned.updated} 项`);
+      await loadWorkspace();
+    } catch (error) { showError(error); }
+    finally { rootBusy.value = false; scanningRootID.value = ""; }
+    return;
+  }
   rootPath.value = path;
   await submitRoot();
 }
@@ -1225,6 +1355,7 @@ async function rescanRoot(root: RootSummary) {
 
 function applyTransportState(state: "connecting" | "webrtc" | "turn" | "relay") {
   nodeTransport.value = state;
+  nodePathSummary.value = webRTCPathSummary();
   if (state === "relay") void refreshNodeStatus();
 }
 
@@ -1518,7 +1649,7 @@ onBeforeUnmount(() => {
       <form v-if="sidebarFolderCreateOpen" class="sidebar-folder-create" @submit.prevent="submitFolder"><label class="sr-only" for="sidebar-new-folder-name">文件夹名称</label><input id="sidebar-new-folder-name" v-model="newFolderName" maxlength="80" placeholder="文件夹名称" autocomplete="off" /><button type="submit" :disabled="folderBusy || !newFolderName.trim()" aria-label="创建文件夹"><Plus :size="15" /></button></form>
       <nav class="folder-nav" aria-label="文件夹">
         <button class="nav-link" :class="{ active: activeFolderID === 'all' }" @click="openFolder('all')"><LibraryBig :size="16" /><span>全部资源</span><span class="nav-count">{{ totalIndexed }}</span></button>
-        <button v-for="folder in folders" :key="folder.id" class="nav-link" :class="{ active: activeFolderID === folder.id }" @click="openFolder(folder.id)"><FolderOpen :size="16" /><span>{{ folder.name }}</span><span class="nav-count">{{ folder.count }}</span></button>
+        <button v-for="folder in folders" :key="folder.id" class="nav-link" :class="{ active: activeFolderID === folder.id }" @click="openFolder(folder.id)"><FolderOpen :size="16" /><span>{{ folder.name }}</span><KeyRound v-if="folder.passwordProtected" :size="12" /><span class="nav-count">{{ folder.passwordProtected && (activeFolderID !== folder.id || folderGateOpen) ? '·' : folder.count }}</span></button>
         <button class="nav-link" title="未归组：尚未放入虚拟文件夹，与手动标签无关" :class="{ active: activeFolderID === 'unfiled' }" @click="openFolder('unfiled')"><FolderOpen :size="16" /><span>未归组</span><span class="nav-count">{{ unfiledCount }}</span></button>
       </nav>
       <div v-if="activeFolderID !== null" class="folder-children" :aria-label="folderTitle + '的内容'">
@@ -1584,7 +1715,7 @@ onBeforeUnmount(() => {
               <span class="connection-dot"></span><span>Web · HTTPS 接入</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small>
             </span>
             <span class="connection-badge traffic-badge" :class="{ offline: !nodeOnline }" :title="nodeTransport === 'webrtc' ? 'WebRTC DataChannel 直连；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'turn' ? 'WebRTC DataChannel 通过 TURN 中继；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'connecting' ? '正在协商 WebRTC；连接失败后文件内容经限速 Hub 中转。' : 'WebRTC 不可用；文件内容经限速 Hub 中转。'">
-              <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · WebRTC / TURN' : nodeTransport === 'connecting' ? '节点 · WebRTC 连接中' : '节点 · Hub 限速中转' }}</span><small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small>
+              <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · WebRTC / TURN' : nodeTransport === 'connecting' ? '节点 · WebRTC 连接中' : '节点 · Hub 限速中转' }}</span><small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small><small v-if="nodePathSummary">{{ nodePathSummary }}</small>
             </span>
           </template>
           <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>
@@ -1616,7 +1747,7 @@ onBeforeUnmount(() => {
           <div class="virtual-folders-heading"><div><p class="eyebrow">顶层分组</p><h2>我的文件夹</h2><p>先按文件夹整理资源，进入后再用标签细分。文件保留在原位置。</p></div></div>
           <form class="virtual-folder-create" @submit.prevent="submitFolder"><label class="sr-only" for="new-folder-name">文件夹名称</label><input id="new-folder-name" v-model="newFolderName" maxlength="80" placeholder="新文件夹名称" /><button class="button button-primary" type="submit" :disabled="folderBusy || !newFolderName.trim()"><Plus :size="15" />新建文件夹</button></form>
           <div class="virtual-folder-grid">
-            <button v-for="folder in folders" :key="folder.id" class="virtual-folder-card" type="button" @click="openFolder(folder.id)"><span class="virtual-folder-icon"><FolderOpen :size="22" /></span><strong>{{ folder.name }}</strong><small>{{ folder.count }} 项资源</small></button>
+            <button v-for="folder in folders" :key="folder.id" class="virtual-folder-card" type="button" @click="openFolder(folder.id)"><span class="virtual-folder-icon"><KeyRound v-if="folder.passwordProtected" :size="20" /><FolderOpen v-else :size="22" /></span><strong>{{ folder.name }}</strong><small>{{ folder.passwordProtected && activeFolderID !== folder.id ? '需要密码' : `${folder.count} 项资源` }}</small></button>
             <button class="virtual-folder-card virtual-folder-unfiled" type="button" @click="openFolder('unfiled')"><span class="virtual-folder-icon"><FolderOpen :size="22" /></span><strong>未归组</strong><small>{{ unfiledCount }} 项资源</small></button>
           </div>
           <p v-if="!folders.length" class="virtual-folder-hint">已有资源都在“未归组”。新建文件夹后，可批量选择文件并移动。</p>
@@ -1687,7 +1818,7 @@ onBeforeUnmount(() => {
         </section>
 
         <template v-else>
-        <div class="folder-context-bar"><button class="quiet-button" @click="openFolder(null)"><House :size="14" />文件夹首页</button><span>/</span><strong>{{ folderTitle }}</strong><div v-if="activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-context-actions"><button class="quiet-button" @click="editingFolderName = folderTitle; folderEditorOpen = !folderEditorOpen"><Pencil :size="14" />重命名</button><button class="quiet-button" @click="removeFolder"><Trash2 :size="14" />删除</button></div></div>
+		<div class="folder-context-bar"><button class="quiet-button" @click="openFolder(null)"><House :size="14" />文件夹首页</button><span>/</span><strong>{{ folderTitle }}</strong><div v-if="activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-context-actions"><button class="quiet-button" @click="openFolderPicker(activeFolderID || '')"><FolderSync :size="14" />扫描本地目录</button><button class="quiet-button" @click="editingFolderName = folderTitle; folderEditorOpen = !folderEditorOpen"><Pencil :size="14" />重命名</button><button class="quiet-button" @click="folderGateMode = 'set'; folderGatePassword = ''; folderGateError = ''; folderGateOpen = true"><KeyRound :size="14" />{{ folders.find((item) => item.id === activeFolderID)?.passwordProtected ? '修改密码' : '设置密码' }}</button><button v-if="folders.find((item) => item.id === activeFolderID)?.passwordProtected" class="quiet-button" @click="removeFolderPassword"><X :size="14" />取消密码</button><button class="quiet-button" @click="removeFolder"><Trash2 :size="14" />删除</button></div></div>
         <p v-if="activeFolderID === 'unfiled'" class="folder-scope-hint">尚未放入虚拟文件夹的资源会显示在这里；“待整理”指没有手动标签的资源。</p>
         <form v-if="folderEditorOpen && activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-rename-form" @submit.prevent="saveFolderName"><input v-model="editingFolderName" maxlength="80" aria-label="文件夹名称" /><button class="button button-primary" :disabled="folderBusy || !editingFolderName.trim()">保存</button><button type="button" class="button button-secondary" @click="folderEditorOpen = false">取消</button></form>
         <div v-if="visibleCollections.length" class="mobile-collections" aria-label="常用查询">
@@ -1929,11 +2060,25 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
+    <div v-if="folderGateOpen" class="folder-gate-backdrop">
+      <form class="folder-gate-dialog" role="dialog" aria-modal="true" aria-labelledby="folder-gate-title" @submit.prevent="submitFolderGate">
+        <span class="panel-icon"><KeyRound :size="18" /></span>
+        <h2 id="folder-gate-title">{{ folderGateMode === 'unlock' ? '输入文件夹密码' : (folders.find((item) => item.id === activeFolderID)?.passwordProtected ? '修改文件夹密码' : '设置文件夹密码') }}</h2>
+        <p>{{ folderGateMode === 'unlock' ? `「${folderTitle}」已设置密码，验证后可查看内容。` : '设置后，打开此文件夹需要输入密码。密码至少 4 个字符。' }}</p>
+        <input v-model="folderGatePassword" type="password" autocomplete="current-password" :placeholder="folderGateMode === 'unlock' ? '输入密码' : '输入新密码'" minlength="4" maxlength="72" required autofocus />
+        <p v-if="folderGateError" class="folder-gate-error" role="alert">{{ folderGateError }}</p>
+        <div class="folder-gate-actions">
+          <button v-if="folderGateMode === 'set'" class="button button-secondary" type="button" @click="folderGateOpen = false">取消</button>
+          <button class="button button-primary" type="submit" :disabled="folderBusy || folderGatePassword.trim().length < 4"><LoaderCircle v-if="folderBusy" class="spin" :size="15" />{{ folderGateMode === 'unlock' ? '解锁文件夹' : '保存密码' }}</button>
+        </div>
+      </form>
+    </div>
+
     <div v-if="directoryPickerOpen" class="directory-picker-backdrop" @click.self="directoryPickerOpen = false">
       <section class="directory-picker" role="dialog" aria-modal="true" aria-labelledby="directory-picker-title">
         <header class="directory-picker-header">
           <span class="panel-icon"><FolderOpen :size="18" /></span>
-          <div><h2 id="directory-picker-title">选择索引目录</h2><p>浏览本机文件夹，原文件不会移动或复制。</p></div>
+          <div><h2 id="directory-picker-title">选择索引目录</h2><p>{{ folderScanTarget ? `扫描后会将资源加入「${folderTitle}」，原文件不会移动或复制。` : '浏览本机文件夹，原文件不会移动或复制。' }}</p></div>
           <button class="quiet-button directory-close" aria-label="关闭" @click="directoryPickerOpen = false"><X :size="18" /></button>
         </header>
         <div class="directory-picker-toolbar">

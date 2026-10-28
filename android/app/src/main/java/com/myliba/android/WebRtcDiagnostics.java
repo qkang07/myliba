@@ -44,6 +44,15 @@ final class WebRtcDiagnostics {
         if(peer==null)return;
         try{peer.getStats(report->logSelectedPair(report,label));}catch(Exception ex){AppLog.info(label+" selected ICE pair stats failed: "+ex.getClass().getSimpleName());}
     }
+    static void selectedPair(PeerConnection peer,String label,java.util.function.Consumer<String> listener){
+        if(peer==null)return;
+        try{peer.getStats(report->{String summary=selectedPairSummary(report);AppLog.info(label+" selected ICE pair "+summary);listener.accept(summary);});}catch(Exception ex){AppLog.info(label+" selected ICE pair stats failed: "+ex.getClass().getSimpleName());}
+    }
+    private static String selectedPairSummary(RTCStatsReport report){
+        Map<String,RTCStats> stats=report.getStatsMap();Map<String,RTCStats> candidates=new HashMap<>();for(RTCStats stat:stats.values())if("local-candidate".equals(stat.getType())||"remote-candidate".equals(stat.getType()))candidates.put(stat.getId(),stat);
+        for(RTCStats stat:stats.values())if("candidate-pair".equals(stat.getType())){Map<String,Object> m=stat.getMembers();boolean selected=truth(m.get("selected"))||truth(m.get("nominated"))&&"succeeded".equals(String.valueOf(m.get("state")));if(!selected)continue;String local=candidateType(candidates.get(String.valueOf(m.get("localCandidateId")))),remote=candidateType(candidates.get(String.valueOf(m.get("remoteCandidateId"))));Object raw=m.get("currentRoundTripTime");String rtt=raw instanceof Number?" · RTT "+Math.round(((Number)raw).doubleValue()*1000)+" ms":"";return local+" ↔ "+remote+rtt;}
+        return "未取得已选 ICE 路径";
+    }
     private static void logSelectedPair(RTCStatsReport report,String label){
         Map<String,RTCStats> stats=report.getStatsMap();Map<String,RTCStats> candidates=new HashMap<>();for(RTCStats stat:stats.values())if("local-candidate".equals(stat.getType())||"remote-candidate".equals(stat.getType()))candidates.put(stat.getId(),stat);
         for(RTCStats stat:stats.values())if("candidate-pair".equals(stat.getType())){Map<String,Object> m=stat.getMembers();boolean selected=truth(m.get("selected"))||truth(m.get("nominated"))&&"succeeded".equals(String.valueOf(m.get("state")));if(!selected)continue;RTCStats local=candidates.get(String.valueOf(m.get("localCandidateId"))),remote=candidates.get(String.valueOf(m.get("remoteCandidateId")));AppLog.info(label+" selected ICE pair local="+candidateType(local)+" remote="+candidateType(remote)+" state="+m.get("state"));return;}

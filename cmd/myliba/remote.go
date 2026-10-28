@@ -721,6 +721,12 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet || method == http.MethodPost
 	case len(parts) == 3 && parts[1] == "folders":
 		return method == http.MethodPut || method == http.MethodDelete
+	case len(parts) == 4 && parts[1] == "folders" && parts[3] == "unlock":
+		return method == http.MethodPost
+	case len(parts) == 4 && parts[1] == "folders" && parts[3] == "access":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "folders" && (parts[3] == "password" || parts[3] == "scan"):
+		return (parts[3] == "password" && method == http.MethodPut) || (parts[3] == "scan" && method == http.MethodPost)
 	case len(parts) == 3 && parts[1] == "resources" && parts[2] == "folder":
 		return method == http.MethodPut
 	case len(parts) == 2 && parts[1] == "resources":

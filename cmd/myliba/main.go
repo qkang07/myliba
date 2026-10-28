@@ -41,6 +41,8 @@ type server struct {
 	videoSlots     chan struct{}
 	jobsWake       chan struct{}
 	jobsStop       chan struct{}
+	folderAccessMu sync.Mutex
+	folderAccess   map[string]folderAccessSession
 }
 
 type resource struct {
@@ -202,6 +204,10 @@ func main() {
 	mux.HandleFunc("GET /api/attribute-tags", app.attributeTags)
 	mux.HandleFunc("GET /api/folders", app.listFolders)
 	mux.HandleFunc("POST /api/folders", app.createFolder)
+	mux.HandleFunc("POST /api/folders/{id}/unlock", app.unlockFolder)
+	mux.HandleFunc("GET /api/folders/{id}/access", app.folderAccessStatus)
+	mux.HandleFunc("PUT /api/folders/{id}/password", app.setFolderPassword)
+	mux.HandleFunc("POST /api/folders/{id}/scan", app.assignRootToFolder)
 	mux.HandleFunc("PUT /api/folders/{id}", app.renameFolder)
 	mux.HandleFunc("DELETE /api/folders/{id}", app.deleteFolder)
 	mux.HandleFunc("PUT /api/resources/folder", app.moveResourcesToFolder)
@@ -216,7 +222,7 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(static)))
 	addr := "127.0.0.1:4317"
 	log.Printf("Myliba is ready at http://%s (data: %s)", addr, dataDir)
-	httpServer := &http.Server{Addr: addr, Handler: securityHeaders(mux)}
+	httpServer := &http.Server{Addr: addr, Handler: securityHeaders(app.folderAccessMiddleware(mux))}
 	if handled, err := runWindowsTray(httpServer, hubs); handled {
 		if err != nil {
 			log.Fatal(err)
@@ -276,7 +282,8 @@ CREATE TABLE IF NOT EXISTS resource_tags (
 CREATE TABLE IF NOT EXISTS folders (
 	id TEXT PRIMARY KEY,
 	name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-	created_at TEXT NOT NULL
+	created_at TEXT NOT NULL,
+	password_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS resource_folders (
 	resource_id TEXT PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE,
@@ -369,6 +376,12 @@ CREATE TABLE IF NOT EXISTS file_asset_locations (
 	columns.Close()
 	if !hasAutoPreprocess {
 		_, err = db.Exec(`ALTER TABLE roots ADD COLUMN auto_preprocess INTEGER NOT NULL DEFAULT 1`)
+	}
+	if err == nil {
+		_, err = db.Exec(`ALTER TABLE folders ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''`)
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			err = nil
+		}
 	}
 	if err == nil {
 		_, err = db.Exec(`UPDATE resources SET kind='image' WHERE lower(name) LIKE '%.arw' AND kind <> 'image'`)
