@@ -3,6 +3,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { createThumbnailVariant, createVideoVariant, fileURL, getResourceFile, getResourceThumbnailVariant, getCloudFile, getCloudVideoPart, getCloudVideoVariant, getVideoPart, getVideoVariant, type Resource, type VideoManifest, type VideoQuality } from "./api";
 import { webRTCConnected, webRTCFetch } from "./webrtc";
 import { readBlobWithProgress } from "./transferProgress";
+import { openVirtualMedia } from "./virtualMedia";
 
 const props = defineProps<{ id: string; name: string; remote: boolean; phoneNode?: boolean; shareKey?: string; cloud?: boolean; qualities?: VideoQuality[]; resource?: Pick<Resource, "id" | "size" | "modified">; poster?: string; fileSize?: number }>();
 const emit = defineEmits<{ metadata: [duration: number] }>();
@@ -10,7 +11,7 @@ type Selection = VideoQuality | "original";
 type NetworkInfo = { downlink?: number; effectiveType?: string };
 const connection = (navigator as Navigator & { connection?: NetworkInfo }).connection;
 const preferredQuality: VideoQuality = connection?.downlink && connection.downlink < 2 || connection?.effectiveType === "2g" ? "360p" : "720p";
-const selected = ref<Selection>(props.phoneNode ? "original" : props.cloud ? (props.qualities?.includes(preferredQuality) ? preferredQuality : props.qualities?.[0] ?? preferredQuality) : preferredQuality);
+const selected = ref<Selection>(props.phoneNode || (props.remote && !props.cloud && !props.shareKey) ? "original" : props.cloud ? (props.qualities?.includes(preferredQuality) ? preferredQuality : props.qualities?.[0] ?? preferredQuality) : preferredQuality);
 const video = ref<HTMLVideoElement | null>(null);
 const message = ref("");
 const loading = ref(false);
@@ -31,6 +32,7 @@ let pumping = false;
 let initialized = false;
 let restorePosition = 0;
 let resumePlayback = false;
+let closeVirtualMedia: (() => void) | undefined;
 
 async function loadPoster() {
   if (!props.resource) return;
@@ -81,6 +83,8 @@ function part(quality: VideoQuality, segment: "init" | number) {
 
 function dispose() {
   generation++;
+  closeVirtualMedia?.();
+  closeVirtualMedia = undefined;
   if (video.value) {
     video.value.pause();
     video.value.removeAttribute("src");
@@ -106,8 +110,24 @@ async function start() {
   message.value = "";
   loading.value = false;
   progress.value = null;
+  transferLabel.value = "";
   if (!currentVideo) return;
   if (selected.value === "original") {
+    if (props.remote && !props.cloud && !props.shareKey) {
+      loading.value = true;
+      message.value = "正在准备视频流…";
+      try {
+        const source = await openVirtualMedia(props.id);
+        if (current !== generation) { source.close(); return; }
+        closeVirtualMedia = source.close;
+        currentVideo.src = source.url;
+        currentVideo.load();
+        void currentVideo.play().catch(() => {});
+      } catch (cause) {
+        if (current === generation) { loading.value = false; message.value = cause instanceof Error ? cause.message : "无法启动视频流"; }
+      }
+      return;
+    }
     // Let the browser's media stack issue byte-range requests for local files.
     // Reading the response into a Blob first would block playback until EOF.
     if (!props.remote && !props.cloud && !props.shareKey) {
@@ -313,13 +333,6 @@ function onCanPlay() {
   message.value = "";
   progress.value = null;
 }
-function onMediaProgress() {
-  const element = video.value;
-  if (!element || selected.value !== "original" || !Number.isFinite(element.duration) || element.duration <= 0 || !element.buffered.length) return;
-  const buffered = element.buffered.end(element.buffered.length - 1);
-  progress.value = Math.min(100, Math.round(buffered * 100 / element.duration));
-}
-
 watch(() => props.id, () => { restorePosition = 0; resumePlayback = false; started.value = false; dispose(); if (posterObjectURL) URL.revokeObjectURL(posterObjectURL); posterObjectURL = ""; posterURL.value = props.poster || ""; void loadPoster(); });
 watch([() => props.id, selected], async () => { if (!started.value) return; await nextTick(); void start(); }, { flush: "post" });
 onMounted(() => { void loadPoster(); });
@@ -340,7 +353,7 @@ onBeforeUnmount(() => { controller.abort(); dispose(); if (posterObjectURL) URL.
       <span v-if="loading || message || progress !== null" role="status">{{ message || (selected === 'original' ? '原片缓冲进度' : '视频片段读取进度') }}</span>
       <progress v-if="loading || progress !== null || (!started && message)" :value="progress === null ? undefined : progress" max="100"></progress><span v-if="progress !== null">{{ progress }}% · {{ transferLabel }}</span><span v-else-if="loading">{{ transferLabel }}</span>
     </div>
-    <div v-if="!started" class="stream-video-cover"><img v-if="posterURL" :src="posterURL" :alt="name + '封面'" /><div class="stream-video-cover-actions"><button type="button" @click="playPreview">{{ phoneNode ? '播放原片' : '播放预览' }}</button><button v-if="!phoneNode" type="button" @click="playOriginal">查看原片</button></div></div>
-    <video v-else ref="video" controls preload="metadata" playsinline @timeupdate="pump" @seeking="pump" @waiting="onWaiting" @canplay="onCanPlay" @progress="onMediaProgress" @loadedmetadata="onMetadata" @error="selected === 'original' && (message = '浏览器无法播放此原片格式，请下载查看。')"></video>
+    <div v-if="!started" class="stream-video-cover"><img v-if="posterURL" :src="posterURL" :alt="name + '封面'" /><div class="stream-video-cover-actions"><button type="button" @click="playPreview">{{ selected === 'original' ? '播放原片' : '播放预览' }}</button><button v-if="!phoneNode && selected !== 'original'" type="button" @click="playOriginal">查看原片</button></div></div>
+    <video v-else ref="video" controls preload="metadata" playsinline @timeupdate="pump" @seeking="pump" @waiting="onWaiting" @canplay="onCanPlay" @loadedmetadata="onMetadata" @error="selected === 'original' && (message = '浏览器无法播放此原片格式，请下载查看。')"></video>
   </div>
 </template>

@@ -9,8 +9,10 @@ import HubSettings from "./HubSettings.vue";
 import CloudPanel from "./CloudPanel.vue";
 import HubCloudDashboard from "./HubCloudDashboard.vue";
 import DeviceManager from "./DeviceManager.vue";
+import NodeTransfer from "./NodeTransfer.vue";
 import {
   Check,
+  ArrowDown,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -113,6 +115,7 @@ const ownerSession = ref(true);
 const nodeOnline = ref(false);
 const resourceNodes = ref<HubResourceNode[]>([]);
 const selectedResourceNodeID = ref("");
+const transferOpen = ref(false);
 const selectedResourceNodeKind = computed(() => resourceNodes.value.find((node) => node.id === selectedResourceNodeID.value)?.kind);
 const nodeTransport = ref<"connecting" | "webrtc" | "turn" | "relay">("relay");
 const nodePathSummary = ref("");
@@ -1644,6 +1647,9 @@ onBeforeUnmount(() => {
         <button class="nav-link" :class="{ active: activeFolderID === null }" @click="openFolder(null)">
           <House :size="17" /><span>文件夹首页</span>
         </button>
+        <button v-if="remoteMode && authenticated" class="nav-link" :class="{ active: transferOpen }" @click="transferOpen = true">
+          <ArrowDown :size="17" /><span>文件传输</span>
+        </button>
       </nav>
       <div class="sidebar-section-label folder-section-title"><span>文件夹</span><span class="sidebar-heading-actions"><span class="label-count">{{ folders.length }}</span><button class="sidebar-add" type="button" title="新建文件夹" aria-label="新建文件夹" :aria-expanded="sidebarFolderCreateOpen" @click="toggleSidebarFolderCreate"><Plus :size="14" /></button></span></div>
       <form v-if="sidebarFolderCreateOpen" class="sidebar-folder-create" @submit.prevent="submitFolder"><label class="sr-only" for="sidebar-new-folder-name">文件夹名称</label><input id="sidebar-new-folder-name" v-model="newFolderName" maxlength="80" placeholder="文件夹名称" autocomplete="off" /><button type="submit" :disabled="folderBusy || !newFolderName.trim()" aria-label="创建文件夹"><Plus :size="15" /></button></form>
@@ -1694,7 +1700,7 @@ onBeforeUnmount(() => {
 
     <div class="main-column">
       <header class="topbar">
-        <div class="breadcrumbs"><button type="button" class="breadcrumb-home" @click="openFolder(null)">我的资源</button><span class="breadcrumb-divider">/</span><strong>{{ detailResourceID ? "资源详情" : activeFolderID === null ? "文件夹" : pageTitle }}</strong></div>
+        <div class="breadcrumbs"><button type="button" class="breadcrumb-home" @click="transferOpen ? transferOpen = false : openFolder(null)">我的资源</button><span class="breadcrumb-divider">/</span><strong>{{ transferOpen ? "文件传输" : detailResourceID ? "资源详情" : activeFolderID === null ? "文件夹" : pageTitle }}</strong></div>
         <div class="topbar-actions">
           <template v-if="remoteMode">
             <label v-if="authenticated" class="resource-node-picker">资源节点
@@ -1711,12 +1717,6 @@ onBeforeUnmount(() => {
                 </div>
               </div>
             </details>
-            <span class="connection-badge traffic-badge" title="浏览器到服务端的 HTTPS 应用层流量；↓ 服务端发往网页，↑ 网页发往服务端。">
-              <span class="connection-dot"></span><span>Web · HTTPS 接入</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small>
-            </span>
-            <span class="connection-badge traffic-badge" :class="{ offline: !nodeOnline }" :title="nodeTransport === 'webrtc' ? 'WebRTC DataChannel 直连；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'turn' ? 'WebRTC DataChannel 通过 TURN 中继；↓ 节点发往网页，↑ 网页发往节点。' : nodeTransport === 'connecting' ? '正在协商 WebRTC；连接失败后文件内容经限速 Hub 中转。' : 'WebRTC 不可用；文件内容经限速 Hub 中转。'">
-              <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · WebRTC / TURN' : nodeTransport === 'connecting' ? '节点 · WebRTC 连接中' : '节点 · Hub 限速中转' }}</span><small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small><small v-if="nodePathSummary">{{ nodePathSummary }}</small>
-            </span>
           </template>
           <span v-else class="connection-badge"><span class="connection-dot"></span>本机模式</span>
           <HubSettings v-if="!remoteMode && authenticated" />
@@ -1729,7 +1729,8 @@ onBeforeUnmount(() => {
       </header>
 
       <main class="page-content">
-        <ResourceDetail v-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" :remote="remoteMode" :phone-node="selectedResourceNodeKind === 'android'" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
+        <NodeTransfer v-if="transferOpen && remoteMode && authenticated" :nodes="resourceNodes" :selected-node-id="selectedResourceNodeID" @close="transferOpen = false" />
+        <ResourceDetail v-else-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" :remote="remoteMode" :phone-node="selectedResourceNodeKind === 'android'" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
         <template v-else>
         <section v-if="activeFolderID === null" class="page-intro">
           <div>
@@ -1761,7 +1762,7 @@ onBeforeUnmount(() => {
           <form class="root-form" @submit.prevent="submitRoot">
             <label class="sr-only" for="root-path">文件夹路径</label>
             <input id="root-path" v-model="rootPath" type="text" placeholder="文件夹路径" autocomplete="off" />
-            <button class="button button-secondary picker-button" type="button" :disabled="rootBusy" @click="openFolderPicker"><FolderOpen :size="16" /><span>浏览文件夹</span></button>
+            <button class="button button-secondary picker-button" type="button" :disabled="rootBusy" @click="openFolderPicker()"><FolderOpen :size="16" /><span>浏览文件夹</span></button>
             <button class="button button-primary" type="submit" :disabled="rootBusy || !rootPath.trim()">
               <LoaderCircle v-if="rootBusy" class="spin" :size="16" /><Plus v-else :size="16" /><span>{{ rootBusy ? "正在扫描" : "添加目录" }}</span>
             </button>
@@ -2116,4 +2117,14 @@ onBeforeUnmount(() => {
 
     <Transition name="toast"><div v-if="toastVisible" class="toast-message" role="status"><Check :size="16" />{{ toastMessage }}</div></Transition>
   </div>
+  <Teleport to="body">
+    <aside v-if="remoteMode && authenticated" class="live-connection-meter" aria-label="实时连接状态与速率">
+      <div class="live-meter-row"><span class="connection-dot"></span><span>网页 · Hub HTTPS</span><small>↓ {{ formatRate(webTraffic.downloadBps) }}　↑ {{ formatRate(webTraffic.uploadBps) }}</small></div>
+      <div class="live-meter-row" :class="{ offline: !nodeOnline }" :title="nodePathSummary">
+        <span class="connection-dot"></span><span>{{ nodeTransport === 'webrtc' ? '节点 · WebRTC 直连' : nodeTransport === 'turn' ? '节点 · TURN 中继' : nodeTransport === 'connecting' ? '节点 · 连接协商中' : '节点 · Hub HTTPS 中转' }}</span>
+        <small>↓ {{ formatRate(nodeTraffic.downloadBps) }}　↑ {{ formatRate(nodeTraffic.uploadBps) }}</small>
+      </div>
+      <small v-if="nodePathSummary" class="live-meter-path">{{ nodePathSummary }}</small>
+    </aside>
+  </Teleport>
 </template>

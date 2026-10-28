@@ -9,6 +9,7 @@ import java.util.concurrent.*;
 
 /** Loopback Range bridge so Android's media player can seek through RTC. */
 final class RtcMediaProxy implements AutoCloseable {
+    private static final long CHUNK_SIZE=512L*1024;
     private final RemoteClient client;private final String path,key;
     private final ServerSocket listener;private final ExecutorService workers=Executors.newCachedThreadPool();
     private volatile boolean closed;
@@ -25,13 +26,31 @@ final class RtcMediaProxy implements AutoCloseable {
             String first=line(in);String[] request=first.split(" ");if(request.length<2||!("GET".equals(request[0])||"HEAD".equals(request[0]))||!request[1].equals("/"+key)){out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes(StandardCharsets.US_ASCII));return;}
             boolean head="HEAD".equals(request[0]);
             String range="";for(int i=0;i<64;i++){String value=line(in);if(value.isEmpty())break;int colon=value.indexOf(':');if(colon>0&&value.substring(0,colon).equalsIgnoreCase("Range"))range=value.substring(colon+1).trim();}
-            client.streamFile(path,head?"bytes=0-0":range,head?new ByteArrayOutputStream():out,(status,headers)->{
-                StringBuilder reply=new StringBuilder("HTTP/1.1 ").append(head?200:status).append(!head&&status==206?" Partial Content":" OK").append("\r\nConnection: close\r\n");
-                for(String name:new String[]{"Content-Type","Content-Length","Content-Range","Accept-Ranges"}){if(head&&"Content-Range".equals(name))continue;String value=header(headers,name);
-                    if(head&&"Content-Length".equals(name)){String contentRange=header(headers,"Content-Range");int slash=contentRange.lastIndexOf('/');if(slash>=0)value=contentRange.substring(slash+1);}
-                    if(!value.isEmpty()&&!value.contains("\r")&&!value.contains("\n"))reply.append(name).append(": ").append(value).append("\r\n");}
-                out.write(reply.append("\r\n").toString().getBytes(StandardCharsets.US_ASCII));out.flush();
+            JSONObject[] probe={null};
+            client.streamFile(path,"bytes=0-0",new ByteArrayOutputStream(),(status,headers)->{
+                if(status!=206||!header(headers,"Content-Range").matches("bytes 0-0/[0-9]+"))throw new IOException("资源节点不支持视频分段读取");
+                probe[0]=headers;
             });
+            if(probe[0]==null)throw new IOException("无法读取视频信息");
+            String contentRange=header(probe[0],"Content-Range");long total=Long.parseLong(contentRange.substring(contentRange.lastIndexOf('/')+1));
+            if(total<=0)throw new IOException("视频长度无效");
+            long start=0,end=total-1;
+            if(!range.isEmpty()){
+                if(!range.matches("bytes=[0-9]*-[0-9]*"))throw new IOException("视频范围无效");
+                String[] bounds=range.substring(6).split("-",-1);
+                if(bounds[0].isEmpty()){if(bounds[1].isEmpty())throw new IOException("视频范围无效");long suffix=Long.parseLong(bounds[1]);if(suffix<=0)throw new IOException("视频范围无效");start=Math.max(0,total-suffix);}
+                else{start=Long.parseLong(bounds[0]);if(!bounds[1].isEmpty())end=Math.min(end,Long.parseLong(bounds[1]));}
+                if(start>=total||end<start){out.write(("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */"+total+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));return;}
+            }
+            String type=header(probe[0],"Content-Type");if(type.isEmpty()||type.contains("\r")||type.contains("\n"))type="application/octet-stream";
+            StringBuilder reply=new StringBuilder("HTTP/1.1 ").append(range.isEmpty()?"200 OK":"206 Partial Content").append("\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Type: ").append(type).append("\r\nContent-Length: ").append(end-start+1).append("\r\n");
+            if(!range.isEmpty())reply.append("Content-Range: bytes ").append(start).append('-').append(end).append('/').append(total).append("\r\n");
+            out.write(reply.append("\r\n").toString().getBytes(StandardCharsets.US_ASCII));out.flush();
+            if(!head)for(long offset=start;offset<=end&&!closed;){
+                long last=Math.min(end,offset+CHUNK_SIZE-1);String expected="bytes "+offset+"-"+last+"/"+total;
+                client.streamFile(path,"bytes="+offset+"-"+last,out,(status,headers)->{if(status!=206||!expected.equals(header(headers,"Content-Range")))throw new IOException("视频分段内容发生变化");});
+                offset=last+1;
+            }
             out.flush();
         }catch(Exception ignored){}
     }

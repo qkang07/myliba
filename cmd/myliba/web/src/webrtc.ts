@@ -11,6 +11,7 @@ type PendingResponse = {
   reject: (error: Error) => void;
   controller?: ReadableStreamDefaultController<Uint8Array>;
   started: boolean;
+  cleanup?: () => void;
 };
 
 let peer: RTCPeerConnection | undefined;
@@ -83,7 +84,7 @@ function handleDataMessage(raw: string) {
     if (!bodyForbidden) {
       stream = new ReadableStream<Uint8Array>({
         start(controller) { request.controller = controller; },
-        cancel() { pending.delete(message.id!); },
+        cancel() { request.cleanup?.(); pending.delete(message.id!); const current = channel; if (current?.readyState === "open") void sendData(current, { type: "request-cancel", id: message.id }).catch(() => {}); },
       });
     }
     request.started = true;
@@ -98,17 +99,20 @@ function handleDataMessage(raw: string) {
     const error = new Error(message.error || "WebRTC 文件传输中断");
     if (request.started) request.controller?.error(error);
     else request.reject(error);
+    request.cleanup?.();
     pending.delete(message.id);
     return;
   }
   if (message.type === "end") {
     request.controller?.close();
+    request.cleanup?.();
     pending.delete(message.id);
   }
 }
 
 function failPending(error: Error) {
   for (const request of pending.values()) {
+    request.cleanup?.();
     if (!request.started) request.reject(error);
     else request.controller?.error(error);
   }
@@ -332,17 +336,38 @@ export async function webRTCFetch(input: RequestInfo | URL, init?: RequestInit):
   const body = new Uint8Array(await request.arrayBuffer());
   const headers: Record<string, string> = {};
   request.headers.forEach((value, key) => { headers[key] = value; });
-  const response = new Promise<Response>((resolve, reject) => pending.set(id, { resolve, reject, started: false }));
+  const response = new Promise<Response>((resolve, reject) => {
+    const entry: PendingResponse = { resolve, reject, started: false };
+    const abort = () => {
+      if (!pending.has(id)) return;
+      pending.delete(id);
+      entry.cleanup?.();
+      const error = new DOMException("请求已取消", "AbortError");
+      if (entry.started) entry.controller?.error(error); else entry.reject(error);
+      if (activeChannel.readyState === "open") void sendData(activeChannel, { type: "request-cancel", id }).catch(() => {});
+    };
+    entry.cleanup = () => request.signal.removeEventListener("abort", abort);
+    pending.set(id, entry);
+    request.signal.addEventListener("abort", abort, { once: true });
+    if (request.signal.aborted) abort();
+  });
+  // An abort can arrive while request frames are still being sent.
+  void response.catch(() => {});
   try {
+    if (request.signal.aborted) return response;
     await sendData(activeChannel, { type: "request", id, method: request.method, path: `${new URL(request.url).pathname}${new URL(request.url).search}`, headers });
+    if (request.signal.aborted) { await sendData(activeChannel, { type: "request-cancel", id }); return response; }
     for (let offset = 0; offset < body.length; offset += 24 * 1024) {
       const data = body.subarray(offset, Math.min(offset + 24 * 1024, body.length));
       let binary = "";
       for (const byte of data) binary += String.fromCharCode(byte);
       await sendData(activeChannel, { type: "request-chunk", id, data: btoa(binary) });
+      if (request.signal.aborted) { await sendData(activeChannel, { type: "request-cancel", id }); return response; }
     }
     await sendData(activeChannel, { type: "request-end", id });
+    if (request.signal.aborted) await sendData(activeChannel, { type: "request-cancel", id });
   } catch (error) {
+    pending.get(id)?.cleanup?.();
     pending.delete(id);
     throw error;
   }

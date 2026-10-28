@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.os.ParcelFileDescriptor;
 import android.util.Base64;
 import org.json.*;
 import java.io.*;
@@ -116,8 +117,14 @@ final class NodeResourceApi {
             String[] bounds=range.substring(6).split("-",-1);start=Long.parseLong(bounds[0]);if(!bounds[1].isEmpty())end=Math.min(end,Long.parseLong(bounds[1]));
             if(start>=item.size||end<start)return error(416,"文件范围无效");status=206;
         }
-        InputStream source=context.getContentResolver().openInputStream(Uri.parse(item.uri));if(source==null)return error(404,"文件不可访问");
-        long skipped=0;while(skipped<start){long n=source.skip(start-skipped);if(n<=0){source.close();return error(404,"文件不可访问");}skipped+=n;}
+        Uri fileUri=Uri.parse(item.uri);InputStream source=null;boolean positioned=false;
+        if(start>0){
+            try{ParcelFileDescriptor descriptor=context.getContentResolver().openFileDescriptor(fileUri,"r");
+                if(descriptor!=null){ParcelFileDescriptor.AutoCloseInputStream seekable=new ParcelFileDescriptor.AutoCloseInputStream(descriptor);try{seekable.getChannel().position(start);source=seekable;positioned=true;}catch(IOException ex){seekable.close();}}
+            }catch(IOException ignored){/* Some document providers only expose sequential streams. */}
+        }
+        if(source==null)source=context.getContentResolver().openInputStream(fileUri);if(source==null)return error(404,"文件不可访问");
+        long skipped=0;while(!positioned&&skipped<start){long n=source.skip(start-skipped);if(n<=0){source.close();return error(404,"文件不可访问");}skipped+=n;}
         long length=item.size==0?0:end-start+1;
         String type=item.mime==null||item.mime.isEmpty()?"application/octet-stream":item.mime;
         if(type.equals("text/html")||type.equals("image/svg+xml")||type.contains("javascript"))type="application/octet-stream";

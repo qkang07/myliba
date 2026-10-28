@@ -97,9 +97,9 @@ public final class PreviewActivity extends Activity {
         layout.setBackgroundColor(media?Color.BLACK:MobileUi.BG);
         getWindow().setStatusBarColor(media?Color.BLACK:MobileUi.BG);
         getWindow().setNavigationBarColor(media?Color.BLACK:MobileUi.PAPER);
-        getWindow().getDecorView().setSystemUiVisibility(media?View.SYSTEM_UI_FLAG_FULLSCREEN|View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY:View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR|View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        getWindow().getDecorView().setSystemUiVisibility(media?View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY:View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR|View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         setContentView(layout);
-        if (Build.VERSION.SDK_INT >= 35 && !media) {
+        if (Build.VERSION.SDK_INT >= 35) {
             getWindow().setDecorFitsSystemWindows(false);
             layout.setOnApplyWindowInsetsListener((view, insets) -> {
                 android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
@@ -375,7 +375,8 @@ public final class PreviewActivity extends Activity {
         FrameLayout.LayoutParams videoParams=new FrameLayout.LayoutParams(-1,-1,Gravity.CENTER);
         stage.addView(video,videoParams);
         content.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
-        video.setOnPreparedListener(player->{stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());hideLoading();player.setOnBufferingUpdateListener((mp,percent)->{if(percent<100)showLoading("正在缓冲原片…",percent);else hideLoading();});video.start();});
+        video.setOnPreparedListener(player->{stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());hideLoading();video.start();});
+        video.setOnInfoListener((player,what,extra)->{if(what==android.media.MediaPlayer.MEDIA_INFO_BUFFERING_START)showLoading("正在缓冲视频…",-1);else if(what==android.media.MediaPlayer.MEDIA_INFO_BUFFERING_END)hideLoading();return false;});
         video.setOnErrorListener((player, what, extra) -> {hideLoading();showMessage(remote?"视频无法播放，请返回详情下载原片。":"视频无法播放，可用其他应用打开。");if(originalAction!=null)originalAction.setEnabled(true);return true;});
     }
 

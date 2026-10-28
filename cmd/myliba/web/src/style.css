@@ -94,6 +94,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .traffic-badge { display: grid; grid-template-columns: 7px auto; column-gap: 7px; row-gap: 2px; min-height: 40px; align-content: center; padding: 4px 9px; border-radius: 9px; font-size: 10px; }
 .traffic-badge .connection-dot { grid-row: 1 / span 2; align-self: center; }
 .traffic-badge small { grid-column: 2; color: var(--text-muted); font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.live-connection-meter { position: fixed; z-index: 130; top: max(68px, calc(env(safe-area-inset-top) + 64px)); right: max(12px, env(safe-area-inset-right)); display: grid; gap: 4px; min-width: 260px; padding: 8px 11px; border: 1px solid rgb(220 227 221 / 90%); border-radius: 10px; background: rgb(255 255 255 / 95%); box-shadow: 0 4px 18px rgb(20 35 25 / 15%); backdrop-filter: blur(12px); color: var(--text-secondary); font-size: 10px; }
+body.detail-preview-open .live-connection-meter { top: max(8px, env(safe-area-inset-top)); }
+.live-meter-row { display: grid; grid-template-columns: 7px auto auto; align-items: center; gap: 7px; white-space: nowrap; }
+.live-meter-row small { color: var(--text-muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+.live-meter-row.offline .connection-dot { background: #c18a42; }
+.live-meter-path { overflow: hidden; padding-left: 14px; color: var(--text-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .quiet-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 0; background: transparent; color: var(--text-secondary); cursor: pointer; font-size: 11px; }
 .quiet-button:hover { color: var(--green); }
 .signout-button { padding: 7px 0 7px 5px; }
@@ -451,9 +457,11 @@ h1, h2, p { margin-top: 0; }
 }
 
 @media (max-width: 760px) {
-  .traffic-badge small { display: none; }
-  .traffic-badge { display: inline-flex; min-height: 29px; padding: 0 8px; }
-  .traffic-badge .connection-dot { display: inline-block; }
+  .live-connection-meter { top: max(68px, calc(env(safe-area-inset-top) + 64px)); right: max(8px, env(safe-area-inset-right)); min-width: 0; padding: 6px 8px; }
+  body.detail-preview-open .live-connection-meter { top: max(6px, env(safe-area-inset-top)); }
+  .live-meter-row { grid-template-columns: 7px auto; column-gap: 6px; row-gap: 1px; }
+  .live-meter-row small { grid-column: 2; }
+  .live-meter-path { max-width: min(70vw, 300px); }
 }
 
 @media (max-width: 430px) {

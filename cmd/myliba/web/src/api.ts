@@ -184,6 +184,39 @@ export function removeResourceNode(id: string) {
   return request<void>(`/api/hub/nodes/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
+export interface TransferEntry { name: string; path: string; dir: boolean; size: number }
+export interface TransferDirectory { current: string; parent: string; roots: Array<{ name: string; path: string }>; entries: TransferEntry[] }
+
+async function transferFetch(path: string, init?: RequestInit) {
+  const response = await fetch(path, { credentials: "same-origin", ...init });
+  if (!response.ok) {
+    const body = await response.json().catch(() => undefined);
+    throw new ApiError(response.status, body?.error || `传输请求失败 (${response.status})`);
+  }
+  return response;
+}
+
+export async function browseTransferDirectory(path = "") {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  return await (await transferFetch(`/api/transfers/browse${query}`)).json() as TransferDirectory;
+}
+
+export function readTransferChunk(path: string, offset: number, length: number, signal: AbortSignal) {
+  const query = new URLSearchParams({ path, offset: String(offset), length: String(length) });
+  return transferFetch(`/api/transfers/file?${query}`, { signal });
+}
+
+export function writeTransferChunk(path: string, id: string, offset: number, total: number, chunk: Blob, final: boolean, signal: AbortSignal) {
+  const query = new URLSearchParams({ path, id, offset: String(offset), total: String(total) });
+  if (final) query.set("final", "1");
+  return transferFetch(`/api/transfers/file?${query}`, { method: "PUT", body: chunk, signal, headers: { "Content-Type": "application/octet-stream" } });
+}
+
+export function cancelTransferFile(path: string, id: string) {
+  const query = new URLSearchParams({ path, id });
+  return transferFetch(`/api/transfers/file?${query}`, { method: "DELETE" });
+}
+
 export interface HubDevice {
   id: string;
   name: string;
@@ -247,7 +280,7 @@ export class ApiError extends Error {
   }
 }
 
-async function apiFetch(url: string, init?: RequestInit) {
+export async function apiFetch(url: string, init?: RequestInit) {
   if (remoteSession && contentPath.test(url)) await waitForWebRTCConnection();
   if (remoteSession && url.startsWith("/api/") && url !== "/api/session" && !url.startsWith("/api/hub/") && webRTCConnected()) {
     try {
@@ -255,6 +288,7 @@ async function apiFetch(url: string, init?: RequestInit) {
       if (response.status < 500 || !contentPath.test(url) || (init?.method && init.method !== "GET")) return response;
       // Retry server-side content failures through the authenticated Hub relay.
     } catch (error) {
+      if (init?.signal?.aborted) throw error;
       if (!contentPath.test(url) || (init?.method && init.method !== "GET")) throw error;
       // A data channel can look connected while the content request itself fails.
       // Retry the safe read through the authenticated Hub relay.
