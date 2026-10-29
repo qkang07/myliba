@@ -99,8 +99,11 @@ final class RemoteClient {
         streamFile(path,null,out,(status,headers)->{if(status<200||status>=300)throw new Failure(status,"文件传输失败（"+status+"）");});
     }
     void streamFile(String path,String range,OutputStream out,RemoteRTC.ResponseStart start)throws Exception{
+        streamFile(path,range,out,start,null);
+    }
+    void streamFile(String path,String range,OutputStream out,RemoteRTC.ResponseStart start,java.util.concurrent.atomic.AtomicBoolean cancelled)throws Exception{
         if(!rtcConfigured)json("GET","/api/session",null);
-        try{rtc.ensureConnected();}catch(Exception ex){AppLog.info("Remote media falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start);return;}
+        try{rtc.ensureConnected();}catch(Exception ex){if(cancelled!=null&&cancelled.get())throw ex;AppLog.info("Remote media falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start,cancelled);return;}
         JSONObject headers=new JSONObject();if(range!=null&&!range.isEmpty())headers.put("Range",new JSONArray().put(range));
         final int[] statusCode={0};
         final long[] forwarded={0};
@@ -113,23 +116,25 @@ final class RemoteClient {
             RemoteRTC.Reply reply=rtc.stream("GET",path,new byte[0],headers,counted,Long.MAX_VALUE,(status,responseHeadersValue)->{
                 statusCode[0]=status;
                 if(status<500){started[0]=true;if(start!=null)start.onStart(status,responseHeadersValue);}
-            });
-            if(reply.status>=500&&!started[0]){AppLog.info("Remote media falling back to limited Hub relay after RTC HTTP "+reply.status);streamFromHub(path,range,out,start);}
+            },cancelled);
+            if(reply.status>=500&&!started[0]){AppLog.info("Remote media falling back to limited Hub relay after RTC HTTP "+reply.status);streamFromHub(path,range,out,start,cancelled);}
             else if(!started[0]&&start!=null)start.onStart(reply.status,reply.headers);
         }
-        catch(Exception ex){if(forwarded[0]>0||started[0])throw ex;AppLog.info("Remote media falling back to limited Hub relay after RTC content failure: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start);}
+        catch(Exception ex){if((cancelled!=null&&cancelled.get())||forwarded[0]>0||started[0])throw ex;AppLog.info("Remote media falling back to limited Hub relay after RTC content failure: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start,cancelled);}
     }
-    private void streamFromHub(String path,String range,OutputStream out,RemoteRTC.ResponseStart start)throws Exception{
+    private void streamFromHub(String path,String range,OutputStream out,RemoteRTC.ResponseStart start,java.util.concurrent.atomic.AtomicBoolean cancelled)throws Exception{
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();
+        java.util.concurrent.atomic.AtomicBoolean finished=new java.util.concurrent.atomic.AtomicBoolean();
+        if(cancelled!=null){Thread watcher=new Thread(()->{while(!finished.get()&&!cancelled.get())try{Thread.sleep(100);}catch(InterruptedException ex){return;}if(cancelled.get()&&!finished.get())c.disconnect();},"media-relay-cancel");watcher.setDaemon(true);watcher.start();}
         try{
-            c.setRequestMethod("GET");c.setConnectTimeout(12000);c.setReadTimeout(30000);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
+            c.setRequestMethod("GET");c.setConnectTimeout(12000);c.setReadTimeout(path.contains("mode=ondemand")?120000:30000);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
             c.setRequestProperty("Origin",base);c.setRequestProperty("Referer",base+"/");if(!cookie.isEmpty())c.setRequestProperty("Cookie",cookie);
             if(range!=null&&!range.isEmpty())c.setRequestProperty("Range",range);
             int status=c.getResponseCode();if(status<200||status>=300){InputStream error=c.getErrorStream();byte[] data=new byte[0];if(error!=null){byte[] buffer=new byte[8192];int n=error.read(buffer);if(n>0)data=java.util.Arrays.copyOf(buffer,n);error.close();}if(status==401)forget();throw failure(status,data);}
             JSONObject headers=new JSONObject();for(String name:new String[]{"Content-Type","Content-Length","Content-Range","Accept-Ranges"}){String value=c.getHeaderField(name);if(value!=null)headers.put(name,new JSONArray().put(value));}
             if(start!=null)start.onStart(status,headers);
             try(InputStream in=c.getInputStream()){byte[] buffer=new byte[8192];int n;while((n=in.read(buffer))!=-1)out.write(buffer,0,n);}
-        }finally{c.disconnect();}
+        }finally{finished.set(true);c.disconnect();}
     }
     JSONObject selectNode(String id)throws Exception{
         JSONObject result=json("PUT","/api/hub/nodes/active",object("id",id));

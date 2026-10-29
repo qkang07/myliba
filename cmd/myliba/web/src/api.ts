@@ -601,6 +601,7 @@ export function getVideoInfo(id: string) {
 export type VideoQuality = "360p" | "720p" | "1080p";
 export interface VideoManifest {
   status: "missing" | "processing" | "failed" | "ready";
+  mode?: "ondemand";
   error?: string;
   codec?: string;
   duration?: number;
@@ -609,24 +610,24 @@ export interface VideoManifest {
 export function videoVariantURL(id: string, quality: VideoQuality) {
   return `/api/resources/${encodeURIComponent(id)}/video/${quality}`;
 }
-export function getVideoVariant(id: string, quality: VideoQuality) {
-  return request<VideoManifest>(videoVariantURL(id, quality));
+export function getVideoVariant(id: string, quality: VideoQuality, onDemand = false, signal?: AbortSignal) {
+  return request<VideoManifest>(videoVariantURL(id, quality) + (onDemand ? "?mode=ondemand" : ""), { signal });
 }
 export function createVideoVariant(id: string, quality: VideoQuality) {
   return request<VideoManifest>(videoVariantURL(id, quality), { method: "POST" });
 }
-export function getVideoPart(id: string, quality: VideoQuality, part: "init" | number) {
-  return apiFetch(`${videoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}`);
+export function getVideoPart(id: string, quality: VideoQuality, part: "init" | number, onDemand = false, signal?: AbortSignal) {
+  return apiFetch(`${videoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}${onDemand ? "?mode=ondemand" : ""}`, { signal });
 }
 
 export function cloudVideoVariantURL(id: string, quality: VideoQuality) {
   return `/api/cloud/files/${encodeURIComponent(id)}/video/${quality}`;
 }
-export function getCloudVideoVariant(id: string, quality: VideoQuality) {
-  return request<VideoManifest>(cloudVideoVariantURL(id, quality));
+export function getCloudVideoVariant(id: string, quality: VideoQuality, onDemand = false, signal?: AbortSignal) {
+  return request<VideoManifest>(cloudVideoVariantURL(id, quality) + (onDemand ? "?mode=ondemand" : ""), { signal });
 }
-export function getCloudVideoPart(id: string, quality: VideoQuality, part: "init" | number) {
-  return apiFetch(`${cloudVideoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}`);
+export function getCloudVideoPart(id: string, quality: VideoQuality, part: "init" | number, onDemand = false, signal?: AbortSignal) {
+  return apiFetch(`${cloudVideoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}${onDemand ? "?mode=ondemand" : ""}`, { signal });
 }
 
 export function removeResourceTag(id: string, tagID: string) {

@@ -74,6 +74,11 @@ public final class PreviewActivity extends Activity {
     private TextView originalAction;
     private boolean showingOriginal;
     private boolean videoStarted;
+    private String videoQuality="original";
+    private int videoRestorePosition;
+    private boolean videoResume=true;
+    private boolean videoFailed;
+    private TextView videoQualityAction;
     private long fileSize;
 
     @Override public void onCreate(Bundle state) {
@@ -375,9 +380,22 @@ public final class PreviewActivity extends Activity {
         FrameLayout.LayoutParams videoParams=new FrameLayout.LayoutParams(-1,-1,Gravity.CENTER);
         stage.addView(video,videoParams);
         content.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
-        video.setOnPreparedListener(player->{stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());hideLoading();video.start();});
+        if(remote&&mime.startsWith("video/")&&!"android".equals(getIntent().getStringExtra("source_node_kind"))){videoQualityAction=button("清晰度：原片",this::chooseVideoQuality);toolbar.addView(videoQualityAction);}
+        video.setOnPreparedListener(player->{videoFailed=false;stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());hideLoading();if(videoRestorePosition>0){video.seekTo(videoRestorePosition);videoRestorePosition=0;}if(videoResume)video.start();});
         video.setOnInfoListener((player,what,extra)->{if(what==android.media.MediaPlayer.MEDIA_INFO_BUFFERING_START)showLoading("正在缓冲视频…",-1);else if(what==android.media.MediaPlayer.MEDIA_INFO_BUFFERING_END)hideLoading();return false;});
-        video.setOnErrorListener((player, what, extra) -> {hideLoading();showMessage(remote?"视频无法播放，请返回详情下载原片。":"视频无法播放，可用其他应用打开。");if(originalAction!=null)originalAction.setEnabled(true);return true;});
+        video.setOnErrorListener((player, what, extra) -> {hideLoading();videoFailed=true;if(remote&&videoQualityAction!=null)android.widget.Toast.makeText(this,"视频无法播放，请尝试其他清晰度或原片",android.widget.Toast.LENGTH_LONG).show();else showMessage(remote?"视频无法播放，请返回详情下载原片。":"视频无法播放，可用其他应用打开。");if(originalAction!=null)originalAction.setEnabled(true);return true;});
+    }
+
+    private void chooseVideoQuality(){
+        String[] labels={"原片","360p · 省流量","720p · 标清","1080p · 高清"};String[] values={"original","360p","720p","1080p"};
+        new android.app.AlertDialog.Builder(this).setTitle("选择视频清晰度").setItems(labels,(dialog,index)->{
+            if(video==null||(!videoFailed&&values[index].equals(videoQuality)))return;
+            if(!videoFailed){videoRestorePosition=video.getCurrentPosition();videoResume=video.isPlaying();}videoFailed=false;video.stopPlayback();
+            if(mediaProxy!=null)mediaProxy.close();
+            videoQuality=values[index];videoQualityAction.setText("清晰度："+(index==0?"原片":values[index]));showLoading("正在准备视频片段…",-1);
+            try{RemoteClient client=new RemoteClient(getIntent().getStringExtra("server"),getSharedPreferences("MainActivity",MODE_PRIVATE),this);mediaProxy=new RtcMediaProxy(client,getIntent().getStringExtra("resource"),videoQuality);video.setVideoURI(Uri.parse(mediaProxy.url()));}
+            catch(Exception ex){hideLoading();showMessage("无法启动视频流："+ex.getMessage());}
+        }).show();
     }
 
     private void openExternal() {
@@ -388,7 +406,7 @@ public final class PreviewActivity extends Activity {
         catch (RuntimeException error) { showMessage("没有可打开此文件的应用，或目录授权已失效。"); }
     }
     private void toggleImageControls(){if(!mime.startsWith("image/"))return;imageControlsVisible=!imageControlsVisible;toolbar.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);if(browserNav!=null)browserNav.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);}
-    private void navigateMedia(int step){int target=browseIndex+step;if(browseIds==null||target<0||target>=browseIds.size())return;Intent next=new Intent(this,PreviewActivity.class);String id=browseIds.get(target);next.putExtra("uri",remote?getIntent().getStringExtra("server")+"/api/resources/"+RemoteClient.enc(id)+"/file":id);next.putExtra("name",browseNames.get(target));next.putExtra("mime",browseMimes.get(target));if(remote)next.putExtra("server",getIntent().getStringExtra("server")).putExtra("resource",id);next.putStringArrayListExtra("browse_ids",browseIds);next.putStringArrayListExtra("browse_names",browseNames);next.putStringArrayListExtra("browse_mimes",browseMimes);long[] sizes=getIntent().getLongArrayExtra("browse_sizes");if(sizes!=null){next.putExtra("browse_sizes",sizes);if(target<sizes.length)next.putExtra("size",sizes[target]);}next.putExtra("browse_index",target);startActivity(next);finish();}
+    private void navigateMedia(int step){int target=browseIndex+step;if(browseIds==null||target<0||target>=browseIds.size())return;Intent next=new Intent(this,PreviewActivity.class);String id=browseIds.get(target);next.putExtra("uri",remote?getIntent().getStringExtra("server")+"/api/resources/"+RemoteClient.enc(id)+"/file":id);next.putExtra("name",browseNames.get(target));next.putExtra("mime",browseMimes.get(target));if(remote)next.putExtra("server",getIntent().getStringExtra("server")).putExtra("resource",id).putExtra("source_node_kind",getIntent().getStringExtra("source_node_kind"));next.putStringArrayListExtra("browse_ids",browseIds);next.putStringArrayListExtra("browse_names",browseNames);next.putStringArrayListExtra("browse_mimes",browseMimes);long[] sizes=getIntent().getLongArrayExtra("browse_sizes");if(sizes!=null){next.putExtra("browse_sizes",sizes);if(target<sizes.length)next.putExtra("size",sizes[target]);}next.putExtra("browse_index",target);startActivity(next);finish();}
 
     private void fail(Exception error) { runOnUiThread(() -> { if (!closing) {hideLoading();showMessage("预览失败：" + error.getMessage());} }); }
 

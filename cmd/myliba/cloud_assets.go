@@ -376,6 +376,27 @@ func (c *cloudClient) cloudAssetPart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *cloudClient) cloudVideo(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("mode") == "ondemand" {
+		if c.indexer == nil || videoQualities[r.PathValue("quality")].width == 0 {
+			writeError(w, 503, "云视频转码不可用")
+			return
+		}
+		input, key, closeInput, err := c.demandInput(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeError(w, 503, "云层原片不可用")
+			return
+		}
+		defer closeInput()
+		manifest, err := demandManifest(r.Context(), c.indexer, input, key, r.PathValue("quality"))
+		if err != nil {
+			if r.Context().Err() == nil {
+				writeError(w, 503, err.Error())
+			}
+			return
+		}
+		writeJSON(w, 200, manifest)
+		return
+	}
 	_, manifest, err := c.findRecord(r.PathValue("id"))
 	if err != nil {
 		writeError(w, 404, "文件不存在")
@@ -398,6 +419,30 @@ func (c *cloudClient) cloudVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *cloudClient) cloudVideoPart(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("mode") == "ondemand" {
+		if c.indexer == nil || videoQualities[r.PathValue("quality")].width == 0 {
+			writeError(w, 503, "云视频转码不可用")
+			return
+		}
+		index := 0
+		raw := r.PathValue("segment")
+		if raw != "" {
+			var err error
+			index, err = strconv.Atoi(raw)
+			if err != nil || index < 0 || index > 21600 {
+				writeError(w, 400, "视频片段编号无效")
+				return
+			}
+		}
+		input, key, closeInput, err := c.demandInput(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeError(w, 503, "云层原片不可用")
+			return
+		}
+		defer closeInput()
+		serveDemandPart(w, r, c.indexer, input, key, r.PathValue("quality"), index, raw == "")
+		return
+	}
 	_, manifest, err := c.findRecord(r.PathValue("id"))
 	if err != nil {
 		writeError(w, 404, "文件不存在")

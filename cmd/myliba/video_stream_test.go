@@ -51,6 +51,11 @@ func TestVideoStreamRoutesStayDirect(t *testing.T) {
 	if !allowedShareRTCRequest(shareID, wireMessage{Method: http.MethodPost, Path: shareStatus, Headers: key}) {
 		t.Fatal("share video conversion denied")
 	}
+	if !allowedShareRTCRequest(shareID, wireMessage{Method: http.MethodGet, Path: shareSegment + "?mode=ondemand", Headers: key}) ||
+		allowedShareRTCRequest(shareID, wireMessage{Method: http.MethodGet, Path: shareSegment + "?mode=ondemand&extra=1", Headers: key}) ||
+		allowedShareRTCRequest(shareID, wireMessage{Method: http.MethodGet, Path: shareSegment + "?mode=ondemand"}) {
+		t.Fatal("on-demand share route authorization is invalid")
+	}
 	if allowedShareRTCRequest(shareID, wireMessage{Method: http.MethodGet, Path: shareSegment}) ||
 		allowedShareRTCRequest(shareID, wireMessage{Method: http.MethodGet, Path: shareStatus + "/segments/../file", Headers: key}) {
 		t.Fatal("share video route accepted an unauthorized request")

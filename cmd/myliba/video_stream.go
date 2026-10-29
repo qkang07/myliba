@@ -32,6 +32,7 @@ var videoQualities = map[string]videoQuality{
 
 type videoManifest struct {
 	Status   string    `json:"status"`
+	Mode     string    `json:"mode,omitempty"`
 	Error    string    `json:"error,omitempty"`
 	Codec    string    `json:"codec,omitempty"`
 	Duration float64   `json:"duration,omitempty"`
@@ -80,6 +81,17 @@ func (s *server) videoVariant(w http.ResponseWriter, r *http.Request) {
 	path, info, dir, err := s.videoSource(r.PathValue("id"), quality)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if r.URL.Query().Get("mode") == "ondemand" {
+		manifest, err := demandManifest(r.Context(), s, path, dir, quality)
+		if err != nil {
+			if r.Context().Err() == nil {
+				writeError(w, http.StatusServiceUnavailable, err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, manifest)
 		return
 	}
 	if manifest, err := readVideoManifest(dir); err == nil {
@@ -241,9 +253,21 @@ func mp4Codec(init []byte) string {
 }
 
 func (s *server) serveVideoPart(w http.ResponseWriter, r *http.Request, name, contentType string) {
-	_, _, dir, err := s.videoSource(r.PathValue("id"), r.PathValue("quality"))
+	path, _, dir, err := s.videoSource(r.PathValue("id"), r.PathValue("quality"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if r.URL.Query().Get("mode") == "ondemand" {
+		index := 0
+		if raw := r.PathValue("segment"); raw != "" {
+			index, err = strconv.Atoi(raw)
+			if err != nil {
+				writeError(w, 400, "视频片段编号无效")
+				return
+			}
+		}
+		serveDemandPart(w, r, s, path, dir, r.PathValue("quality"), index, name == "init.mp4")
 		return
 	}
 	if _, err := readVideoManifest(dir); err != nil {
@@ -274,6 +298,10 @@ func (s *server) videoSegment(w http.ResponseWriter, r *http.Request) {
 	index, err := strconv.Atoi(r.PathValue("segment"))
 	if err != nil || index < 0 || index > 99999 {
 		writeError(w, http.StatusBadRequest, "视频分段编号无效")
+		return
+	}
+	if r.URL.Query().Get("mode") == "ondemand" {
+		s.serveVideoPart(w, r, fmt.Sprintf("segment-%05d.m4s", index), "video/iso.segment")
 		return
 	}
 	_, _, dir, err := s.videoSource(r.PathValue("id"), r.PathValue("quality"))

@@ -325,6 +325,8 @@ func connectNode(parent context.Context, hubURL, token, nodeID, nodeName string,
 	conn.SetReadLimit(2 << 20)
 	log.Printf("Connected to remote hub %s", parsed.Host)
 	writeMu := &sync.Mutex{}
+	var requestsMu sync.Mutex
+	requests := map[string]context.CancelFunc{}
 	rtc, err := newNodeRTCManager(conn, writeMu, iceServers)
 	if err != nil {
 		return err
@@ -362,7 +364,25 @@ func connectNode(parent context.Context, hubURL, token, nodeID, nodeName string,
 		switch request.Type {
 		case "request":
 			if request.ID != "" {
-				go handleNodeRequest(ctx, conn, writeMu, &request)
+				requestsMu.Lock()
+				if _, exists := requests[request.ID]; exists {
+					requestsMu.Unlock()
+					continue
+				}
+				requestCtx, stop := context.WithCancel(ctx)
+				requests[request.ID] = stop
+				requestsMu.Unlock()
+				go func(input wireMessage, requestCtx context.Context, stop context.CancelFunc) {
+					defer func() { stop(); requestsMu.Lock(); delete(requests, input.ID); requestsMu.Unlock() }()
+					handleNodeRequest(requestCtx, conn, writeMu, &input)
+				}(request, requestCtx, stop)
+			}
+		case "request-cancel":
+			requestsMu.Lock()
+			stop := requests[request.ID]
+			requestsMu.Unlock()
+			if stop != nil {
+				stop()
 			}
 		case "rtc-signal":
 			rtc.handle(request.SessionID, request.ShareID, request.Signal)
@@ -554,11 +574,15 @@ func (h *remoteHub) proxy(w http.ResponseWriter, r *http.Request) {
 	waiter := &remoteWaiter{channel: make(chan wireMessage, 8), done: make(chan struct{}), node: conn}
 	h.waiters[id] = waiter
 	h.mu.Unlock()
+	completed := false
 	defer func() {
 		h.mu.Lock()
 		delete(h.waiters, id)
 		h.mu.Unlock()
 		waiter.finish()
+		if !completed {
+			go func() { _ = h.send(conn, wireMessage{Type: "request-cancel", ID: id}) }()
+		}
 	}()
 
 	path := r.URL.RequestURI()
@@ -591,6 +615,7 @@ func (h *remoteHub) proxy(w http.ResponseWriter, r *http.Request) {
 					flusher.Flush()
 				}
 			case "end":
+				completed = true
 				return
 			}
 		case <-waiter.done:

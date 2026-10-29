@@ -1,6 +1,7 @@
 import { apiFetch, fileURL } from "./api";
+import { webRTCFetch } from "./webrtc";
 
-type Source = { path: string; controllers: Set<AbortController> };
+type Source = { read: (range: string, signal: AbortSignal) => Promise<Response>; controllers: Set<AbortController> };
 const sources = new Map<string, Source>();
 let initialized: Promise<void> | undefined;
 let listening = false;
@@ -22,7 +23,7 @@ function initialize(): Promise<void> {
       port.onmessage = () => abort.abort();
       void (async () => {
         try {
-          const response = await apiFetch(source.path, { signal: abort.signal, headers: { Range: `bytes=${data.start}-${data.end}` } });
+          const response = await source.read(`bytes=${data.start}-${data.end}`, abort.signal);
           const range = response.headers.get("Content-Range") || "";
           const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(range);
           if (response.status !== 206 || !match || Number(match[1]) !== data.start || Number(match[2]) > data.end!) {
@@ -49,10 +50,13 @@ function initialize(): Promise<void> {
   return initialized;
 }
 
-export async function openVirtualMedia(resourceID: string): Promise<{ url: string; close: () => void }> {
+export async function openVirtualMedia(resourceID: string, options: { cloud?: boolean; shareKey?: string } = {}): Promise<{ url: string; close: () => void }> {
   await initialize();
   const token = crypto.randomUUID();
-  const source: Source = { path: fileURL(resourceID), controllers: new Set() };
+  const path = options.cloud ? `/api/cloud/files/${encodeURIComponent(resourceID)}/file` : options.shareKey ? `/api/shares/${encodeURIComponent(resourceID)}/file` : fileURL(resourceID);
+  const source: Source = { read: (range, signal) => options.shareKey
+    ? webRTCFetch(path, { signal, headers: { Range: range, "X-Myliba-Share-Key": options.shareKey } })
+    : apiFetch(path, { signal, headers: { Range: range } }), controllers: new Set() };
   sources.set(token, source);
   return { url: `/__myliba_media/${token}`, close: () => { sources.delete(token); for (const abort of source.controllers) abort.abort(); } };
 }

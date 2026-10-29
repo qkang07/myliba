@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -862,7 +863,12 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	if file, info := c.localOriginal(record, manifest); file != nil {
+	var localFile *os.File
+	var localInfo os.FileInfo
+	if r.Header.Get("Range") == "" || len(manifest.Chunks) == 0 {
+		localFile, localInfo = c.localOriginal(record, manifest)
+	}
+	if file, info := localFile, localInfo; file != nil {
 		defer file.Close()
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
@@ -883,6 +889,49 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
 		writeError(w, 500, "文件密钥无效")
+		return
+	}
+	if r.Header.Get("Range") != "" {
+		reader, readerErr := newCloudRangeReader(r.Context(), c, record, manifest, aead)
+		if readerErr != nil {
+			writeError(w, 500, "云层文件索引无效")
+			return
+		}
+		// Verify the first requested block before sending HTTP headers. If that
+		// cloud block is unavailable, retain the verified-local-file fallback.
+		requested := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+		bounds := strings.SplitN(requested, "-", 2)
+		var first int64
+		if len(bounds) == 2 {
+			if bounds[0] != "" {
+				first, _ = strconv.ParseInt(bounds[0], 10, 64)
+			} else if suffix, e := strconv.ParseInt(bounds[1], 10, 64); e == nil && suffix > 0 {
+				first = manifest.Size - suffix
+				if first < 0 {
+					first = 0
+				}
+			}
+		}
+		if first >= 0 && first < manifest.Size {
+			_, _ = reader.Seek(first, io.SeekStart)
+			var probe [1]byte
+			if _, readerErr = reader.Read(probe[:]); readerErr != nil {
+				if file, info := c.localOriginal(record, manifest); file != nil {
+					defer file.Close()
+					w.Header().Set("Content-Type", contentType)
+					w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+					w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+					http.ServeContent(w, r, manifest.Name, info.ModTime(), file)
+					return
+				}
+				writeError(w, http.StatusServiceUnavailable, "文件块暂不可用或校验失败")
+				return
+			}
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+		w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+		http.ServeContent(w, r, manifest.Name, time.Time{}, reader)
 		return
 	}
 	w.Header().Set("Content-Type", contentType)

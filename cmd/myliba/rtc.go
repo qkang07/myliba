@@ -317,11 +317,11 @@ func (m *nodeRTCManager) serveRTCRequest(ctx context.Context, session *nodeRTCSe
 
 func allowedShareRTCRequest(shareID string, input wireMessage) bool {
 	parsed, err := url.ParseRequestURI(input.Path)
-	if !validShareID(shareID) || err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || filteredHeaders(input.Headers, false).Get("X-Myliba-Share-Key") == "" {
+	if !validShareID(shareID) || err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.RawQuery != "" && parsed.RawQuery != "mode=ondemand") || filteredHeaders(input.Headers, false).Get("X-Myliba-Share-Key") == "" {
 		return false
 	}
 	base := "/api/shares/" + shareID
-	if input.Method == http.MethodGet && parsed.Path == base+"/file" {
+	if input.Method == http.MethodGet && parsed.Path == base+"/file" && parsed.RawQuery == "" {
 		return true
 	}
 	if !strings.HasPrefix(parsed.Path, base+"/video/") {

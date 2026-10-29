@@ -170,13 +170,17 @@ final class RemoteRTC implements AutoCloseable {
         return stream(method,path,body,headers,output,max,null);
     }
     Reply stream(String method,String path,byte[] body,JSONObject headers,OutputStream output,long max,ResponseStart startHandler)throws Exception{
+        return stream(method,path,body,headers,output,max,startHandler,null);
+    }
+    Reply stream(String method,String path,byte[] body,JSONObject headers,OutputStream output,long max,ResponseStart startHandler,AtomicBoolean cancelled)throws Exception{
         ensureConnected();long transferStarted=android.os.SystemClock.elapsedRealtime();DataChannel requestChannel=channel;String id=UUID.randomUUID().toString();BlockingQueue<JSONObject> queue=new LinkedBlockingQueue<>();pending.put(id,queue);
         try{
             send(new JSONObject().put("type","request").put("id",id).put("method",method).put("path",path).put("headers",headers));
             if(body!=null)for(int offset=0;offset<body.length;offset+=24<<10)send(new JSONObject().put("type","request-chunk").put("id",id).put("data",Base64.encodeToString(body,offset,Math.min(24<<10,body.length-offset),Base64.NO_WRAP)));
             send(new JSONObject().put("type","request-end").put("id",id));
             int status=0;JSONObject responseHeaders=new JSONObject();long total=0;
-            while(true){JSONObject message=queue.poll(30,TimeUnit.SECONDS);if(message==null||!connected())throw new IOException("RTC 文件传输中断");
+            long deadline=android.os.SystemClock.elapsedRealtime()+(path.contains("mode=ondemand")?120000:30000);
+            while(true){if(cancelled!=null&&cancelled.get())throw new ConsumerFailure(new IOException("视频请求已取消"));JSONObject message=queue.poll(1,TimeUnit.SECONDS);if(!connected()||android.os.SystemClock.elapsedRealtime()>deadline)throw new IOException("RTC 文件传输中断");if(message==null)continue;deadline=android.os.SystemClock.elapsedRealtime()+30000;
                 String type=message.optString("type");
                 if("start".equals(type)){status=message.optInt("status",502);responseHeaders=message.optJSONObject("headers");if(responseHeaders==null)responseHeaders=new JSONObject();if(startHandler!=null)try{startHandler.onStart(status,responseHeaders);}catch(Exception ex){throw new ConsumerFailure(ex);}}
                 else if("chunk".equals(type)){byte[] chunk=Base64.decode(message.optString("data",""),Base64.DEFAULT);total+=chunk.length;if(total>max)throw new IOException("响应内容过大");try{output.write(chunk);}catch(IOException ex){throw new ConsumerFailure(ex);}}

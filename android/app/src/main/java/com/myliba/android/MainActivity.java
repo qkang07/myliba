@@ -633,7 +633,7 @@ public final class MainActivity extends Activity {
         Intent intent=new Intent(this,PreviewActivity.class);
         intent.putExtra("uri",remotePreview?s.client.base+"/api/resources/"+RemoteClient.enc(e.id)+"/file":s.remote?localUri:e.id);
         intent.putExtra("name",e.name).putExtra("mime",e.mime).putExtra("size",e.size);
-        if(remotePreview)intent.putExtra("server",s.client.base).putExtra("resource",e.id);
+        if(remotePreview){intent.putExtra("server",s.client.base).putExtra("resource",e.id);for(int i=0;i<s.client.nodes.length();i++){JSONObject node=s.client.nodes.optJSONObject(i);if(node!=null&&s.client.selectedNodeId.equals(node.optString("id"))){intent.putExtra("source_node_kind",node.optString("kind"));break;}}}
         ArrayList<String> ids=new ArrayList<>(),names=new ArrayList<>(),mimes=new ArrayList<>();ArrayList<Long> sizes=new ArrayList<>();
         for(LibraryStore.Entry item:entries)if(item.available&&item.kind.equals(e.kind)&&(item.kind.equals("image")||item.kind.equals("video"))){String id=remotePreview?item.id:selfNode?indexedSelfNodeUri(item.id):item.id;if(!id.isEmpty()){ids.add(id);names.add(item.name);mimes.add(item.mime);sizes.add(item.size);}}
         int browseAt=ids.indexOf(remotePreview?e.id:selfNode?localUri:e.id);
