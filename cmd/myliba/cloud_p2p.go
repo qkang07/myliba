@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -104,6 +105,8 @@ func (c *cloudRuntime) p2pRequest(parent context.Context, method, target, path, 
 	finished := make(chan result, 1)
 	var received bytes.Buffer
 	status := 0
+	var payloadStarted time.Time
+	var payloadElapsed time.Duration
 	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if msg.IsString {
 			var header cloudChannelHeader
@@ -121,13 +124,23 @@ func (c *cloudRuntime) p2pRequest(parent context.Context, method, target, path, 
 					}
 					return
 				}
+				if !payloadStarted.IsZero() {
+					payloadElapsed = time.Since(payloadStarted)
+				}
 				data := append([]byte(nil), received.Bytes()...)
+				header := make(http.Header)
+				if payloadElapsed > 0 {
+					header.Set("X-Myliba-Payload-Duration-Millis", fmt.Sprint(payloadElapsed.Milliseconds()))
+				}
 				select {
-				case finished <- result{response: &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader(data))}}:
+				case finished <- result{response: &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(bytes.NewReader(data))}}:
 				default:
 				}
 			}
 		} else if received.Len()+len(msg.Data) <= 16<<20 {
+			if received.Len() == 0 {
+				payloadStarted = time.Now()
+			}
 			_, _ = received.Write(msg.Data)
 		} else {
 			select {
@@ -219,8 +232,53 @@ func (c *cloudRuntime) p2pRequest(parent context.Context, method, target, path, 
 	}
 	select {
 	case result := <-finished:
+		if result.err == nil && result.response != nil {
+			if result.response.Header == nil {
+				result.response.Header = make(http.Header)
+			}
+			result.response.Header.Set("X-Myliba-Selected-ICE-Pair", cloudSelectedICEPair(peer))
+		}
 		return result.response, result.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func cloudSelectedICEPair(peer *webrtc.PeerConnection) string {
+	if peer == nil {
+		return ""
+	}
+	stats := peer.GetStats()
+	for _, stat := range stats {
+		transport, ok := stat.(webrtc.TransportStats)
+		if !ok || transport.SelectedCandidatePairID == "" {
+			continue
+		}
+		pair, ok := stats[transport.SelectedCandidatePairID].(webrtc.ICECandidatePairStats)
+		if !ok {
+			continue
+		}
+		local, localOK := stats[pair.LocalCandidateID].(webrtc.ICECandidateStats)
+		remote, remoteOK := stats[pair.RemoteCandidateID].(webrtc.ICECandidateStats)
+		if !localOK || !remoteOK {
+			continue
+		}
+		localType := string(local.CandidateType) + "/" + strings.ToLower(local.Protocol) + "/" + cloudIPFamily(local.IP)
+		if local.NetworkType != "" {
+			localType += "/" + strings.ToLower(local.NetworkType)
+		}
+		remoteType := string(remote.CandidateType) + "/" + strings.ToLower(remote.Protocol) + "/" + cloudIPFamily(remote.IP)
+		return localType + " ↔ " + remoteType
+	}
+	return ""
+}
+
+func cloudIPFamily(ip string) string {
+	if strings.Contains(ip, ":") {
+		return "ipv6"
+	}
+	if ip != "" {
+		return "ipv4"
+	}
+	return "unknown"
 }

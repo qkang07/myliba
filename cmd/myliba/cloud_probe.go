@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -17,11 +18,40 @@ type cloudPeerStatus struct {
 }
 
 type cloudPathCheck struct {
-	State         string `json:"state"`
-	RTTMillis     int64  `json:"rttMillis,omitempty"`
-	ConnectMillis int64  `json:"connectMillis,omitempty"`
-	SpeedBps      int64  `json:"speedBps,omitempty"`
+	State          string `json:"state"`
+	RTTMillis      int64  `json:"rttMillis,omitempty"`
+	ConnectMillis  int64  `json:"connectMillis,omitempty"`
+	SpeedBps       int64  `json:"speedBps,omitempty"`
+	Bytes          int64  `json:"bytes,omitempty"`
+	DurationMillis int64  `json:"durationMillis,omitempty"`
+	HTTPStatus     int    `json:"httpStatus,omitempty"`
+	SelectedPair   string `json:"selectedPair,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
+
+type cloudSpeedTestResult struct {
+	PeerID         string             `json:"peerId"`
+	Path           string             `json:"path"`
+	State          string             `json:"state"`
+	Bytes          int64              `json:"bytes,omitempty"`
+	DurationMillis int64              `json:"durationMillis,omitempty"`
+	SpeedBps       int64              `json:"speedBps,omitempty"`
+	ConnectMillis  int64              `json:"connectMillis,omitempty"`
+	SelectedPair   string             `json:"selectedPair,omitempty"`
+	Error          string             `json:"error,omitempty"`
+	StartedAt      time.Time          `json:"startedAt"`
+	Rounds         int                `json:"rounds,omitempty"`
+	Samples        []cloudSpeedSample `json:"samples,omitempty"`
+}
+
+type cloudSpeedSample struct {
+	Bytes          int64 `json:"bytes"`
+	DurationMillis int64 `json:"durationMillis"`
+	ConnectMillis  int64 `json:"connectMillis"`
+	SpeedBps       int64 `json:"speedBps"`
+}
+
+const cloudSpeedTestBytes = 4 << 20
 
 func (c *cloudRuntime) peerStatuses() map[string]cloudPeerStatus {
 	c.mu.RLock()
@@ -105,14 +135,19 @@ func (c *cloudRuntime) checkCloudPath(ctx context.Context, negotiated bool, requ
 		started := time.Now()
 		resp, err := request("/cloud/diagnostic-payload?bytes=262144")
 		if err != nil || resp == nil {
-			return cloudPathCheck{State: "unreachable"}
+			return cloudPathCheck{State: "unreachable", Error: cloudDiagnosticError(err)}
 		}
 		count, copyErr := io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		elapsed := time.Since(started)
-		check := cloudPathCheck{State: "connected", ConnectMillis: elapsed.Milliseconds()}
+		check := cloudPathCheck{State: "connected", ConnectMillis: elapsed.Milliseconds(), Bytes: count, DurationMillis: elapsed.Milliseconds(), HTTPStatus: resp.StatusCode}
+		check.SelectedPair = resp.Header.Get("X-Myliba-Selected-ICE-Pair")
 		if resp.StatusCode != http.StatusOK || copyErr != nil || count == 0 {
 			check.State = "unreachable"
+			check.Error = cloudDiagnosticError(copyErr)
+			if resp.StatusCode != http.StatusOK {
+				check.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			}
 			return check
 		}
 		if elapsed > 0 {
@@ -125,11 +160,11 @@ func (c *cloudRuntime) checkCloudPath(ctx context.Context, negotiated bool, requ
 		started := time.Now()
 		resp, err := request("/cloud/ping")
 		if err != nil {
-			return cloudPathCheck{State: "unreachable"}
+			return cloudPathCheck{State: "unreachable", Error: cloudDiagnosticError(err)}
 		}
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusNoContent {
-			return cloudPathCheck{State: "unreachable"}
+			return cloudPathCheck{State: "unreachable", Error: fmt.Sprintf("ping HTTP %d", resp.StatusCode)}
 		}
 		total += time.Since(started)
 	}
@@ -137,12 +172,32 @@ func (c *cloudRuntime) checkCloudPath(ctx context.Context, negotiated bool, requ
 	started := time.Now()
 	resp, err := request("/cloud/diagnostic-payload?bytes=262144")
 	if err == nil && resp != nil {
+		check.HTTPStatus = resp.StatusCode
 		count, copyErr := io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		elapsed := time.Since(started)
 		if copyErr == nil && count > 0 && elapsed > 0 {
 			check.SpeedBps = int64(float64(count) / elapsed.Seconds())
+			check.Bytes = count
+			check.DurationMillis = elapsed.Milliseconds()
+		} else if copyErr != nil {
+			check.Error = cloudDiagnosticError(copyErr)
+		} else if resp.StatusCode != http.StatusOK {
+			check.Error = fmt.Sprintf("diagnostic HTTP %d", resp.StatusCode)
 		}
+	} else {
+		check.Error = cloudDiagnosticError(err)
 	}
 	return check
+}
+
+func cloudDiagnosticError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.TrimSpace(err.Error())
+	if len(message) > 240 {
+		message = message[:240]
+	}
+	return message
 }

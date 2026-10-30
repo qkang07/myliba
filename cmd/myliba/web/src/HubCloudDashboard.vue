@@ -46,10 +46,12 @@ function speed(value?: number) {
   while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
   return `${value.toFixed(1)} ${units[index]}`;
 }
-function checkDetail(path: string, check: { state: string; rttMillis?: number; connectMillis?: number; speedBps?: number }) {
-  if (check.state !== "connected") return "不可达";
-  const latency = path === "webrtc" ? `建链 ${check.connectMillis ?? "?"} ms` : `${check.rttMillis ?? "?"} ms`;
-  return `可达 · ${latency} · ${speed(check.speedBps)}`;
+function checkDetail(path: string, check: { state: string; rttMillis?: number; connectMillis?: number; speedBps?: number; bytes?: number; durationMillis?: number; httpStatus?: number; selectedPair?: string; error?: string }) {
+  if (check.state !== "connected") return check.error ? `不可达 · ${check.error}` : "不可达";
+  const latency = path === "webrtc" ? `建链/请求 ${check.connectMillis ?? "?"} ms` : `RTT ${check.rttMillis ?? "?"} ms`;
+  const sample = check.bytes ? ` · ${size(check.bytes)} / ${check.durationMillis ?? "?"} ms` : "";
+  const status = check.httpStatus ? ` · HTTP ${check.httpStatus}` : "";
+  return `可达 · ${latency} · ${speed(check.speedBps)}${sample}${status}${check.selectedPair ? ` · ICE ${check.selectedPair}` : ""}${check.error ? ` · ${check.error}` : ""}`;
 }
 watch(open, (value) => {
   if (timer) clearInterval(timer);

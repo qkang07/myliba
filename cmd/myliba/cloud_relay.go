@@ -91,7 +91,7 @@ func cloudRelayPath(method, path string) bool {
 			return false
 		}
 		size, err := strconv.Atoi(values[0])
-		return err == nil && size > 0 && size <= 1<<20
+		return err == nil && size > 0 && size <= 4<<20
 	}
 	if method == http.MethodGet && u.Path == "/cloud/inventory" {
 		return u.RawQuery == "" || (len(u.Query()) == 1 && validCloudHash(u.Query().Get("after")))

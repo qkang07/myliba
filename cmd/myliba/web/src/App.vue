@@ -92,6 +92,8 @@ import {
   selectResourceNode,
   removeResourceNode,
   selectMediaStore,
+  migrateMediaStore,
+  setMediaStoreCapacity,
   updateCollection,
   type DirectoryListing,
   type BatchTagSuggestion,
@@ -139,6 +141,8 @@ const thumbnailBatchProgress = ref({ done: 0, total: 0 });
 const roots = ref<RootSummary[]>([]);
 const mediaStores = ref<MediaStore[]>([]);
 const mediaStorePath = ref("");
+const mediaStoreCapacityGB = ref("10");
+const mediaStoreCapacityDrafts = ref<Record<string, string>>({});
 const mediaStoreBusy = ref(false);
 const tags = ref<TagSummary[]>([]);
 const attributeCatalog = ref<AttributeTag[]>([]);
@@ -195,6 +199,7 @@ const rootBusy = ref(false);
 const rootSettingBusyID = ref("");
 const pickerBusy = ref(false);
 const directoryPickerOpen = ref(false);
+const directoryPickerPurpose = ref<"root" | "storage">("root");
 const directoryListing = ref<DirectoryListing | null>(null);
 const directoryError = ref("");
 const scanningRootID = ref("");
@@ -624,12 +629,26 @@ async function loadMediaStores() {
 async function submitMediaStore() {
   const path = mediaStorePath.value.trim();
   if (!path || mediaStoreBusy.value) return;
+  const capacityGB = Number(mediaStoreCapacityGB.value);
+  if (!Number.isFinite(capacityGB) || capacityGB < 0) { showError("容量上限请输入大于等于 0 的数字"); return; }
   mediaStoreBusy.value = true;
   try {
-    await addMediaStore(path);
+    await addMediaStore(path, Math.floor(capacityGB * 1024 ** 3));
     mediaStorePath.value = "";
     await loadMediaStores();
   } catch (error) { showError(error); }
+  finally { mediaStoreBusy.value = false; }
+}
+
+function capacityGBText(bytes: number) { return bytes > 0 ? String(Math.round(bytes / 1024 ** 3 * 100) / 100) : "0"; }
+
+async function saveMediaStoreCapacity(store: MediaStore) {
+  const raw = mediaStoreCapacityDrafts.value[store.id] ?? capacityGBText(store.maxBytes);
+  const gb = Number(raw);
+  if (!Number.isFinite(gb) || gb < 0) { showError("容量上限请输入大于等于 0 的数字"); return; }
+  mediaStoreBusy.value = true;
+  try { await setMediaStoreCapacity(store.id, Math.floor(gb * 1024 ** 3)); await loadMediaStores(); }
+  catch (error) { showError(error); }
   finally { mediaStoreBusy.value = false; }
 }
 
@@ -640,6 +659,20 @@ async function makeDefaultMediaStore(id: string) {
     await selectMediaStore(id);
     await loadMediaStores();
   } catch (error) { showError(error); }
+  finally { mediaStoreBusy.value = false; }
+}
+
+async function migrateMediaStoreTo(source: MediaStore) {
+  const targets = mediaStores.value.filter((store) => store.id !== source.id);
+  if (mediaStoreBusy.value || source.isDefault || targets.length === 0) return;
+  const choice = window.prompt(`将“${source.path}”中的附加内容迁移到哪个目录？输入序号：\n${targets.map((store, index) => `${index + 1}. ${store.path}（${formatBytes(store.usedBytes)} / ${store.maxBytes > 0 ? formatBytes(store.maxBytes) : "不限"}）`).join("\n")}`);
+  if (choice === null) return;
+  const index = Number(choice) - 1;
+  if (!Number.isInteger(index) || index < 0 || index >= targets.length) { showError("请输入列表中的目标序号"); return; }
+  if (!window.confirm(`迁移成功后会从“${source.path}”清理 Myliba 管理的附加内容并移除此存储位置。目录中的其他文件会保留。继续吗？`)) return;
+  mediaStoreBusy.value = true;
+  try { await migrateMediaStore(source.id, targets[index].id); await loadMediaStores(); notify("附加内容已迁移，存储位置已移除"); }
+  catch (error) { showError(error); }
   finally { mediaStoreBusy.value = false; }
 }
 
@@ -1292,7 +1325,18 @@ async function submitRoot() {
 
 async function openFolderPicker(targetFolderID = "") {
   if (rootBusy.value || directoryPickerOpen.value) return;
+  directoryPickerPurpose.value = "root";
   folderScanTarget.value = targetFolderID;
+  directoryPickerOpen.value = true;
+  directoryListing.value = null;
+  directoryError.value = "";
+  await browseDirectories("");
+}
+
+async function openStorageDirectoryPicker() {
+  if (directoryPickerOpen.value || mediaStoreBusy.value) return;
+  directoryPickerPurpose.value = "storage";
+  folderScanTarget.value = "";
   directoryPickerOpen.value = true;
   directoryListing.value = null;
   directoryError.value = "";
@@ -1315,6 +1359,10 @@ async function selectCurrentDirectory() {
   const path = directoryListing.value?.current;
   if (!path) return;
   directoryPickerOpen.value = false;
+  if (directoryPickerPurpose.value === "storage") {
+    mediaStorePath.value = path;
+    return;
+  }
   const targetFolderID = folderScanTarget.value;
   folderScanTarget.value = "";
   if (targetFolderID) {
@@ -1781,19 +1829,26 @@ onBeforeUnmount(() => {
           </div>
           <div class="panel-heading">
             <span class="panel-icon"><HardDrive :size="18" /></span>
-            <span class="panel-heading-copy"><strong>生成内容存储位置</strong><small>缩略图和多尺寸视频可保存到多个本机目录；默认位置用于新生成的内容，旧文件保持原位。</small></span>
+            <span class="panel-heading-copy"><strong>本机附加内容与云层存储</strong><small>应用默认目录始终排在第一位；缩略图、视频片段和云层加密块共用目录配额，达到上限后使用后续目录。</small></span>
           </div>
           <form class="root-form" @submit.prevent="submitMediaStore">
             <label class="sr-only" for="media-store-path">媒体存储目录</label>
-            <input id="media-store-path" v-model="mediaStorePath" type="text" placeholder="已有的本机目录路径" autocomplete="off" />
+            <input id="media-store-path" v-model="mediaStorePath" type="text" placeholder="选择本机目录" autocomplete="off" readonly />
+            <button class="button button-secondary" type="button" :disabled="mediaStoreBusy" @click="openStorageDirectoryPicker"><FolderOpen :size="15" />选择目录</button>
+            <label class="sr-only" for="media-store-capacity">容量上限 GB</label>
+            <input id="media-store-capacity" v-model="mediaStoreCapacityGB" type="number" min="0" step="0.1" placeholder="容量上限 GB（0 不限）" />
             <button class="button button-primary" type="submit" :disabled="mediaStoreBusy || !mediaStorePath.trim()"><Plus :size="16" />添加位置</button>
           </form>
           <div v-if="mediaStores.length" class="root-list">
             <div v-for="store in mediaStores" :key="store.id" class="root-row">
               <span class="root-folder-icon"><HardDrive :size="15" /></span>
               <span class="root-path" :title="store.path">{{ store.path }}</span>
-              <span class="root-count">{{ store.isDefault ? "新内容默认位置" : "已配置" }}</span>
+              <span class="root-count">{{ formatBytes(store.usedBytes) }} / {{ store.maxBytes > 0 ? formatBytes(store.maxBytes) : "不限" }}{{ store.isDefault ? " · 新内容默认位置" : "" }}</span>
+              <label class="sr-only" :for="`media-capacity-${store.id}`">容量上限 GB</label>
+              <input :id="`media-capacity-${store.id}`" v-model="mediaStoreCapacityDrafts[store.id]" type="number" min="0" step="0.1" :placeholder="capacityGBText(store.maxBytes)" class="media-capacity-input" />
+              <button class="button button-ghost" type="button" :disabled="mediaStoreBusy" @click="saveMediaStoreCapacity(store)">保存上限</button>
               <button v-if="!store.isDefault" class="button button-ghost" type="button" :disabled="mediaStoreBusy" @click="makeDefaultMediaStore(store.id)">设为默认</button>
+              <button v-if="!store.isDefault" class="button button-ghost" type="button" :disabled="mediaStoreBusy || mediaStores.length < 2" @click="migrateMediaStoreTo(store)">迁移并移除</button>
             </div>
           </div>
         </section>
@@ -2079,7 +2134,7 @@ onBeforeUnmount(() => {
       <section class="directory-picker" role="dialog" aria-modal="true" aria-labelledby="directory-picker-title">
         <header class="directory-picker-header">
           <span class="panel-icon"><FolderOpen :size="18" /></span>
-          <div><h2 id="directory-picker-title">选择索引目录</h2><p>{{ folderScanTarget ? `扫描后会将资源加入「${folderTitle}」，原文件不会移动或复制。` : '浏览本机文件夹，原文件不会移动或复制。' }}</p></div>
+          <div><h2 id="directory-picker-title">{{ directoryPickerPurpose === "storage" ? "选择存储目录" : "选择索引目录" }}</h2><p>{{ directoryPickerPurpose === "storage" ? "Myliba 会在此目录保存缩略图、视频片段等生成内容。" : folderScanTarget ? `扫描后会将资源加入「${folderTitle}」，原文件不会移动或复制。` : '浏览本机文件夹，原文件不会移动或复制。' }}</p></div>
           <button class="quiet-button directory-close" aria-label="关闭" @click="directoryPickerOpen = false"><X :size="18" /></button>
         </header>
         <div class="directory-picker-toolbar">
@@ -2096,7 +2151,7 @@ onBeforeUnmount(() => {
             <div v-if="!directoryListing.roots.length && !directoryListing.directories.length" class="directory-empty">此目录下没有子文件夹</div>
           </template>
         </div>
-        <footer class="directory-picker-footer">{{ directoryListing?.current ? "选择当前目录后，Myliba 会开始扫描其中的文件。" : "先选择一个磁盘，再逐层打开目标文件夹。" }}</footer>
+        <footer class="directory-picker-footer">{{ directoryListing?.current ? (directoryPickerPurpose === "storage" ? "选好目录后，设置容量上限并添加。" : "选择当前目录后，Myliba 会开始扫描其中的文件。") : "先选择一个磁盘，再逐层打开目标文件夹。" }}</footer>
       </section>
     </div>
 

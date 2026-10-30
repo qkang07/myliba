@@ -98,7 +98,7 @@ final class CloudPeerClient {
 			CountDownLatch gathered=new CountDownLatch(1);List<String> candidates=Collections.synchronizedList(new ArrayList<>());PeerConnection[] peerRef=new PeerConnection[1];
 			peer=factory.createPeerConnection(new PeerConnection.RTCConfiguration(ice),new PeerConnection.Observer(){
 				@Override public void onSignalingChange(PeerConnection.SignalingState state){}
-				@Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Cloud peer outbound ICE "+state+"; "+WebRtcDiagnostics.network(storage));if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(peerRef[0],"Cloud peer outbound");}
+				@Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){AppLog.info("Cloud peer outbound ICE "+state+"; "+WebRtcDiagnostics.network(storage));if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(peerRef[0],"Cloud peer outbound",summary->{if(summary!=null&&!summary.isEmpty())CloudStorageService.peerPairs.put(target,summary);});}
 				@Override public void onIceConnectionReceivingChange(boolean receiving){}
 				@Override public void onIceGatheringChange(PeerConnection.IceGatheringState state){AppLog.info("Cloud peer outbound ICE gathering "+state);if(state==PeerConnection.IceGatheringState.COMPLETE)gathered.countDown();}
 				@Override public void onIceCandidate(IceCandidate candidate){AppLog.info("Cloud peer outbound local "+WebRtcDiagnostics.candidate(candidate.sdp));candidates.add(candidate.sdp);}
@@ -125,14 +125,14 @@ final class CloudPeerClient {
 			request("POST","/cloud/signal",new JSONObject().put("from",id).put("to",target).put("session",session).put("type","offer").put("sdp",withCandidates(offer[0].description,candidates)));
 			JSONObject remote=answer.get(15,TimeUnit.SECONDS);if(!target.equals(remote.optString("from")))throw new IOException("unexpected peer answer");
 			WebRtcDiagnostics.sdpCandidates("Cloud peer outbound remote SDP",remote.optString("sdp"));setDescription(peer,new SessionDescription(SessionDescription.Type.ANSWER,remote.getString("sdp")),false);
-			if(!outbound.done.await(20,TimeUnit.SECONDS))throw new IOException("peer response timed out");
+			if(!outbound.done.await(path.startsWith("/cloud/diagnostic-payload")?90:20,TimeUnit.SECONDS))throw new IOException("peer response timed out");
 			if(outbound.failure!=null)throw outbound.failure;
-			return new CloudStorageService.PeerResult(outbound.status,outbound.response.toByteArray());
+			return new CloudStorageService.PeerResult(outbound.status,outbound.response.toByteArray(),outbound.payloadDurationMillis);
 		}finally{pendingAnswers.remove(session);if(peer!=null){peer.close();peer.dispose();}}
 	}
 	private static final class Outbound implements DataChannel.Observer {
 		final String method,path,grant;final byte[] payload;final CountDownLatch done=new CountDownLatch(1);final ByteArrayOutputStream response=new ByteArrayOutputStream();
-		volatile DataChannel channel;volatile IOException failure;volatile int status;
+		volatile DataChannel channel;volatile IOException failure;volatile int status;volatile long payloadStarted,payloadDurationMillis;
 		Outbound(String method,String path,String grant,byte[] payload){this.method=method;this.path=path;this.grant=grant;this.payload=payload;}
 		@Override public void onBufferedAmountChange(long previousAmount){}
 		@Override public void onStateChange(){if(channel==null)return;if(channel.state()==DataChannel.State.OPEN){new Thread(()->{
@@ -143,8 +143,8 @@ final class CloudPeerClient {
 		},"cloud-peer-send").start();}else if(channel.state()==DataChannel.State.CLOSED&&done.getCount()>0){failure=new IOException("cloud peer channel closed");done.countDown();}}
 		private void send(byte[] bytes,boolean binary)throws Exception{while(channel.bufferedAmount()>512<<10){if(channel.state()!=DataChannel.State.OPEN)throw new IOException("channel closed");Thread.sleep(5);}if(!channel.send(new DataChannel.Buffer(ByteBuffer.wrap(bytes),binary)))throw new IOException("send failed");}
 		@Override public synchronized void onMessage(DataChannel.Buffer message){byte[] bytes=new byte[message.data.remaining()];message.data.get(bytes);
-			if(message.binary){if(response.size()+bytes.length>16<<20){failure=new IOException("peer response too large");done.countDown();}else response.write(bytes,0,bytes.length);return;}
-			try{JSONObject control=new JSONObject(new String(bytes,StandardCharsets.UTF_8));if("response".equals(control.optString("type")))status=control.optInt("status");else if("end".equals(control.optString("type"))){if(status<100||status>599)failure=new IOException("invalid peer response");done.countDown();}}
+			if(message.binary){if(payloadStarted==0)payloadStarted=android.os.SystemClock.elapsedRealtime();if(response.size()+bytes.length>16<<20){failure=new IOException("peer response too large");done.countDown();}else response.write(bytes,0,bytes.length);return;}
+			try{JSONObject control=new JSONObject(new String(bytes,StandardCharsets.UTF_8));if("response".equals(control.optString("type")))status=control.optInt("status");else if("end".equals(control.optString("type"))){if(status<100||status>599)failure=new IOException("invalid peer response");if(payloadStarted>0)payloadDurationMillis=Math.max(1,android.os.SystemClock.elapsedRealtime()-payloadStarted);done.countDown();}}
 			catch(Exception ex){failure=new IOException("invalid peer response",ex);done.countDown();}
 		}
 	}
@@ -165,7 +165,7 @@ final class CloudPeerClient {
                 @Override public void onSignalingChange(PeerConnection.SignalingState state){}
                 @Override public void onIceConnectionChange(PeerConnection.IceConnectionState state){
                     AppLog.info("Cloud peer inbound ICE "+state+"; "+WebRtcDiagnostics.network(storage));
-                    if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(active.peer,"Cloud peer inbound");
+					if(state==PeerConnection.IceConnectionState.CONNECTED||state==PeerConnection.IceConnectionState.COMPLETED)WebRtcDiagnostics.selectedPair(active.peer,"Cloud peer inbound",summary->{if(summary!=null&&!summary.isEmpty())CloudStorageService.peerPairs.put(from,summary);});
                     if(state==PeerConnection.IceConnectionState.CLOSED||state==PeerConnection.IceConnectionState.FAILED)active.scheduleDispose();
                 }
                 @Override public void onIceConnectionReceivingChange(boolean receiving){}

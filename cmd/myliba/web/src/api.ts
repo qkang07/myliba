@@ -86,21 +86,35 @@ export interface MediaStore {
   id: string;
   path: string;
   isDefault: boolean;
+  maxBytes: number;
+  usedBytes: number;
 }
 
 export function getMediaStores() {
   return request<MediaStore[]>("/api/media-stores", { headers: { "X-Myliba-Local": "1" } });
 }
 
-export function addMediaStore(path: string) {
+export function addMediaStore(path: string, maxBytes: number) {
   return request<{ id: string; path: string; existing?: boolean }>("/api/media-stores", {
-    method: "POST", body: JSON.stringify({ path }), headers: { "X-Myliba-Local": "1" },
+    method: "POST", body: JSON.stringify({ path, maxBytes }), headers: { "X-Myliba-Local": "1" },
+  });
+}
+
+export function setMediaStoreCapacity(id: string, maxBytes: number) {
+  return request<void>(`/api/media-stores/${encodeURIComponent(id)}/capacity`, {
+    method: "PUT", body: JSON.stringify({ maxBytes }), headers: { "X-Myliba-Local": "1" },
   });
 }
 
 export function selectMediaStore(id: string) {
   return request<void>(`/api/media-stores/${encodeURIComponent(id)}/default`, {
     method: "PUT", body: "{}", headers: { "X-Myliba-Local": "1" },
+  });
+}
+
+export function migrateMediaStore(id: string, targetId: string) {
+  return request<void>(`/api/media-stores/${encodeURIComponent(id)}/migrate`, {
+    method: "POST", body: JSON.stringify({ targetId }), headers: { "X-Myliba-Local": "1" },
   });
 }
 
@@ -358,7 +372,7 @@ export interface CloudNode {
   id: string;
   endpoint: string;
 	lan?: string[];
-	links?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "https" | "relay" | "direct"; checkedAt?: string; checks?: Record<string, { state: "connected" | "unreachable"; rttMillis?: number; connectMillis?: number; speedBps?: number }> }>;
+	links?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "https" | "relay" | "direct"; checkedAt?: string; checks?: Record<string, { state: "connected" | "unreachable"; rttMillis?: number; connectMillis?: number; speedBps?: number; bytes?: number; durationMillis?: number; httpStatus?: number; selectedPair?: string; error?: string }> }>;
   relayed?: boolean;
   role: "client" | "storage";
   seenAt: string;
@@ -403,14 +417,61 @@ export interface CloudView {
   nodeId: string;
   libraryId: string;
   peers: CloudNode[];
-	peerStatus?: Record<string, { state: "checking" | "connected" | "unreachable"; path?: "lan" | "webrtc" | "https" | "relay" | "direct"; checkedAt?: string; checks?: Record<string, { state: "connected" | "unreachable"; rttMillis?: number; connectMillis?: number; speedBps?: number }> }>;
+	peerStatus?: Record<string, CloudPeerStatus>;
   directEndpoint: string;
 	lan?: string[];
+}
+
+export interface CloudPathCheck {
+  state: "connected" | "unreachable";
+  rttMillis?: number;
+  connectMillis?: number;
+  speedBps?: number;
+  bytes?: number;
+  durationMillis?: number;
+	httpStatus?: number;
+	selectedPair?: string;
+  error?: string;
+}
+
+export interface CloudPeerStatus {
+  state: "checking" | "connected" | "unreachable";
+  path?: "lan" | "webrtc" | "https" | "relay" | "direct";
+  checkedAt?: string;
+  checks?: Record<string, CloudPathCheck>;
+}
+
+export interface CloudPeerDiagnosis {
+  peer: { id: string; role: string; seenAt: string; endpointType: string; lanAddresses: number };
+  diagnostics: CloudPeerStatus;
+}
+
+export interface CloudSpeedTest {
+  peerId: string;
+  path: "lan" | "webrtc" | "https" | "relay";
+  state: "complete" | "failed";
+  bytes?: number;
+  durationMillis?: number;
+  speedBps?: number;
+	connectMillis?: number;
+	selectedPair?: string;
+  error?: string;
+  startedAt: string;
+  rounds?: number;
+  samples?: Array<{ bytes: number; durationMillis: number; connectMillis: number; speedBps: number }>;
 }
 
 export async function getCloudFiles(): Promise<CloudView> {
   const view = await request<CloudView>("/api/cloud/files");
   return { ...view, peers: view.peers ?? [] };
+}
+
+export function diagnoseCloudPeer(id: string) {
+  return request<CloudPeerDiagnosis>(`/api/cloud/peers/${encodeURIComponent(id)}/diagnose`, { method: "POST", headers: { "X-Myliba-Local": "1" } });
+}
+
+export function speedTestCloudPeer(id: string, path: CloudSpeedTest["path"]) {
+  return request<CloudSpeedTest>(`/api/cloud/peers/${encodeURIComponent(id)}/speedtest`, { method: "POST", body: JSON.stringify({ path }), headers: { "X-Myliba-Local": "1" } });
 }
 
 export function uploadResourceToCloud(id: string, history?: boolean) {

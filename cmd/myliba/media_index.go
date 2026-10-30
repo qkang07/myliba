@@ -1,10 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -19,6 +21,8 @@ type mediaStore struct {
 	ID        string `json:"id"`
 	Path      string `json:"path"`
 	IsDefault bool   `json:"isDefault"`
+	MaxBytes  int64  `json:"maxBytes"`
+	UsedBytes int64  `json:"usedBytes"`
 }
 
 func (s *server) ensureDefaultMediaStore(dataDir string) error {
@@ -38,11 +42,48 @@ func (s *server) selectedMediaStore() (mediaStore, error) {
 	return store, err
 }
 
+func (s *server) writableMediaStore() (mediaStore, error) {
+	rows, err := s.db.Query(`SELECT id,path,is_default,max_bytes FROM media_stores ORDER BY is_default DESC,(id='appdata') DESC,added_at,id`)
+	if err != nil {
+		return mediaStore{}, err
+	}
+	defer rows.Close()
+	var first mediaStore
+	for rows.Next() {
+		var item mediaStore
+		if err := rows.Scan(&item.ID, &item.Path, &item.IsDefault, &item.MaxBytes); err != nil {
+			return mediaStore{}, err
+		}
+		if first.ID == "" {
+			first = item
+		}
+		if item.MaxBytes == 0 || s.mediaStoreUsed(item.Path) < item.MaxBytes {
+			return item, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return mediaStore{}, err
+	}
+	if first.ID != "" {
+		return first, nil
+	}
+	return mediaStore{}, sql.ErrNoRows
+}
+
+func (s *server) mediaStoreUsed(path string) int64 {
+	if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+		if used, ok := s.cloud.runtime.disk.rootUsage(path); ok {
+			return used
+		}
+	}
+	return mediaStoreUsage(path)
+}
+
 func (s *server) mediaStores(w http.ResponseWriter, r *http.Request) {
 	if !localCloudMutation(w, r) {
 		return
 	}
-	rows, err := s.db.Query(`SELECT id,path,is_default FROM media_stores ORDER BY is_default DESC,added_at,id`)
+	rows, err := s.db.Query(`SELECT id,path,is_default,max_bytes FROM media_stores ORDER BY (id='appdata') DESC,is_default DESC,added_at,id`)
 	if err != nil {
 		writeError(w, 500, "无法读取本机存储位置")
 		return
@@ -51,10 +92,11 @@ func (s *server) mediaStores(w http.ResponseWriter, r *http.Request) {
 	stores := []mediaStore{}
 	for rows.Next() {
 		var item mediaStore
-		if err := rows.Scan(&item.ID, &item.Path, &item.IsDefault); err != nil {
+		if err := rows.Scan(&item.ID, &item.Path, &item.IsDefault, &item.MaxBytes); err != nil {
 			writeError(w, 500, "无法读取本机存储位置")
 			return
 		}
+		item.UsedBytes = s.mediaStoreUsed(item.Path)
 		stores = append(stores, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -74,14 +116,15 @@ func (s *server) addMediaStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Path string `json:"path"`
+		Path     string `json:"path"`
+		MaxBytes int64  `json:"maxBytes"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil {
 		writeError(w, 400, "本机存储位置无效")
 		return
 	}
 	path, err := filepath.Abs(strings.TrimSpace(input.Path))
-	if err != nil || strings.TrimSpace(input.Path) == "" {
+	if err != nil || strings.TrimSpace(input.Path) == "" || input.MaxBytes < 0 {
 		writeError(w, 400, "本机存储位置无效")
 		return
 	}
@@ -114,6 +157,33 @@ func (s *server) addMediaStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	roots.Close()
+	stores, err := s.db.Query(`SELECT path FROM media_stores`)
+	if err != nil {
+		writeError(w, 500, "无法验证存储目录")
+		return
+	}
+	for stores.Next() {
+		var root string
+		if err := stores.Scan(&root); err != nil {
+			stores.Close()
+			writeError(w, 500, "无法验证存储目录")
+			return
+		}
+		if pathWithin(path, root) && pathWithin(root, path) {
+			continue
+		}
+		if pathWithin(path, root) || pathWithin(root, path) {
+			stores.Close()
+			writeError(w, 400, "存储目录不能互相包含")
+			return
+		}
+	}
+	if err := stores.Err(); err != nil {
+		stores.Close()
+		writeError(w, 500, "无法验证存储目录")
+		return
+	}
+	stores.Close()
 	for _, subdir := range []string{"thumbnails", "videos"} {
 		if err := os.MkdirAll(filepath.Join(path, subdir), 0700); err != nil {
 			writeError(w, 400, "无法在该目录保存媒体文件")
@@ -122,6 +192,16 @@ func (s *server) addMediaStore(w http.ResponseWriter, r *http.Request) {
 	}
 	var id string
 	if err := s.db.QueryRow(`SELECT id FROM media_stores WHERE path=?`, path).Scan(&id); err == nil {
+		if input.MaxBytes > 0 {
+			if input.MaxBytes < s.mediaStoreUsed(path) {
+				writeError(w, 409, "容量上限不能小于当前占用")
+				return
+			}
+			if _, updateErr := s.db.Exec(`UPDATE media_stores SET max_bytes=? WHERE id=?`, input.MaxBytes, id); updateErr != nil {
+				writeError(w, 500, "无法保存容量上限")
+				return
+			}
+		}
 		writeJSON(w, 200, map[string]any{"id": id, "path": path, "existing": true})
 		return
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -129,11 +209,59 @@ func (s *server) addMediaStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id = newID()
-	if _, err := s.db.Exec(`INSERT INTO media_stores(id,path,is_default,added_at) VALUES(?,?,0,?)`, id, path, now()); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO media_stores(id,path,is_default,added_at,max_bytes) VALUES(?,?,0,?,?)`, id, path, now(), input.MaxBytes); err != nil {
 		writeError(w, 500, "无法保存本机存储位置")
 		return
 	}
 	writeJSON(w, 201, map[string]string{"id": id, "path": path})
+}
+
+func (s *server) updateMediaStoreCapacity(w http.ResponseWriter, r *http.Request) {
+	if !localCloudMutation(w, r) {
+		return
+	}
+	var input struct {
+		MaxBytes int64 `json:"maxBytes"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil || input.MaxBytes < 0 {
+		writeError(w, 400, "容量上限无效")
+		return
+	}
+	id := r.PathValue("id")
+	var path string
+	if err := s.db.QueryRow(`SELECT path FROM media_stores WHERE id=?`, id).Scan(&path); err != nil {
+		writeError(w, 404, "本机存储位置不存在")
+		return
+	}
+	used := mediaStoreUsage(path)
+	if input.MaxBytes > 0 && input.MaxBytes < used {
+		writeError(w, 409, "容量上限不能小于当前占用")
+		return
+	}
+	if _, err := s.db.Exec(`UPDATE media_stores SET max_bytes=? WHERE id=?`, input.MaxBytes, id); err != nil {
+		writeError(w, 500, "无法保存容量上限")
+		return
+	}
+	if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+		s.cloud.runtime.disk.setRootUsage(path, used)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func mediaStoreUsage(root string) int64 {
+	var total int64
+	for _, child := range []string{"thumbnails", "videos", "cloud"} {
+		_ = filepath.WalkDir(filepath.Join(root, child), func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			if info, e := entry.Info(); e == nil && info.Mode().IsRegular() {
+				total += info.Size()
+			}
+			return nil
+		})
+	}
+	return total
 }
 
 func (s *server) selectMediaStore(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +299,253 @@ func (s *server) selectMediaStore(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type migrationFile struct {
+	source, target string
+	size           int64
+	hash           [32]byte
+	exists         bool
+}
+
+func hashRegularFile(path string) (int64, [32]byte, error) {
+	var zero [32]byte
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, zero, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, zero, fmt.Errorf("拒绝迁移非普通文件: %s", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, zero, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, zero, err
+	}
+	copy(zero[:], h.Sum(nil))
+	return n, zero, nil
+}
+
+func (s *server) migrateMediaStore(w http.ResponseWriter, r *http.Request) {
+	if !localCloudMutation(w, r) {
+		return
+	}
+	var disk *cloudDisk
+	if s.cloud != nil && s.cloud.runtime != nil {
+		disk = s.cloud.runtime.disk
+	}
+	if disk != nil {
+		disk.mu.Lock()
+		defer disk.mu.Unlock()
+	}
+	sourceID := r.PathValue("id")
+	var input struct {
+		TargetID string `json:"targetId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil || input.TargetID == "" || input.TargetID == sourceID {
+		writeError(w, 400, "迁移目标无效")
+		return
+	}
+	var sourcePath, targetPath string
+	var isDefault bool
+	if err := s.db.QueryRow(`SELECT path,is_default FROM media_stores WHERE id=?`, sourceID).Scan(&sourcePath, &isDefault); err != nil {
+		writeError(w, 404, "源存储位置不存在")
+		return
+	}
+	if isDefault || sourceID == defaultMediaStoreID {
+		writeError(w, 409, "默认应用目录不能移除")
+		return
+	}
+	var targetLimit int64
+	if err := s.db.QueryRow(`SELECT path,max_bytes FROM media_stores WHERE id=?`, input.TargetID).Scan(&targetPath, &targetLimit); err != nil {
+		writeError(w, 404, "目标存储位置不存在")
+		return
+	}
+	if _, err := os.Stat(sourcePath); err != nil {
+		writeError(w, 409, "源目录当前不可用")
+		return
+	}
+	if _, err := os.Stat(targetPath); err != nil {
+		writeError(w, 409, "目标目录当前不可用")
+		return
+	}
+	if pathWithin(sourcePath, targetPath) || pathWithin(targetPath, sourcePath) {
+		writeError(w, 409, "源目录与目标目录不能互相包含")
+		return
+	}
+	files := make([]migrationFile, 0)
+	for _, child := range []string{"thumbnails", "videos", "cloud"} {
+		root := filepath.Join(sourcePath, child)
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			if walkErr != nil {
+				return walkErr
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("目录中含有符号链接: %s", path)
+			}
+			if info.IsDir() {
+				return nil
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("目录中含有特殊文件: %s", path)
+			}
+			rel, err := filepath.Rel(sourcePath, path)
+			if err != nil {
+				return err
+			}
+			size, hash, err := hashRegularFile(path)
+			if err != nil {
+				return err
+			}
+			target := filepath.Join(targetPath, rel)
+			f := migrationFile{source: path, target: target, size: size, hash: hash}
+			if targetInfo, e := os.Lstat(target); e == nil {
+				if !targetInfo.Mode().IsRegular() {
+					return fmt.Errorf("目标存在同名非普通文件: %s", target)
+				}
+				n, h, e := hashRegularFile(target)
+				if e != nil {
+					return e
+				}
+				if n != size || h != hash {
+					return fmt.Errorf("目标已存在不同内容的同名文件: %s", target)
+				}
+				f.exists = true
+			} else if !os.IsNotExist(e) {
+				return e
+			}
+			files = append(files, f)
+			return nil
+		})
+		if err != nil {
+			writeError(w, 409, "无法安全读取源目录: "+err.Error())
+			return
+		}
+	}
+	var delta int64
+	for _, f := range files {
+		delta += f.size
+	}
+	used := mediaStoreUsage(targetPath)
+	if targetLimit > 0 && used+delta > targetLimit {
+		writeError(w, 409, "目标目录剩余容量不足，源目录未变更")
+		return
+	}
+	for _, f := range files {
+		if f.exists {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(f.target), 0700); err != nil {
+			writeError(w, 500, "无法创建目标目录")
+			return
+		}
+		in, err := os.Open(f.source)
+		if err != nil {
+			writeError(w, 500, "无法读取源文件")
+			return
+		}
+		tmp, err := os.CreateTemp(filepath.Dir(f.target), ".myliba-migrate-*")
+		if err != nil {
+			in.Close()
+			writeError(w, 500, "无法创建迁移临时文件")
+			return
+		}
+		h := sha256.New()
+		n, copyErr := io.Copy(io.MultiWriter(tmp, h), in)
+		in.Close()
+		if copyErr == nil {
+			copyErr = tmp.Sync()
+		}
+		closeErr := tmp.Close()
+		if copyErr == nil {
+			copyErr = closeErr
+		}
+		var got [32]byte
+		copy(got[:], h.Sum(nil))
+		if copyErr == nil && (n != f.size || got != f.hash) {
+			copyErr = fmt.Errorf("迁移校验失败")
+		}
+		if copyErr == nil {
+			copyErr = os.Rename(tmp.Name(), f.target)
+		}
+		if copyErr != nil {
+			_ = os.Remove(tmp.Name())
+			writeError(w, 500, "复制或校验失败，源目录仍保留: "+copyErr.Error())
+			return
+		}
+	}
+	locations, err := s.db.Query(`SELECT asset_id,path FROM file_asset_locations WHERE storage_id=?`, sourceID)
+	if err != nil {
+		writeError(w, 500, "无法更新附加内容记录")
+		return
+	}
+	type location struct{ asset, path string }
+	locs := []location{}
+	for locations.Next() {
+		var l location
+		if err := locations.Scan(&l.asset, &l.path); err != nil {
+			locations.Close()
+			writeError(w, 500, "无法读取附加内容记录")
+			return
+		}
+		locs = append(locs, l)
+	}
+	if err := locations.Err(); err != nil {
+		locations.Close()
+		writeError(w, 500, "无法读取附加内容记录")
+		return
+	}
+	locations.Close()
+	tx, err := s.db.Begin()
+	if err != nil {
+		writeError(w, 500, "无法更新存储位置")
+		return
+	}
+	defer tx.Rollback()
+	for _, l := range locs {
+		rel, err := filepath.Rel(sourcePath, l.path)
+		if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			writeError(w, 409, "附加内容记录超出源目录")
+			return
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO file_asset_locations(asset_id,storage_id,path) VALUES(?,?,?)`, l.asset, input.TargetID, filepath.Join(targetPath, rel)); err != nil {
+			writeError(w, 500, "无法迁移附加内容记录")
+			return
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM file_asset_locations WHERE storage_id=?`, sourceID); err != nil {
+		writeError(w, 500, "无法迁移附加内容记录")
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM media_stores WHERE id=?`, sourceID); err != nil {
+		writeError(w, 500, "无法移除源存储位置")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, 500, "无法完成存储迁移")
+		return
+	}
+	for _, child := range []string{"thumbnails", "videos", "cloud"} {
+		if err := os.RemoveAll(filepath.Join(sourcePath, child)); err != nil {
+			log.Printf("media store migration cleanup %s: %v", child, err)
+		}
+	}
+	if disk != nil {
+		_ = disk.configureMediaStores(s.db)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *server) mediaAssetPath(id, kind string) (string, string) {
 	if s.db != nil {
 		rows, err := s.db.Query(`SELECT l.storage_id,l.path FROM file_asset_locations l
@@ -194,7 +569,7 @@ func (s *server) mediaAssetPath(id, kind string) (string, string) {
 		if _, err := os.Stat(legacy); err == nil {
 			return defaultMediaStoreID, legacy
 		}
-		if store, err := s.selectedMediaStore(); err == nil {
+		if store, err := s.writableMediaStore(); err == nil {
 			if kind == "video" {
 				return store.ID, filepath.Join(store.Path, "videos", id)
 			}
@@ -261,6 +636,43 @@ func (s *server) recordMediaAsset(id, resourceID, versionKey, kind, spec, codec,
 	if size < 0 {
 		return fmt.Errorf("invalid asset size")
 	}
+	var maxBytes int64
+	var storageRoot string
+	if err := s.db.QueryRow(`SELECT path,max_bytes FROM media_stores WHERE id=?`, storageID).Scan(&storageRoot, &maxBytes); err == nil {
+		_, projected := mediaStoreUsageForReservation(storageRoot, path, size)
+		if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+			s.cloud.runtime.disk.setRootUsage(storageRoot, mediaStoreUsage(storageRoot))
+		}
+		if maxBytes > 0 && projected > maxBytes {
+			storeKind := "thumbnails"
+			if kind == "video" {
+				storeKind = "videos"
+			}
+			nextID, nextPath, moveErr := s.moveMediaAssetToAvailableStore(path, storeKind, size)
+			if moveErr != nil {
+				_ = os.RemoveAll(path)
+				if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+					s.cloud.runtime.disk.setRootUsage(storageRoot, mediaStoreUsage(storageRoot))
+				}
+				return fmt.Errorf("本机存储目录已达到容量上限，且后续目录没有足够空间: %w", moveErr)
+			}
+			storageID, path = nextID, nextPath
+			if err := s.db.QueryRow(`SELECT path,max_bytes FROM media_stores WHERE id=?`, storageID).Scan(&storageRoot, &maxBytes); err != nil {
+				return err
+			}
+			_, projected = mediaStoreUsageForReservation(storageRoot, path, size)
+		}
+		if maxBytes > 0 && projected > maxBytes {
+			_ = os.RemoveAll(path)
+			if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+				s.cloud.runtime.disk.setRootUsage(storageRoot, mediaStoreUsage(storageRoot))
+			}
+			return fmt.Errorf("本机存储目录已达到容量上限")
+		}
+		if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+			s.cloud.runtime.disk.setRootUsage(storageRoot, mediaStoreUsage(storageRoot))
+		}
+	}
 	var existingSize int64
 	if err := s.db.QueryRow(`SELECT a.size FROM file_assets a JOIN file_asset_locations l ON l.asset_id=a.id
 		WHERE a.id=? AND l.storage_id=? AND l.path=?`, id, storageID, path).Scan(&existingSize); err == nil && existingSize == size {
@@ -286,6 +698,159 @@ func (s *server) recordMediaAsset(id, resourceID, versionKey, kind, spec, codec,
 		s.cloud.queueAssetSync(resourceID)
 	}
 	return nil
+}
+
+func mediaStoreUsageForReservation(root, assetPath string, incoming int64) (int64, int64) {
+	// The just-written asset is already included by the walk, so avoid counting it twice.
+	used := mediaStoreUsage(root)
+	if assetInfo, err := os.Stat(assetPath); err == nil {
+		if assetInfo.IsDir() {
+			var current int64
+			_ = filepath.WalkDir(assetPath, func(path string, entry os.DirEntry, walkErr error) error {
+				if walkErr == nil && !entry.IsDir() {
+					if info, e := entry.Info(); e == nil && info.Mode().IsRegular() {
+						current += info.Size()
+					}
+				}
+				return nil
+			})
+			used -= current
+		} else if assetInfo.Mode().IsRegular() {
+			used -= assetInfo.Size()
+		}
+	}
+	return used, used + incoming
+}
+
+func (s *server) moveMediaAssetToAvailableStore(assetPath, kind string, size int64) (string, string, error) {
+	if kind != "thumbnails" && kind != "videos" {
+		return "", "", errors.New("invalid media store kind")
+	}
+	currentID := s.mediaStoreIDForPath(assetPath)
+	var currentRoot string
+	if err := s.db.QueryRow(`SELECT path FROM media_stores WHERE id=?`, currentID).Scan(&currentRoot); err != nil {
+		return "", "", err
+	}
+	relative, err := filepath.Rel(currentRoot, assetPath)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", "", errors.New("media asset is outside its storage directory")
+	}
+	rows, err := s.db.Query(`SELECT id,path,max_bytes FROM media_stores ORDER BY is_default DESC,(id='appdata') DESC,added_at,id`)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, root string
+		var maxBytes int64
+		if err := rows.Scan(&id, &root, &maxBytes); err != nil {
+			return "", "", err
+		}
+		if id == currentID {
+			continue
+		}
+		target := filepath.Join(root, relative)
+		if _, statErr := os.Lstat(target); statErr == nil {
+			continue
+		}
+		_, projected := mediaStoreUsageForReservation(root, target, size)
+		if maxBytes > 0 && projected > maxBytes {
+			continue
+		}
+		if err := moveMediaAssetPath(assetPath, target); err != nil {
+			continue
+		}
+		if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+			s.cloud.runtime.disk.setRootUsage(currentRoot, mediaStoreUsage(currentRoot))
+			s.cloud.runtime.disk.setRootUsage(root, mediaStoreUsage(root))
+		}
+		return id, target, nil
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", err
+	}
+	return "", "", errors.New("所有存储目录都没有足够的剩余容量")
+}
+
+func moveMediaAssetPath(source, target string) error {
+	info, err := os.Lstat(source)
+	if err != nil || (!info.IsDir() && !info.Mode().IsRegular()) {
+		return errors.New("媒体文件不可移动")
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		return err
+	}
+	tempRoot, err := os.MkdirTemp(filepath.Dir(target), ".media-move-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tempRoot)
+	tempPath := filepath.Join(tempRoot, filepath.Base(target))
+	if info.IsDir() {
+		if err := os.MkdirAll(tempPath, info.Mode().Perm()); err != nil {
+			return err
+		}
+		err = filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			rel, err := filepath.Rel(source, path)
+			if err != nil {
+				return err
+			}
+			if rel == "." {
+				return nil
+			}
+			dst := filepath.Join(tempPath, rel)
+			mode := entry.Type()
+			if mode&os.ModeSymlink != 0 {
+				return errors.New("媒体目录包含符号链接")
+			}
+			if entry.IsDir() {
+				return os.MkdirAll(dst, 0700)
+			}
+			return copyMediaFile(path, dst)
+		})
+		if err != nil {
+			return err
+		}
+	} else if err := copyMediaFile(source, tempPath); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, target); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(source); err != nil {
+		_ = os.RemoveAll(target)
+		return err
+	}
+	return nil
+}
+
+func copyMediaFile(source, target string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("媒体文件类型无效")
+	}
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, input)
+	syncErr := output.Sync()
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func (s *server) backfillMediaAssets() {

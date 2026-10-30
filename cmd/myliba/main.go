@@ -146,6 +146,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/cloud/files", cloud.list)
+	mux.HandleFunc("POST /api/cloud/peers/{id}/diagnose", cloud.diagnosePeer)
+	mux.HandleFunc("POST /api/cloud/peers/{id}/speedtest", cloud.speedTest)
 	mux.HandleFunc("GET /api/cloud/files/{id}/file", cloud.download)
 	mux.HandleFunc("GET /api/cloud/files/{id}/assets/{asset}/parts/{part}", cloud.cloudAssetPart)
 	mux.HandleFunc("GET /api/cloud/files/{id}/video/{quality}", cloud.cloudVideo)
@@ -175,7 +177,9 @@ func main() {
 	mux.HandleFunc("GET /api/resources/{id}/index", app.fileIndex)
 	mux.HandleFunc("GET /api/media-stores", app.mediaStores)
 	mux.HandleFunc("POST /api/media-stores", app.addMediaStore)
+	mux.HandleFunc("PUT /api/media-stores/{id}/capacity", app.updateMediaStoreCapacity)
 	mux.HandleFunc("PUT /api/media-stores/{id}/default", app.selectMediaStore)
+	mux.HandleFunc("POST /api/media-stores/{id}/migrate", app.migrateMediaStore)
 	mux.HandleFunc("GET /api/resources/{id}/video-info", app.videoInfo)
 	mux.HandleFunc("GET /api/resources/{id}/video-preview", app.videoPreview)
 	mux.HandleFunc("POST /api/resources/{id}/video-preview", app.videoPreview)
@@ -333,7 +337,8 @@ CREATE TABLE IF NOT EXISTS media_stores (
     id TEXT PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
     is_default INTEGER NOT NULL DEFAULT 0,
-    added_at TEXT NOT NULL
+	added_at TEXT NOT NULL,
+	max_bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS file_assets (
     id TEXT PRIMARY KEY,
@@ -378,6 +383,33 @@ CREATE TABLE IF NOT EXISTS file_asset_locations (
 		return err
 	}
 	columns.Close()
+	if err == nil {
+		columns, err = db.Query(`PRAGMA table_info(media_stores)`)
+		if err != nil {
+			return err
+		}
+		hasMaxBytes := false
+		for columns.Next() {
+			var cid, notNull, primaryKey int
+			var name, columnType string
+			var defaultValue sql.NullString
+			if err := columns.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+				columns.Close()
+				return err
+			}
+			if name == "max_bytes" {
+				hasMaxBytes = true
+			}
+		}
+		if err := columns.Err(); err != nil {
+			columns.Close()
+			return err
+		}
+		columns.Close()
+		if !hasMaxBytes {
+			_, err = db.Exec(`ALTER TABLE media_stores ADD COLUMN max_bytes INTEGER NOT NULL DEFAULT 0`)
+		}
+	}
 	if !hasAutoPreprocess {
 		_, err = db.Exec(`ALTER TABLE roots ADD COLUMN auto_preprocess INTEGER NOT NULL DEFAULT 1`)
 	}

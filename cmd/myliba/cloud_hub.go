@@ -79,7 +79,7 @@ func validCloudNode(node cloudNode) bool {
 			return false
 		}
 		for path, check := range status.Checks {
-			if (path != "lan" && path != "webrtc" && path != "https" && path != "relay") || (check.State != "connected" && check.State != "unreachable") || check.RTTMillis < 0 || check.RTTMillis > 60000 || check.ConnectMillis < 0 || check.ConnectMillis > 60000 || check.SpeedBps < 0 || check.SpeedBps > 1<<40 {
+			if (path != "lan" && path != "webrtc" && path != "https" && path != "relay") || (check.State != "connected" && check.State != "unreachable") || check.RTTMillis < 0 || check.RTTMillis > 60000 || check.ConnectMillis < 0 || check.ConnectMillis > 60000 || check.SpeedBps < 0 || check.SpeedBps > 1<<40 || check.Bytes < 0 || check.Bytes > 4<<20 || check.DurationMillis < 0 || check.DurationMillis > 60000 || check.HTTPStatus < 0 || check.HTTPStatus > 599 || len(check.Error) > 240 || len(check.SelectedPair) > 96 {
 				return false
 			}
 		}

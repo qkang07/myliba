@@ -2,7 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
-	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,17 @@ const (
 type cloudDisk struct {
 	dir     string
 	backend cloudObjectBackend
+	db      *sql.DB
+	mu      sync.RWMutex
+	roots   []cloudDiskRoot
+}
+
+type cloudDiskRoot struct {
+	path      string
+	cloudDir  string
+	maxBytes  int64
+	usedBytes int64
+	readOnly  bool
 }
 
 type cloudFile struct {
@@ -49,7 +61,67 @@ func newCloudDisk(dir string) (*cloudDisk, error) {
 			return nil, err
 		}
 	}
-	return &cloudDisk{dir: dir}, nil
+	return &cloudDisk{dir: dir, roots: []cloudDiskRoot{{path: filepath.Dir(dir), cloudDir: dir}}}, nil
+}
+
+func (d *cloudDisk) configureMediaStores(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	rows, err := db.Query(`SELECT path,max_bytes FROM media_stores ORDER BY is_default DESC,(id='appdata') DESC,added_at,id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	roots := make([]cloudDiskRoot, 0, 4)
+	previous := make(map[string]cloudDiskRoot, len(d.roots))
+	for _, root := range d.roots {
+		previous[root.path] = root
+	}
+	seen := map[string]bool{}
+	for rows.Next() {
+		var root cloudDiskRoot
+		if err := rows.Scan(&root.path, &root.maxBytes); err != nil {
+			return err
+		}
+		root.path = filepath.Clean(root.path)
+		if seen[root.path] {
+			continue
+		}
+		seen[root.path] = true
+		root.cloudDir = filepath.Join(root.path, "cloud")
+		if err := os.MkdirAll(filepath.Join(root.cloudDir, "blocks"), 0700); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Join(root.cloudDir, "catalog"), 0700); err != nil {
+			return err
+		}
+		root.readOnly = false
+		if old, ok := previous[root.path]; ok && old.usedBytes > 0 {
+			root.usedBytes = old.usedBytes
+		} else {
+			root.usedBytes = cloudDiskRootUsage(root.path)
+		}
+		roots = append(roots, root)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	legacyRoot := filepath.Clean(filepath.Dir(d.dir))
+	if !seen[legacyRoot] {
+		root := cloudDiskRoot{path: legacyRoot, cloudDir: d.dir, readOnly: true}
+		if old, ok := previous[root.path]; ok && old.usedBytes > 0 {
+			root.usedBytes = old.usedBytes
+		} else {
+			root.usedBytes = cloudDiskRootUsage(root.path)
+		}
+		roots = append(roots, root)
+	}
+	if len(roots) > 0 {
+		d.roots = roots
+	}
+	d.db = db
+	return nil
 }
 
 func cloudHash(data []byte) string {
@@ -78,14 +150,39 @@ func (d *cloudDisk) path(kind, id string) (string, error) {
 	if kind != "blocks" && kind != "catalog" {
 		return "", errors.New("invalid content kind")
 	}
-	return filepath.Join(d.dir, kind, id[:2], id), nil
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	base := d.dir
+	if len(d.roots) > 0 {
+		base = d.roots[0].cloudDir
+	}
+	return filepath.Join(base, kind, id[:2], id), nil
+}
+
+func (d *cloudDisk) existingPath(kind, id string) (string, error) {
+	path, err := d.path(kind, id)
+	if err != nil {
+		return "", err
+	}
+	if d.backend != nil {
+		return path, nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, root := range d.roots {
+		candidate := filepath.Join(root.cloudDir, kind, id[:2], id)
+		if info, e := os.Stat(candidate); e == nil && info.Mode().IsRegular() {
+			return candidate, nil
+		}
+	}
+	return path, nil
 }
 
 func (d *cloudDisk) has(kind, id string) bool {
 	if d.backend != nil {
 		return d.valid(kind, id)
 	}
-	path, err := d.path(kind, id)
+	path, err := d.existingPath(kind, id)
 	if err != nil {
 		return false
 	}
@@ -107,73 +204,121 @@ func (d *cloudDisk) valid(kind, id string) bool {
 }
 
 func (d *cloudDisk) put(kind, id string, body io.Reader, limit int64) error {
-	path, err := d.path(kind, id)
+	if _, err := d.path(kind, id); err != nil {
+		return err
+	}
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
 	if err != nil {
 		return err
 	}
-	if d.backend != nil {
-		data, err := io.ReadAll(io.LimitReader(body, limit+1))
-		if err != nil {
+	if len(data) == 0 || int64(len(data)) > limit || cloudHash(data) != id {
+		return errors.New("invalid cloud object")
+	}
+	if kind == "catalog" {
+		if err := validateCloudRecord(data); err != nil {
 			return err
 		}
-		if len(data) == 0 || int64(len(data)) > limit || cloudHash(data) != id {
-			return errors.New("invalid cloud object")
-		}
-		if kind == "catalog" {
-			if err := validateCloudRecord(data); err != nil {
-				return err
-			}
-		}
+	}
+	if d.backend != nil {
 		return d.backend.Put(kind, id, data)
 	}
 	if d.valid(kind, id) {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.db != nil {
+		if err := d.configureMediaStores(d.db); err != nil {
+			return err
+		}
 	}
-	file, err := os.CreateTemp(filepath.Dir(path), ".cloud-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	defer file.Close()
-	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(file, hash), io.LimitReader(body, limit+1))
-	if err != nil {
-		return err
-	}
-	if n == 0 || n > limit {
-		return errors.New("invalid object size")
-	}
-	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(hash.Sum(nil))), []byte(id)) != 1 {
-		return errors.New("content hash mismatch")
-	}
-	if kind == "catalog" {
-		data, err := os.ReadFile(file.Name())
+	for i := range d.roots {
+		root := d.roots[i]
+		if root.readOnly {
+			continue
+		}
+		existing := filepath.Join(root.cloudDir, kind, id[:2], id)
+		if existingData, e := os.ReadFile(existing); e == nil && cloudHash(existingData) == id {
+			return nil
+		} else if e == nil {
+			_ = os.Remove(existing)
+			root.usedBytes = max(int64(0), root.usedBytes-int64(len(existingData)))
+		}
+		used := root.usedBytes
+		if root.maxBytes > 0 && used+int64(len(data)) > root.maxBytes {
+			continue
+		}
+		target := filepath.Join(root.cloudDir, kind, id[:2], id)
+		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+			continue
+		}
+		if info, e := os.Stat(target); e == nil && info.Mode().IsRegular() {
+			_ = os.Remove(target)
+		}
+		temp, err := os.CreateTemp(filepath.Dir(target), ".cloud-*")
 		if err != nil {
-			return err
+			continue
 		}
-		if err := validateCloudRecord(data); err != nil {
-			return err
+		if _, err = temp.Write(data); err == nil {
+			err = temp.Sync()
 		}
-	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	// Immutable IDs make duplicate concurrent writes harmless.
-	if d.valid(kind, id) {
+		if closeErr := temp.Close(); err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = os.Rename(temp.Name(), target)
+		}
+		if err != nil {
+			_ = os.Remove(temp.Name())
+			continue
+		}
+		d.roots[i].usedBytes = used + int64(len(data))
 		return nil
 	}
-	if d.has(kind, id) {
-		if err := os.Remove(path); err != nil {
-			return err
+	return errors.New("所有本机存储目录均已达到容量上限或不可写")
+}
+
+func cloudDiskRootUsage(root string) int64 {
+	var total int64
+	for _, child := range []string{"thumbnails", "videos", "cloud"} {
+		_ = filepath.WalkDir(filepath.Join(root, child), func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			if info, e := entry.Info(); e == nil && info.Mode().IsRegular() {
+				total += info.Size()
+			}
+			return nil
+		})
+	}
+	return total
+}
+
+func (d *cloudDisk) setRootUsage(root string, used int64) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := range d.roots {
+		if filepath.Clean(d.roots[i].path) == filepath.Clean(root) {
+			d.roots[i].usedBytes = used
 		}
 	}
-	return os.Rename(file.Name(), path)
+}
+
+func (d *cloudDisk) rootUsage(root string) (int64, bool) {
+	if d == nil {
+		return 0, false
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, item := range d.roots {
+		if filepath.Clean(item.path) == filepath.Clean(root) {
+			return item.usedBytes, true
+		}
+	}
+	return 0, false
 }
 
 func validateCloudRecord(data []byte) error {
@@ -206,7 +351,7 @@ func validateCloudRecord(data []byte) error {
 }
 
 func (d *cloudDisk) get(kind, id string) (*cloudFile, error) {
-	path, err := d.path(kind, id)
+	path, err := d.existingPath(kind, id)
 	if err != nil {
 		return nil, err
 	}
@@ -246,18 +391,30 @@ func (d *cloudDisk) list(kind string) ([]string, error) {
 	if d.backend != nil {
 		return d.backend.List(kind)
 	}
+	d.mu.RLock()
+	roots := append([]cloudDiskRoot(nil), d.roots...)
+	d.mu.RUnlock()
+	seen := map[string]bool{}
 	ids := []string{}
-	err := filepath.WalkDir(filepath.Join(d.dir, kind), func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	for _, root := range roots {
+		err := filepath.WalkDir(filepath.Join(root.cloudDir, kind), func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if entry.Type().IsRegular() && validCloudHash(entry.Name()) && !seen[entry.Name()] {
+				if kind != "catalog" || d.valid(kind, entry.Name()) {
+					seen[entry.Name()] = true
+					ids = append(ids, entry.Name())
+				}
+			}
+			return nil
+		})
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
 		}
-		if entry.Type().IsRegular() && validCloudHash(entry.Name()) && (kind != "catalog" || d.valid(kind, entry.Name())) {
-			ids = append(ids, entry.Name())
-		}
-		return nil
-	})
+	}
 	sort.Strings(ids)
-	return ids, err
+	return ids, nil
 }
 
 func cloudBearer(next http.Handler, token string) http.Handler {
@@ -282,10 +439,12 @@ func (d *cloudDisk) routesWithAuth(mux *http.ServeMux, authorize func(http.Handl
 	})))
 	mux.Handle("GET /cloud/diagnostic-payload", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		size, err := strconv.Atoi(r.URL.Query().Get("bytes"))
-		if err != nil || size < 1 || size > 1<<20 {
+		if err != nil || size < 1 || size > 4<<20 {
 			http.Error(w, "invalid diagnostic size", http.StatusBadRequest)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(make([]byte, size))
 	})))

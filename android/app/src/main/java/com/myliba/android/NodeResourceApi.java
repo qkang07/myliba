@@ -136,8 +136,8 @@ final class NodeResourceApi {
         return result;
     }
     private Result thumbnail(LocalLibrary.Item item,boolean force)throws Exception{
-        File cached=ThumbnailLoader.cacheFile(context,item.uri,item.modified,item.size);
-        if(!force&&cached.isFile()){cached.setLastModified(System.currentTimeMillis());return new Result(200,"image/jpeg",new FileInputStream(cached),cached.length());}
+        String cachePath=ThumbnailLoader.cacheFile(context,item.uri,item.modified,item.size);
+        if(!force)try{byte[] cached=StorageDirectories.read(context,cachePath,4*1024*1024);return new Result(200,"image/jpeg",new ByteArrayInputStream(cached),cached.length);}catch(IOException ignored){}
         Bitmap bitmap=null;Uri uri=Uri.parse(item.uri);
         try{
             if("video".equals(kind(item))){MediaMetadataRetriever retriever=new MediaMetadataRetriever();try{retriever.setDataSource(context,uri);bitmap=retriever.getFrameAtTime(0);}finally{retriever.release();}}
@@ -145,8 +145,9 @@ final class NodeResourceApi {
             else if("image".equals(kind(item))){BitmapFactory.Options options=new BitmapFactory.Options();options.inJustDecodeBounds=true;try(InputStream in=context.getContentResolver().openInputStream(uri)){BitmapFactory.decodeStream(in,null,options);}int sample=1;while(Math.max(options.outWidth,options.outHeight)/sample>1024)sample*=2;options.inJustDecodeBounds=false;options.inSampleSize=sample;try(InputStream in=context.getContentResolver().openInputStream(uri)){bitmap=BitmapFactory.decodeStream(in,null,options);}}
         }catch(Exception ignored){}
         if(bitmap==null)return error(404,item.name.toLowerCase(java.util.Locale.ROOT).endsWith(".arw")?"ARW 文件没有可用的内嵌 JPEG 预览":"暂无缩略图");
-        try{ThumbnailLoader.saveLocalThumbnail(cached,bitmap);}finally{bitmap.recycle();}
-        return new Result(200,"image/jpeg",new FileInputStream(cached),cached.length());
+        ByteArrayOutputStream encoded=new ByteArrayOutputStream();try{if(!bitmap.compress(Bitmap.CompressFormat.JPEG,78,encoded))throw new IOException("无法生成缩略图");}finally{bitmap.recycle();}
+        byte[] bytes=encoded.toByteArray();try{StorageDirectories.write(context,cachePath,bytes);}catch(IOException ignored){}
+        return new Result(200,"image/jpeg",new ByteArrayInputStream(bytes),bytes.length);
     }
     private Result videoInfo(LocalLibrary.Item item)throws Exception{
         MediaMetadataRetriever retriever=new MediaMetadataRetriever();long duration=0;

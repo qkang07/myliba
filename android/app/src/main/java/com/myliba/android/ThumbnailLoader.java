@@ -33,33 +33,25 @@ final class ThumbnailLoader {
     boolean generate(LibraryStore.Entry entry,boolean force)throws Exception{
         if(!(entry.kind.equals("image")||entry.kind.equals("video")||entry.mime.equals("application/pdf")))return false;
         Bitmap bitmap=localThumbnail(null,entry,force);if(bitmap==null)return false;
-        File web=cacheFile(context,entry.id,entry.modified,entry.size,"web");if(force||!web.isFile()){Bitmap variant=fit(bitmap,480,320);try{saveLocalThumbnail(web,variant);}finally{if(variant!=bitmap)variant.recycle();}}
+        String web=cachePath(entry.id,entry.modified,entry.size,"web");if(force||!hasCached(web)){Bitmap variant=fit(bitmap,480,320);try{try{saveLocalThumbnail(context,web,variant);}catch(IOException ignored){}}finally{if(variant!=bitmap)variant.recycle();}}
         cache.put("local"+entry.id+entry.modified+entry.size,bitmap);return true;
     }
     private Bitmap localThumbnail(LibraryStore store,LibraryStore.Entry entry,boolean force)throws Exception{
-        File file=cacheFile(context,entry.id,entry.modified,entry.size,"mobile");
-        if(!force&&file.isFile()){Bitmap cached=BitmapFactory.decodeFile(file.getAbsolutePath());if(cached!=null){file.setLastModified(System.currentTimeMillis());return cached;}}
+        String file=cachePath(entry.id,entry.modified,entry.size,"mobile");
+        if(!force)try{byte[] data=StorageDirectories.read(context,file,4*1024*1024);Bitmap cached=BitmapFactory.decodeByteArray(data,0,data.length);if(cached!=null)return cached;}catch(IOException ignored){}
         Bitmap bitmap=read(store,entry);if(bitmap==null)return null;
-        saveLocalThumbnail(file,bitmap);
+        try{saveLocalThumbnail(context,file,bitmap);}catch(IOException ignored){}
         return bitmap;
     }
-    static File cacheFile(Context context,String id,long modified,long size)throws Exception{
-        return cacheFile(context,id,modified,size,"mobile");
-    }
-    private static File cacheFile(Context context,String id,long modified,long size,String variant)throws Exception{
-        File directory=new File(context.getCacheDir(),"resource-thumbnails");
+    static String cacheFile(Context context,String id,long modified,long size)throws Exception{return cachePath(id,modified,size,"mobile");}
+    private static String cachePath(String id,long modified,long size,String variant)throws Exception{
         MessageDigest digest=MessageDigest.getInstance("SHA-256");byte[] hash=digest.digest((id+"|"+modified+"|"+size).getBytes(StandardCharsets.UTF_8));
         StringBuilder name=new StringBuilder();for(byte b:hash)name.append(String.format(java.util.Locale.ROOT,"%02x",b&255));
-        return new File(directory,name+"-"+variant+".jpg");
+        return "resource-thumbnails/"+name+"-"+variant+".jpg";
     }
-    static void saveLocalThumbnail(File file,Bitmap bitmap)throws IOException{
-        File directory=file.getParentFile();
-        if(!directory.isDirectory()&&!directory.mkdirs())throw new IOException("无法创建缩略图目录");
-        File temporary=File.createTempFile("thumb-",".tmp",directory);
-        try{
-            try(FileOutputStream out=new FileOutputStream(temporary)){if(!bitmap.compress(Bitmap.CompressFormat.JPEG,78,out))throw new IOException("无法保存缩略图");}
-            if(!temporary.renameTo(file)){file.delete();if(!temporary.renameTo(file))throw new IOException("无法保存缩略图");}
-        }finally{temporary.delete();}
+    private boolean hasCached(String path){try{StorageDirectories.read(context,path,4*1024*1024);return true;}catch(IOException ignored){return false;}}
+    static void saveLocalThumbnail(Context context,String path,Bitmap bitmap)throws IOException{
+        ByteArrayOutputStream out=new ByteArrayOutputStream();if(!bitmap.compress(Bitmap.CompressFormat.JPEG,78,out))throw new IOException("无法保存缩略图");StorageDirectories.write(context,path,out.toByteArray());
     }
     private Bitmap read(LibraryStore s,LibraryStore.Entry e)throws Exception{
         Uri uri;

@@ -25,7 +25,7 @@ import static com.myliba.android.MobileUi.*;
 
 /** A single mobile library experience, backed by either SAF/SQLite or the Hub API. */
 public final class MainActivity extends Activity {
-    private static final int PICK_TREE=41,EXPORT_LOG=42;
+    private static final int PICK_TREE=41,EXPORT_LOG=42,PICK_STORAGE_TREE=43;
     private final ExecutorService io=Executors.newSingleThreadExecutor();
     private final Handler handler=new Handler(Looper.getMainLooper());
     private final Set<String> selected=new LinkedHashSet<>();
@@ -117,6 +117,7 @@ public final class MainActivity extends Activity {
         nodeCapacity=ui.text("",12,MUTED,false);card.addView(nodeCapacity,ui.top(5));
         body.addView(card);
         nodeConfigure=ui.button("",true,this::cloudStorageSheet);body.addView(nodeConfigure,ui.top(18));
+        renderStorageDirectories(body);
         nodeStop=ui.button("停止存储节点",false,()->{stopService(new Intent(this,CloudStorageService.class));handler.postDelayed(this::render,350);});body.addView(nodeStop,ui.top(9));
         body.addView(ui.button("切换到完整客户端",false,this::leaveStorageMode),ui.top(22));
         body.addView(ui.button("查看诊断日志",false,this::diagnosticsSheet),ui.top(9));
@@ -340,13 +341,14 @@ public final class MainActivity extends Activity {
         section(body,"本机资源库",null,null);body.addView(ui.text("索引目录 "+meta.roots.size()+" 个 · 文件 "+meta.total+" 个",13,MUTED,false),ui.top(8));body.addView(ui.button(scanning?"正在扫描…":"添加索引目录",true,this::pickTree),ui.top(10));for(LibraryStore.Group r:meta.roots)body.addView(ui.item("folder",shortPath(r.name),r.count+" 个文件",()->rootMenu(r)),ui.top(7));
         section(body,"本机资源节点",null,null);resourceNodeStatus=ui.text(ResourceNodeService.status,12,MUTED,false);body.addView(ui.item("server",ResourceNodeService.running?"运行中 · "+localNodeName():"未运行 · "+localNodeName(),ResourceNodeService.status,this::resourceNodeSheet),ui.top(10));
         section(body,"本机缩略图",null,null);LinearLayout autoRow=ui.row();autoRow.addView(ui.text("索引后自动加入缩略图任务",14,INK,true),ui.weight());Switch autoThumb=new Switch(this);autoThumb.setChecked(prefs.getBoolean("auto_local_thumbnails",true));autoThumb.setOnCheckedChangeListener((v,checked)->prefs.edit().putBoolean("auto_local_thumbnails",checked).apply());autoRow.addView(autoThumb);body.addView(autoRow,ui.top(10));LinearLayout taskRow=ui.row();taskRow.addView(ui.text("缩略图后台任务",14,INK,true),ui.weight());thumbnailTaskSwitch=new Switch(this);thumbnailTaskSwitch.setChecked(LocalThumbnailTaskService.isEnabled());thumbnailTaskSwitch.setOnCheckedChangeListener((v,checked)->toggleThumbnailTask(checked));taskRow.addView(thumbnailTaskSwitch);body.addView(taskRow,ui.top(14));thumbnailTaskStatus=ui.text(getSharedPreferences(LocalThumbnailTaskService.PREFS,MODE_PRIVATE).getString("status",LocalThumbnailTaskService.status),12,MUTED,false);body.addView(thumbnailTaskStatus,ui.top(5));
+        renderStorageDirectories(body);
         section(body,"云层存储",null,null);body.addView(ui.item("server",CloudStorageService.running?"存储节点运行中":"存储节点配置",CloudStorageService.running?CloudStorageService.status:"本机存储或 OpenList 后端",this::cloudStorageSheet),ui.top(10));
         section(body,"传输",null,null);body.addView(ui.item("download","传输列表",transferSummary(),()->navigate(3)),ui.top(10));section(body,"诊断",null,null);body.addView(ui.item("file","诊断日志","查看连接诊断并导出诊断包",this::diagnosticsSheet),ui.top(10));
         if(!scanMessage.isEmpty())body.addView(ui.text(scanMessage,12,GREEN,false),ui.top(12));
     }
     private String transferSummary(){JSONArray a=ResourceTransferService.records(this);int running=0;for(int i=0;i<a.length();i++){JSONObject x=a.optJSONObject(i);if(x!=null&&(x.optString("status").equals("下载中")||x.optString("status").equals("等待下载")))running++;}return running==0?"查看下载历史":running+" 个正在传输";}
     private String nodeOverviewSummary(){if(hubStore==null)return "连接 Hub 后查看各节点在线状态";int online=0,total=hubStore.client.nodes.length();for(int i=0;i<total;i++){JSONObject n=hubStore.client.nodes.optJSONObject(i);if(n!=null&&n.optBoolean("online"))online++;}return online+" 个在线 · "+(total-online)+" 个离线 · 点击查看节点";}
-    private String formatPeerLink(JSONObject link){String state=link.optString("state","unknown");if("checking".equals(state))return "检测中";if(!"connected".equals(state))return "不可达";JSONObject checks=link.optJSONObject("checks");if(checks==null)return "已连接";List<String> details=new ArrayList<>();String[] paths={"lan","webrtc","https","relay"};String[] labels={"局域网 TLS","WebRTC","HTTPS","存储中继"};for(int i=0;i<paths.length;i++){JSONObject check=checks.optJSONObject(paths[i]);if(check==null)continue;if(!"connected".equals(check.optString("state"))){details.add(labels[i]+"不可达");continue;}long latency=check.optLong("webrtc".equals(paths[i])?"connectMillis":"rttMillis",0);String value=labels[i]+("webrtc".equals(paths[i])?" 建链 ":" ")+latency+" ms";long bps=check.optLong("speedBps",0);if(bps>0)value+=" · "+formatRate(bps);details.add(value);}String path=link.optString("path","");String preferred="lan".equals(path)?"局域网 TLS":"webrtc".equals(path)?"WebRTC":"https".equals(path)?"HTTPS":"relay".equals(path)?"存储节点中继":"已连接";return details.isEmpty()?preferred:"首选 "+preferred+" · "+String.join("；",details);}
+    private String formatPeerLink(JSONObject link){String state=link.optString("state","unknown");if("checking".equals(state))return "检测中";JSONObject checks=link.optJSONObject("checks");if(checks==null)return "connected".equals(state)?"已连接":"不可达";List<String> details=new ArrayList<>();String[] paths={"lan","webrtc","https","relay"};for(String path:paths){JSONObject check=checks.optJSONObject(path);if(check==null)continue;String label=peerPathLabel(path);if(!"connected".equals(check.optString("state"))){details.add(label+"不可达"+(check.optString("error").isEmpty()?"":" · "+check.optString("error")));continue;}long latency=check.optLong("webrtc".equals(path)?"connectMillis":"rttMillis",0);String value=label+("webrtc".equals(path)?" 建链/请求 ":" RTT ")+latency+" ms";long bps=check.optLong("speedBps",0);if(bps>0)value+=" · "+formatRate(bps);if(check.optLong("bytes")>0)value+=" · "+size(check.optLong("bytes"))+" / "+check.optLong("durationMillis")+" ms";if(check.optInt("httpStatus")>0)value+=" · HTTP "+check.optInt("httpStatus");if(!check.optString("selectedPair").isEmpty())value+=" · ICE "+check.optString("selectedPair");if(!check.optString("error").isEmpty())value+=" · "+check.optString("error");details.add(value);}String preferred=peerPathLabel(link.optString("path",""));return details.isEmpty()?preferred:("connected".equals(state)?"首选 "+preferred:"不可达")+" · "+String.join("；",details);}
     private String formatRate(long bytesPerSecond){if(bytesPerSecond>=1L<<20)return String.format(Locale.ROOT,"%.1f MB/s",bytesPerSecond/(double)(1<<20));if(bytesPerSecond>=1<<10)return String.format(Locale.ROOT,"%.0f KB/s",bytesPerSecond/(double)(1<<10));return bytesPerSecond+" B/s";}
     private void setThumbnailTaskChecked(boolean checked){if(thumbnailTaskSwitch==null)return;thumbnailTaskSwitch.setOnCheckedChangeListener(null);thumbnailTaskSwitch.setChecked(checked);thumbnailTaskSwitch.setOnCheckedChangeListener((button,value)->toggleThumbnailTask(value));}
     private void toggleThumbnailTask(boolean enabled){if(enabled)startLocalThumbnailTask();else{Intent stop=new Intent(this,LocalThumbnailTaskService.class);stop.setAction("stop");startService(stop);}}
@@ -396,7 +398,7 @@ public final class MainActivity extends Activity {
         android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
         String storedPassword;try{storedPassword=CloudSecretStore.read(settings,"openlist_password");}catch(Exception ex){toast("OpenList 凭据读取失败，请重新配置节点");storedPassword="";}
         MobileUi.Sheet sheet=ui.sheet("手机云层存储节点","同一应用可浏览文件或只运行存储节点。节点只处理已加密的文件块。");
-		if(CloudStorageService.running){List<String> links=new ArrayList<>();for(Map.Entry<String,JSONObject> entry:CloudStorageService.peerLinks.entrySet())links.add(entry.getKey().substring(0,Math.min(12,entry.getKey().length()))+" · "+formatPeerLink(entry.getValue()));Collections.sort(links);sheet.body.addView(ui.text(links.isEmpty()?"其他节点：尚未发现":"其他节点：\n"+String.join("\n",links),12,MUTED,false),ui.top(8));}
+		if(CloudStorageService.running)renderCloudPeerControls(sheet);
         sheet.body.addView(ui.text("存储位置",12,INK,true));
         Spinner backendChoice=new Spinner(this);ArrayAdapter<String> choices=new ArrayAdapter<>(this,android.R.layout.simple_spinner_item,new String[]{"本手机存储（云层节点）","OpenList 云盘（可选后端）"});choices.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);backendChoice.setAdapter(choices);
         backendChoice.setSelection("openlist".equals(settings.getString("backend","disk"))?1:0);sheet.body.addView(backendChoice,ui.top(7));
@@ -441,6 +443,25 @@ public final class MainActivity extends Activity {
         if(CloudStorageService.running)sheet.footer.addView(ui.button("停止存储节点",false,()->{stopService(new Intent(this,CloudStorageService.class));sheet.close();handler.postDelayed(this::render,300);}),ui.top(9));
         sheet.show();
     }
+    private void renderCloudPeerControls(MobileUi.Sheet sheet){
+        section(sheet.body,"节点连接诊断与纯测速",null,null);
+        sheet.body.addView(ui.text("诊断会逐条检查可用路径、RTT、建链耗时和 ICE 候选类型。纯测速只收发合成数据，每条路径 3 轮、每轮 4 MiB，不读写云层文件。",11,MUTED,false),ui.top(5));
+        if(CloudStorageService.peerNodes.isEmpty()){sheet.body.addView(ui.text("其他节点：尚未发现",12,MUTED,false),ui.top(8));return;}
+        List<String> ids=new ArrayList<>(CloudStorageService.peerNodes.keySet());Collections.sort(ids);
+        for(String id:ids){JSONObject node=CloudStorageService.peerNodes.get(id);if(node==null)continue;JSONObject status=CloudStorageService.peerLinks.get(id);if(status==null)status=new JSONObject();
+            TextView heading=ui.text(("storage".equals(node.optString("role"))?"存储节点":"客户端")+" · "+id.substring(0,Math.min(12,id.length())),13,INK,true);sheet.body.addView(heading,ui.top(10));
+            TextView detail=ui.text(formatPeerLink(status),11,MUTED,false);sheet.body.addView(detail,ui.top(4));
+            JSONObject peerDetail=status.optJSONObject("peer");if(peerDetail!=null)sheet.body.addView(ui.text("地址类型 "+peerDetail.optString("endpointType","未知")+" · 局域网地址 "+peerDetail.optInt("lanAddresses")+" 个 · 最近心跳 "+peerDetail.optString("seenAt","未知")+" · 检测 "+status.optString("checkedAt","未知"),10,MUTED,false),ui.top(3));
+            List<String> routes=new ArrayList<>();JSONObject checks=status.optJSONObject("checks");for(String route:new String[]{"lan","webrtc","https","relay"})if(checks!=null&&"connected".equals(checks.optJSONObject(route)==null?"":checks.optJSONObject(route).optString("state")))routes.add(route);
+            if(routes.isEmpty()){if(node.optJSONArray("lan")!=null&&node.optJSONArray("lan").length()>0)routes.add("lan");String endpoint=node.optString("endpoint");if(endpoint.startsWith("p2p://"))routes.add("webrtc");else if(endpoint.contains("/cloud/relay/"))routes.add("relay");else if(endpoint.startsWith("https://"))routes.add("https");}
+            Spinner routeChoice=new Spinner(this);List<String> labels=new ArrayList<>();for(String route:routes)labels.add(peerPathLabel(route));ArrayAdapter<String> adapter=new ArrayAdapter<>(this,android.R.layout.simple_spinner_item,labels);adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);routeChoice.setAdapter(adapter);if(!routes.isEmpty())sheet.body.addView(routeChoice,ui.top(5));
+            TextView resultText=ui.text("测速结果将在这里显示",10,MUTED,false);sheet.body.addView(resultText,ui.top(4));
+            LinearLayout actions=ui.row();actions.addView(ui.button("连接诊断",false,()->{resultText.setText("正在检测局域网、WebRTC、HTTPS 与存储中继…");CloudStorageService.diagnosePeer(id,result->{handler.post(()->{if(result==null)return;CloudStorageService.peerLinks.put(id,result);detail.setText(formatPeerLink(result));JSONObject peer=result.optJSONObject("peer");if(peer!=null)resultText.setText("地址类型 "+peer.optString("endpointType","未知")+" · 局域网地址 "+peer.optInt("lanAddresses")+" 个 · 检测时间 "+result.optString("checkedAt","未知"));else resultText.setText(result.optString("error","诊断失败"));});});}),new LinearLayout.LayoutParams(0,-2,1));
+            actions.addView(ui.button("纯测速",false,()->{if(routes.isEmpty()){resultText.setText("当前没有可用的测速路径");return;}String route=routes.get(Math.max(0,routeChoice.getSelectedItemPosition()));resultText.setText("正在对"+peerPathLabel(route)+"进行 3 轮独立测速…");CloudStorageService.speedTestPeer(id,route,result->{handler.post(()->{if(result==null)return;if("complete".equals(result.optString("state"))){StringBuilder summary=new StringBuilder(peerPathLabel(route)+"平均 "+formatRate(result.optLong("speedBps"))+" · "+size(result.optLong("bytes"))+" · 建链/请求 "+result.optLong("connectMillis")+" ms · 总耗时 "+result.optLong("durationMillis")+" ms");if(!result.optString("selectedPair").isEmpty())summary.append("\n已选 ICE 路径：").append(result.optString("selectedPair"));JSONArray samples=result.optJSONArray("samples");if(samples!=null)for(int i=0;i<samples.length();i++){JSONObject sample=samples.optJSONObject(i);if(sample!=null)summary.append("\n第 ").append(i+1).append(" 轮：").append(formatRate(sample.optLong("speedBps"))).append(" · 数据 ").append(sample.optLong("durationMillis")).append(" ms · 建链/请求 ").append(sample.optLong("connectMillis")).append(" ms");}resultText.setText(summary.toString());}else resultText.setText("测速失败："+result.optString("error","未知错误"));});});}),new LinearLayout.LayoutParams(0,-2,1));
+            sheet.body.addView(actions,ui.top(5));
+        }
+    }
+    private String peerPathLabel(String path){return "lan".equals(path)?"局域网 TLS":"webrtc".equals(path)?"WebRTC":"relay".equals(path)?"存储中继":"HTTPS";}
     private static boolean validCloudAddress(String address){
         try{java.net.URI uri=new java.net.URI(address);return "https".equalsIgnoreCase(uri.getScheme())&&uri.getHost()!=null&&uri.getUserInfo()==null&&uri.getRawQuery()==null&&uri.getRawFragment()==null&&(uri.getPath().isEmpty()||uri.getPath().equals("/"));}catch(Exception ex){return false;}
     }
@@ -505,9 +526,41 @@ public final class MainActivity extends Activity {
         if(old.client.base.equals(cloudSettings.getString("hub",""))){cloudSettings.edit().remove("token").apply();stopService(new Intent(this,CloudStorageService.class));}
     },"已清除本机授权",()->{needsLogin=true;entries.clear();home=false;tab=2;meta=new LibraryStore.Meta();});});}
     private void pickTree(){if(scanning){toast("当前目录扫描完成后再添加");return;}Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);try{startActivityForResult(i,PICK_TREE);}catch(ActivityNotFoundException e){toast("设备没有可用的文件夹选择器");}}
+    private void pickStorageTree(){Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);try{startActivityForResult(i,PICK_STORAGE_TREE);}catch(ActivityNotFoundException e){toast("设备没有可用的文件夹选择器");}}
+    private void renderStorageDirectories(LinearLayout body){
+        section(body,"附加内容与云层存储",null,null);
+        body.addView(ui.text("默认应用目录排在第一位；缩略图和云层加密块按顺序写入有剩余配额的目录。0 GB 表示不限制。",12,MUTED,false),ui.top(7));
+        int count=StorageDirectories.configured(this).length();
+        for(int i=-1;i<count;i++){
+            final int index=i;long used=StorageDirectories.usage(this,i),limit=StorageDirectories.limit(this,i);
+            String title=i<0?"默认应用目录":StorageDirectories.label(this,i);
+            String detail=size(used)+" / "+(limit>0?size(limit):"不限")+(i<0?" · 第一存储位置":" · 第"+(i+2)+"存储位置");
+            body.addView(ui.item("harddrive",title,detail,()->storageDirectorySheet(index)),ui.top(7));
+        }
+        body.addView(ui.button("添加本地存储目录",false,this::pickStorageTree),ui.top(10));
+    }
+    private void storageDirectorySheet(int index){
+        MobileUi.Sheet sheet=ui.sheet(index<0?"默认应用目录":StorageDirectories.label(this,index),"已用 "+size(StorageDirectories.usage(this,index)));
+        sheet.body.addView(ui.item("edit","设置容量上限","单位 GB，输入 0 表示不限",()->{sheet.close();prompt("容量上限（GB）","例如 10",StorageDirectories.limit(this,index)>0?String.valueOf((double)StorageDirectories.limit(this,index)/(1L<<30)):"0",value->{double gb=Double.parseDouble(value);if(!Double.isFinite(gb)||gb<0)throw new IllegalArgumentException("请输入大于等于 0 的 GB 数值");try{StorageDirectories.setLimit(this,index,(long)(gb*(1L<<30)));}catch(Exception ex){throw new IllegalArgumentException(message(ex));}render();});}));
+        if(index>=0)sheet.body.addView(ui.item("trash","移除此目录","不会删除目录内已经保存的文件",()->{sheet.close();StorageDirectories.remove(this,index);render();}));
+        if(index>=0)sheet.body.addView(ui.item("folder","迁移并移除","先复制并校验附加内容，再清理此目录中的 Myliba 内容",()->{sheet.close();chooseStorageMigrationTarget(index);}));
+        sheet.show();
+    }
+    private void chooseStorageMigrationTarget(int sourceIndex){
+        JSONArray dirs=StorageDirectories.configured(this);ArrayList<Integer> indexes=new ArrayList<>();ArrayList<String> labels=new ArrayList<>();
+        indexes.add(-1);labels.add("默认应用目录 · "+StorageDirectories.label(this,-1));
+        for(int i=0;i<dirs.length();i++)if(i!=sourceIndex){indexes.add(i);labels.add(StorageDirectories.label(this,i));}
+        new AlertDialog.Builder(this).setTitle("选择迁移目标").setItems(labels.toArray(new String[0]),(dialog,which)->{
+            int targetIndex=indexes.get(which);String source=StorageDirectories.label(this,sourceIndex),target=StorageDirectories.label(this,targetIndex);
+            confirm("迁移并移除目录？","将把“"+source+"”中的缩略图、视频预览和云层文件迁移到“"+target+"”。校验成功后只清理源目录中 Myliba 管理的内容，其他文件会保留。",()->{
+                toast("正在迁移存储内容…");io.execute(()->{try{StorageDirectories.migrateAndRemove(this,sourceIndex,targetIndex);runOnUiThread(()->{if(!destroyed){render();toast("迁移完成，原存储目录已移除");}});}catch(Exception error){runOnUiThread(()->{if(!destroyed)toast("迁移失败，源目录保留："+message(error));});}});
+            });
+        }).show();
+    }
     @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(result!=RESULT_OK||data==null||data.getData()==null)return;Uri uri=data.getData();
         if(request==EXPORT_LOG){io.execute(()->{try(java.io.OutputStream output=getContentResolver().openOutputStream(uri,"w")){if(output==null)throw new java.io.IOException("无法打开目标文件");AppLog.export(output);runOnUiThread(()->toast("诊断包已保存"));}catch(Exception ex){AppLog.error("Diagnostic export failed",ex);runOnUiThread(()->toast("导出失败："+message(ex)));}});return;}
-        if(request!=PICK_TREE)return;try{getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION);String name=DocumentsContract.getTreeDocumentId(uri);int slash=Math.max(name.lastIndexOf('/'),name.lastIndexOf(':'));if(slash>=0)name=name.substring(slash+1);if(name.isEmpty())name="手机存储";db.addRoot(uri,name);home=false;tab=0;meta=new LibraryStore.Meta();entries.clear();render();scan(uri);}catch(Exception e){toast("无法授权目录："+message(e));}}
+        if(request==PICK_STORAGE_TREE){if(StorageDirectories.overlapsSourceRoot(uri,db)){toast("存储目录不能与资源索引目录重叠");return;}try{getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);String name=DocumentsContract.getTreeDocumentId(uri);int slash=Math.max(name.lastIndexOf('/'),name.lastIndexOf(':'));if(slash>=0)name=name.substring(slash+1);if(name.isEmpty())name="本地目录";StorageDirectories.add(this,uri,name);render();toast("存储目录已添加");}catch(Exception e){toast("无法授权存储目录："+message(e));}return;}
+        if(request!=PICK_TREE)return;if(StorageDirectories.overlapsConfigured(this,uri)){toast("索引目录不能与存储目录重叠");return;}try{getContentResolver().takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION);String name=DocumentsContract.getTreeDocumentId(uri);int slash=Math.max(name.lastIndexOf('/'),name.lastIndexOf(':'));if(slash>=0)name=name.substring(slash+1);if(name.isEmpty())name="手机存储";db.addRoot(uri,name);home=false;tab=0;meta=new LibraryStore.Meta();entries.clear();render();scan(uri);}catch(Exception e){toast("无法授权目录："+message(e));}}
     private void scan(Uri uri){if(scanning)return;scanning=true;scanMessage="正在索引文件…";generation++;loading=true;updateResults();toast(scanMessage);io.execute(()->{try{int count=new TreeScanner(getContentResolver(),db).scan(uri);runOnUiThread(()->{if(destroyed)return;scanning=false;loading=false;scanMessage="已索引 "+count+" 个文件";thumbs.clear();toast(scanMessage);if(!home)reload(false,true);if(prefs.getBoolean("auto_local_thumbnails",true))handler.postDelayed(this::generateLocalThumbnails,250);});}catch(Exception e){runOnUiThread(()->{if(destroyed)return;scanning=false;loading=false;scanMessage="扫描失败："+message(e);error=scanMessage;toast(scanMessage);if(tab==0)updateResults();else render();});}});}
     private void generateLocalThumbnails(){startLocalThumbnailTask();}
     private void showDetail(LibraryStore.Entry e){

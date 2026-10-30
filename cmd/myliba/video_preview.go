@@ -39,7 +39,7 @@ func (s *server) videoPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash := sha256.Sum256([]byte(fmt.Sprintf("preview\x00%s\x00%d\x00%d", id, info.Size(), info.ModTime().UnixNano())))
-	dir := filepath.Join(s.videoDir, "previews", hex.EncodeToString(hash[:]))
+	dir := s.videoPreviewDirectory(hex.EncodeToString(hash[:]), r.Method)
 	manifest := filepath.Join(dir, "preview.json")
 	if r.Method == http.MethodGet {
 		if r.URL.Query().Get("file") == "1" {
@@ -118,6 +118,38 @@ func (s *server) videoPreview(w http.ResponseWriter, r *http.Request) {
 	go s.buildVideoPreview(dir, source, info, spec)
 	writeJSON(w, 202, map[string]string{"status": "processing"})
 }
+
+func (s *server) videoPreviewDirectory(key, method string) string {
+	if s.db != nil {
+		rows, err := s.db.Query(`SELECT path FROM media_stores ORDER BY is_default DESC,added_at,id`)
+		if err == nil {
+			defer rows.Close()
+			var first string
+			for rows.Next() {
+				var root string
+				if rows.Scan(&root) != nil {
+					continue
+				}
+				dir := filepath.Join(root, "videos", "previews", key)
+				if first == "" {
+					first = dir
+				}
+				if _, e := os.Stat(dir); e == nil {
+					return dir
+				}
+			}
+			if method == http.MethodPost {
+				if store, e := s.writableMediaStore(); e == nil {
+					return filepath.Join(store.Path, "videos", "previews", key)
+				}
+			}
+			if first != "" {
+				return first
+			}
+		}
+	}
+	return filepath.Join(s.videoDir, "previews", key)
+}
 func (s *server) buildVideoPreview(dir, source string, info os.FileInfo, spec previewSpec) {
 	s.videoSlots <- struct{}{}
 	defer func() { <-s.videoSlots }()
@@ -171,6 +203,28 @@ func (s *server) buildVideoPreview(dir, source string, info os.FileInfo, spec pr
 							os.Remove(tmp.Name())
 						}
 					}
+				}
+			}
+		}
+	}
+	if err == nil {
+		storeID := s.mediaStoreIDForPath(dir)
+		var maxBytes int64
+		var root string
+		if s.db != nil && s.db.QueryRow(`SELECT path,max_bytes FROM media_stores WHERE id=?`, storeID).Scan(&root, &maxBytes) == nil {
+			used := mediaStoreUsage(root)
+			if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+				s.cloud.runtime.disk.setRootUsage(root, used)
+			}
+			if maxBytes > 0 && used > maxBytes {
+				withoutAsset, _ := mediaStoreUsageForReservation(root, dir, 0)
+				assetBytes := max(int64(0), used-withoutAsset)
+				if _, _, moveErr := s.moveMediaAssetToAvailableStore(dir, "videos", assetBytes); moveErr != nil {
+					_ = os.RemoveAll(dir)
+					if s.cloud != nil && s.cloud.runtime != nil && s.cloud.runtime.disk != nil {
+						s.cloud.runtime.disk.setRootUsage(root, mediaStoreUsage(root))
+					}
+					err = fmt.Errorf("media storage capacity exceeded: %w", moveErr)
 				}
 			}
 		}

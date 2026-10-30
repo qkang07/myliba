@@ -95,6 +95,11 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	if db != nil {
+		if err := disk.configureMediaStores(db); err != nil {
+			return nil, fmt.Errorf("configure cloud storage directories: %w", err)
+		}
+	}
 	if storageOnly {
 		disk.backend, err = newCloudBackendFromEnv()
 		if err != nil {

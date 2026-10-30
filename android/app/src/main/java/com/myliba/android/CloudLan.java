@@ -91,13 +91,13 @@ final class CloudLan {
             HttpsURLConnection connection=null;
             try{
                 connection=(HttpsURLConnection)new URL(address+path).openConnection();connection.setSSLSocketFactory(tls.getSocketFactory());connection.setHostnameVerifier((verifiedHost,session)->true);
-				connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(1500);connection.setReadTimeout(3000);connection.setRequestMethod(method);
+				connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(1500);connection.setReadTimeout(path.startsWith("/cloud/diagnostic-payload")?90000:3000);connection.setRequestMethod(method);
                 connection.setRequestProperty("Authorization","Bearer "+grant);
                 if(data!=null&&data.length>0){connection.setDoOutput(true);connection.setFixedLengthStreamingMode(data.length);try(OutputStream out=connection.getOutputStream()){out.write(data);}}
-                int status=connection.getResponseCode();byte[] body=new byte[0];
+                int status=connection.getResponseCode();long payloadStart=android.os.SystemClock.elapsedRealtime();byte[] body=new byte[0];
                 InputStream input=status>=400?connection.getErrorStream():connection.getInputStream();
                 if(input!=null)try(InputStream in=input;ByteArrayOutputStream out=new ByteArrayOutputStream()){byte[] buffer=new byte[8192];int n;while((n=in.read(buffer))!=-1){out.write(buffer,0,n);if(out.size()>16<<20)throw new IOException("LAN response too large");}body=out.toByteArray();}
-                return new CloudStorageService.PeerResult(status,body);
+                return new CloudStorageService.PeerResult(status,body,Math.max(1,android.os.SystemClock.elapsedRealtime()-payloadStart));
             }catch(Exception ex){last=ex;}finally{if(connection!=null)connection.disconnect();}
         }
         throw new IOException("LAN node unreachable",last);
