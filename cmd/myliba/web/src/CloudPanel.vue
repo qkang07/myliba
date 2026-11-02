@@ -1,21 +1,25 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { Cloud, Download, LoaderCircle, Play, RefreshCw, Upload, X } from "@lucide/vue";
 import StreamingVideo from "./StreamingVideo.vue";
 import {
-  diagnoseCloudPeer, getCloudFile, getCloudFiles, getCloudRecovery, getCloudVersions, importCloudRecovery,
+  diagnoseCloudPeer, getCloudFile, getCloudFiles, getCloudRecovery, getCloudVersions, getResource, importCloudRecovery,
   speedTestCloudPeer, uploadResourceToCloud, type CloudFile, type CloudPeerDiagnosis, type CloudSpeedTest, type CloudView, type Resource,
 } from "./api";
 
 const props = defineProps<{ resources: Resource[]; remote: boolean }>();
+const emit = defineEmits<{ openResource: [id: string] }>();
 const open = ref(false);
 const loading = ref(false);
 const error = ref("");
+const cloudQuery = ref("");
+const includeDevices = ref(true);
 const view = ref<CloudView>({ files: [], jobs: {}, nodeId: "", libraryId: "", peers: [], directEndpoint: "" });
 const recoveryKey = ref("");
 const importKey = ref("");
 const activeDownload = ref("");
 const activeVideo = ref("");
+const activePreview = ref<{ fileID: string; url: string; mime: string; kind: "image" | "audio" | "document" } | null>(null);
 const historyChoices = ref<Record<string, boolean>>({});
 const versions = ref<Record<string, CloudFile[]>>({});
 const diagnosingPeer = ref("");
@@ -23,11 +27,15 @@ const testingPeer = ref("");
 const selectedSpeedPath = ref<Record<string, CloudSpeedTest["path"]>>({});
 const diagnoses = ref<Record<string, CloudPeerDiagnosis>>({});
 const speedResults = ref<Record<string, CloudSpeedTest>>({});
+const matchingFiles = computed(() => {
+  const query = cloudQuery.value.trim().toLocaleLowerCase();
+  return view.value.files.filter((file) => !query || [file.name, file.folderName || "", ...(file.tags || [])].some((value) => value.toLocaleLowerCase().includes(query)));
+});
 let timer: ReturnType<typeof setInterval> | undefined;
 
 async function refresh() {
   try {
-    view.value = await getCloudFiles();
+    view.value = await getCloudFiles(includeDevices.value);
     for (const file of view.value.files) {
       if (file.sourceId && historyChoices.value[file.sourceId] === undefined) historyChoices.value[file.sourceId] = file.history;
     }
@@ -35,15 +43,20 @@ async function refresh() {
   }
   catch (cause) { error.value = cause instanceof Error ? cause.message : "无法读取云层"; }
 }
-async function show() {
+async function show(initialQuery?: string) {
+  if (initialQuery !== undefined) cloudQuery.value = initialQuery.trim();
   open.value = true;
   loading.value = true;
   await refresh();
   loading.value = false;
 }
+defineExpose({ open: show });
 async function upload(resource: Resource) {
   try { await uploadResourceToCloud(resource.id, historyChoices.value[resource.id] ?? false); await refresh(); }
   catch (cause) { error.value = cause instanceof Error ? cause.message : "无法上传文件"; }
+}
+function cloudMembership(resource: Resource) {
+  return view.value.files.find((file) => !file.localOnly && (file.id === resource.id || file.sourceId === resource.id));
 }
 async function download(id: string, name: string, revisionId?: string) {
   if (activeDownload.value) return;
@@ -61,6 +74,52 @@ async function download(id: string, name: string, revisionId?: string) {
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   } catch (cause) { error.value = cause instanceof Error ? cause.message : "无法下载文件"; }
   finally { activeDownload.value = ""; }
+}
+function previewKind(file: CloudFile): "image" | "audio" | "document" | "video" | null {
+  if (file.localOnly) return null;
+  if (file.variants?.length) return "video";
+  const ext = file.name.split(".").pop()?.toLocaleLowerCase() || "";
+  if (["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"].includes(ext)) return "image";
+  if (["mp3", "m4a", "aac", "ogg", "oga", "wav", "flac"].includes(ext)) return "audio";
+  if (["mp4", "m4v", "mov", "webm", "mkv"].includes(ext)) return "video";
+  if (["pdf", "txt", "md", "csv"].includes(ext)) return "document";
+  return null;
+}
+async function preview(file: CloudFile) {
+  const kind = previewKind(file);
+  if (!kind) return;
+  if (file.sourceId) {
+    try {
+      const source = await getResource(file.sourceId);
+      if (source.available && source.modified === file.modified && (source.contentSize ?? source.size) === (file.originalSize ?? file.size)) {
+        closePreview();
+        activeVideo.value = "";
+        open.value = false;
+        emit("openResource", source.id);
+        return;
+      }
+    } catch { /* The source may only exist in the cloud catalog. */ }
+  }
+  if (kind === "video") {
+    closePreview();
+    activeVideo.value = activeVideo.value === file.id ? "" : file.id;
+    return;
+  }
+  activeVideo.value = "";
+  if (activePreview.value) URL.revokeObjectURL(activePreview.value.url);
+  activePreview.value = null;
+  activeDownload.value = file.id;
+  try {
+    const response = await getCloudFile(file.id);
+    if (!response.ok) throw new Error(`预览失败 (HTTP ${response.status})`);
+    const url = URL.createObjectURL(await response.blob());
+    activePreview.value = { fileID: file.id, url, mime: response.headers.get("Content-Type") || "application/octet-stream", kind };
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : "无法预览云层文件"; }
+  finally { activeDownload.value = ""; }
+}
+function closePreview() {
+  if (activePreview.value) URL.revokeObjectURL(activePreview.value.url);
+  activePreview.value = null;
 }
 async function toggleVersions(id: string) {
   if (versions.value[id]) { delete versions.value[id]; versions.value = { ...versions.value }; return; }
@@ -118,13 +177,13 @@ function peerCheckDetail(path: string, check: { state: string; rttMillis?: numbe
 watch(open, (value) => {
   if (timer) clearInterval(timer);
   if (value) timer = setInterval(() => void refresh(), 3000);
-  else recoveryKey.value = "";
+  else { recoveryKey.value = ""; activeVideo.value = ""; closePreview(); }
 });
-onBeforeUnmount(() => { if (timer) clearInterval(timer); });
+onBeforeUnmount(() => { if (timer) clearInterval(timer); closePreview(); });
 </script>
 
 <template>
-  <button class="button button-secondary" type="button" @click="show"><Cloud :size="15" />云层</button>
+  <button class="button button-secondary" type="button" @click="show()"><Cloud :size="15" />云层</button>
   <Teleport to="body">
     <div v-if="open" class="resource-preview-backdrop" @click.self="open = false">
       <section class="hub-settings-dialog cloud-dialog" role="dialog" aria-modal="true" aria-label="云层">
@@ -162,19 +221,27 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
 		      <small v-if="speedResults[peer.id].error" class="form-error">{{ speedResults[peer.id].error }}</small>
 		    </div>
 		  </div>
-          <div class="cloud-heading"><strong>云层文件</strong><button class="quiet-button" type="button" @click="refresh"><RefreshCw :size="15" />刷新</button></div>
+          <div class="cloud-heading"><strong>跨设备与云层文件</strong><button class="quiet-button" type="button" @click="refresh"><RefreshCw :size="15" />刷新</button></div>
+          <label class="cloud-file-search"><Cloud :size="15" /><input v-model="cloudQuery" type="search" placeholder="搜索文件名、文件夹或标签" aria-label="查找云层文件" /></label>
+          <label><input v-model="includeDevices" type="checkbox" @change="refresh" />同时检索设备已同步的文件索引</label>
+          <p>文件夹和标签随来源设备的索引同步更新。未同步的设备文件不会出现在这里；受保护的文件请回到来源设备解锁查看。</p>
           <p v-if="loading">正在读取云层索引…</p>
-          <p v-else-if="!view.files.length">云层里还没有可用文件。</p>
-          <template v-for="file in view.files" :key="file.id">
+          <p v-else-if="!view.files.length">尚无已同步的文件。设备发布索引或文件加入云层后会显示在这里。</p>
+          <p v-else-if="!matchingFiles.length">没有匹配的已同步文件。</p>
+          <template v-for="file in matchingFiles" :key="file.id">
+          <p v-if="file.localOnly">仅设备索引 · 未存入云层。请切换到来源设备读取原件。</p>
+          <p v-for="location in file.locations || []" :key="location.nodeId + location.path">来源设备 {{ location.nodeId }} · {{ location.path }}</p>
+          <p v-if="file.folderName || file.tags?.length">{{ file.folderName ? '文件夹：' + file.folderName : '未归组' }}<span v-if="file.tags?.length"> · 标签：{{ file.tags.join('、') }}</span></p>
           <div class="hub-profile-row">
-            <div><strong>{{ file.name }}</strong><small>文件总大小 {{ formatSize(file.size) }} · 原件 {{ formatSize(file.originalSize ?? file.size) }} · {{ file.chunks }} 块 · 最少 {{ file.minReplicas }}/3 份在线副本 · {{ file.history ? "保留历史" : "无历史" }}</small></div>
-            <button v-if="file.variants?.length" class="button button-secondary" type="button" @click="activeVideo = activeVideo === file.id ? '' : file.id"><Play :size="14" />{{ activeVideo === file.id ? "收起" : "播放" }}</button>
+            <div><strong>{{ file.name }}</strong><small v-if="!file.localOnly">文件总大小 {{ formatSize(file.size) }} · 原件 {{ formatSize(file.originalSize ?? file.size) }} · {{ file.chunks }} 块 · {{ file.replicas ?? file.minReplicas }} 份副本 · {{ file.availableReplicas ?? "—" }} 份可用（60 秒内端点探测） · {{ file.history ? "保留历史" : "无历史" }}</small><small v-else>文件大小 {{ formatSize(file.originalSize) }} · {{ file.locations?.length || 0 }} 处已记录的原件位置</small></div>
+            <button v-if="previewKind(file)" class="button button-secondary" type="button" :disabled="!!activeDownload" @click="preview(file)"><LoaderCircle v-if="activeDownload === file.id" class="spin" :size="14" /><Play v-else :size="14" />{{ activeDownload === file.id ? "读取中" : activeVideo === file.id || activePreview?.fileID === file.id ? "收起预览" : "预览" }}</button>
             <button v-if="file.history" class="button button-secondary" type="button" @click="toggleVersions(file.id)">历史</button>
-            <button class="button button-secondary" type="button" :disabled="!!activeDownload" @click="download(file.id, file.name)">
+            <button v-if="!file.localOnly" class="button button-secondary" type="button" :disabled="!!activeDownload" @click="download(file.id, file.name)">
               <LoaderCircle v-if="activeDownload === file.id" class="spin" :size="14" /><Download v-else :size="14" />下载
             </button>
           </div>
           <div v-if="activeVideo === file.id" class="cloud-video-preview"><StreamingVideo :id="file.id" :name="file.name" :remote="remote" cloud :qualities="file.variants" :file-size="file.originalSize" /></div>
+          <div v-if="activePreview?.fileID === file.id" class="cloud-file-preview"><button class="quiet-button" type="button" @click="closePreview">关闭预览<X :size="14" /></button><img v-if="activePreview.kind === 'image'" :src="activePreview.url" :alt="file.name" /><audio v-else-if="activePreview.kind === 'audio'" :src="activePreview.url" controls preload="metadata" /><iframe v-else :src="activePreview.url" :title="file.name" /></div>
           </template>
           <div v-for="file in view.files.filter((item) => versions[item.id])" :key="file.id + '-history'" class="cloud-history">
             <div v-for="version in versions[file.id]" :key="version.revisionId" class="hub-profile-row">
@@ -186,8 +253,8 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
             <div class="cloud-heading"><strong>将当前页面的本地文件加入云层</strong></div>
             <p v-if="!resources.length">进入资源列表后，可从这里选择文件上传。</p>
             <div v-for="resource in resources" :key="resource.id" class="hub-profile-row">
-              <div><strong>{{ resource.name }}</strong><small>{{ formatSize(resource.contentSize ?? resource.size) }} · {{ view.jobs[resource.id] || "仅本地" }}</small><label class="cloud-history-choice"><input v-model="historyChoices[resource.id]" type="checkbox" />保留后续历史版本</label></div>
-              <button class="button button-secondary" type="button" :disabled="!resource.available || view.jobs[resource.id] === '上传中'" @click="upload(resource)">
+              <div><strong>{{ resource.name }}</strong><small>{{ formatSize(resource.contentSize ?? resource.size) }} · {{ cloudMembership(resource) ? `已在云层，${cloudMembership(resource)?.replicas ?? cloudMembership(resource)?.minReplicas ?? 0} 份副本，${cloudMembership(resource)?.availableReplicas ?? "—"} 份可用` : view.jobs[resource.id] || "仅本地" }}</small><label class="cloud-history-choice"><input v-model="historyChoices[resource.id]" type="checkbox" />保留后续历史版本</label></div>
+              <button v-if="!cloudMembership(resource)" class="button button-secondary" type="button" :disabled="!resource.available || view.jobs[resource.id] === '上传中'" @click="upload(resource)">
                 <Upload :size="14" />{{ view.jobs[resource.id] === "上传中" ? "上传中" : "加入云层" }}
               </button>
             </div>

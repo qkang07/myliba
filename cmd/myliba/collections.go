@@ -20,6 +20,7 @@ type collectionFilters struct {
 	RootID      string   `json:"rootId"`
 	FolderID    string   `json:"folderId"`
 	Unorganized bool     `json:"unorganized"`
+	Reachable   bool     `json:"reachable"`
 	Sort        string   `json:"sort"`
 }
 

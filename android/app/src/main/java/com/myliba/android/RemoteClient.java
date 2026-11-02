@@ -6,11 +6,14 @@ import org.json.*;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** One immutable server identity per client: requests never migrate between hosts. */
 final class RemoteClient {
     final String base;
     private volatile String cookie;
+    private volatile String folderAccessId="",folderAccessToken="";
+    private final ConcurrentHashMap<String,String> folderAccessTokens=new ConcurrentHashMap<>();
     private final SharedPreferences prefs;
     private final Context context;
     private volatile RemoteRTC rtc;
@@ -32,6 +35,9 @@ final class RemoteClient {
         return new URI("https",null,u.getHost(),u.getPort()==443?-1:u.getPort(),null,null,null).toString();
     }
     String cookie(){return cookie;}
+    void setActiveFolderAccess(String id){folderAccessId=id==null?"":id;folderAccessToken=folderAccessTokens.getOrDefault(folderAccessId,"");}
+    void setFolderAccessToken(String id,String token){folderAccessId=id==null?"":id;folderAccessToken=token==null?"":token;if(!folderAccessId.isEmpty()&&!folderAccessToken.isEmpty())folderAccessTokens.put(folderAccessId,folderAccessToken);}
+    void clearFolderAccessToken(String id){if(id!=null)folderAccessTokens.remove(id);if(id!=null&&id.equals(folderAccessId))folderAccessToken="";}
     boolean paired(){return base.equals(prefs.getString("device_hub",""))&&!prefs.getString("device_id","").isEmpty();}
     void forget(){cookie="";rtcConfigured=false;rtc.close();rtc=new RemoteRTC(context,base);if(base.equals(prefs.getString("server_url","")))prefs.edit().remove("server_cookie").apply();}
     void unpair(){forget();if(base.equals(prefs.getString("device_hub","")))prefs.edit().remove("device_hub").remove("device_id").remove("device_token").apply();}
@@ -76,7 +82,9 @@ final class RemoteClient {
             if(directRequired&&!rtcConfigured)json("GET","/api/session",null);
             byte[] payload=body==null?new byte[0]:body.toString().getBytes(StandardCharsets.UTF_8);
             try{
-                RemoteRTC.Reply reply=rtc.fetch(method,path,payload,max);
+                JSONObject requestHeaders=new JSONObject();String accessId=folderAccessId,accessToken=folderAccessToken;
+                if(!accessId.isEmpty()&&!accessToken.isEmpty())requestHeaders.put("X-Myliba-Folder-Access",new JSONArray().put(accessToken));
+                RemoteRTC.Reply reply=rtc.fetch(method,path,payload,requestHeaders,max);
                 if(reply.status<200||reply.status>=300)throw failure(reply.status,reply.body);
                 return reply.body;
             }catch(Failure ex){if(!"GET".equals(method)||ex.status<500)throw ex;AppLog.info("Remote content falling back to limited Hub relay after RTC HTTP "+ex.status);}
@@ -87,6 +95,7 @@ final class RemoteClient {
             c.setRequestMethod(method);c.setConnectTimeout(12000);c.setReadTimeout(30000);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
             c.setRequestProperty("Origin",base);c.setRequestProperty("Referer",base+"/");c.setRequestProperty("Accept","application/json, image/*");
             if(!cookie.isEmpty())c.setRequestProperty("Cookie",cookie);
+            String activeFolderToken=folderAccessToken;if(!activeFolderToken.isEmpty())c.setRequestProperty("X-Myliba-Folder-Access",activeFolderToken);
             if(body!=null){c.setDoOutput(true);c.setRequestProperty("Content-Type","application/json; charset=utf-8");try(OutputStream out=c.getOutputStream()){out.write(body.toString().getBytes(StandardCharsets.UTF_8));}}
             int status=c.getResponseCode();String set=c.getHeaderField("Set-Cookie");
             if(set!=null&&!set.isEmpty()){cookie=set.split(";",2)[0];if(base.equals(prefs.getString("server_url","")))try{prefs.edit().putString("server_cookie",CloudSecretStore.protect(cookie)).apply();}catch(Exception ex){throw new IOException("无法安全保存登录会话",ex);}}

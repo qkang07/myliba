@@ -1,6 +1,8 @@
 package com.myliba.android;
 
 import android.content.Context;
+import android.database.Cursor;
+import android.provider.DocumentsContract;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.MediaMetadataRetriever;
@@ -12,6 +14,7 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Remote, allowlisted view of the phone's existing SAF/SQLite library. */
 final class NodeResourceApi {
@@ -26,6 +29,8 @@ final class NodeResourceApi {
         @Override public void close()throws IOException{body.close();}
     }
     private final Context context;private final LocalLibrary db;
+    private final Set<String> transferFolders=ConcurrentHashMap.newKeySet();
+    private final Map<String,Long> transferFiles=new ConcurrentHashMap<>();
     NodeResourceApi(Context context){this.context=context;db=new LocalLibrary(context);}
     void close(){db.close();}
     static String id(String uri){return Base64.encodeToString(uri.getBytes(StandardCharsets.UTF_8),Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING);}
@@ -61,6 +66,8 @@ final class NodeResourceApi {
         Uri uri=Uri.parse(rawPath);String path=uri.getPath();
         if(path==null||!path.startsWith("/api/")||path.contains("..")||path.contains("\\"))return error(403,"远程接口不允许访问");
         String[] parts=path.substring(1).split("/");
+        if(parts.length==3&&"transfers".equals(parts[1])&&"browse".equals(parts[2])&&"GET".equals(method))return transferBrowse(uri);
+        if(parts.length==3&&"transfers".equals(parts[1])&&"file".equals(parts[2]))return transferFile(method,uri,requestBody);
         if(parts.length==2&&"roots".equals(parts[1])&&"GET".equals(method)){
             JSONArray roots=new JSONArray();for(LocalLibrary.Root root:db.roots())roots.put(new JSONObject().put("id",root.uri).put("path",root.name).put("addedAt","").put("lastScanAt","").put("autoPreprocess",false).put("count",root.count));return json(200,roots);
         }
@@ -102,6 +109,106 @@ final class NodeResourceApi {
         if(parts.length==2&&"cloud".equals(parts[1]))return error(404,"手机资源节点的云层功能独立配置");
         return mutate(method,parts,requestBody);
     }
+
+    private Result transferBrowse(Uri uri)throws Exception{
+        String requested=uri.getQueryParameter("path");
+        JSONArray roots=new JSONArray();
+        if(requested==null||requested.isEmpty()){
+            for(LocalLibrary.Root root:db.roots()){
+                String path=transferDir(root.uri);transferFolders.add(root.uri);
+                roots.put(new JSONObject().put("name",root.name).put("path",path));
+            }
+            return json(200,new JSONObject().put("current","").put("parent","").put("roots",roots).put("entries",new JSONArray()));
+        }
+        String folder=decodeTransferDir(requested);
+        if(folder==null||!authorizedTransferFolder(folder))return error(403,"传输只能访问已添加的资源根目录");
+        Uri tree=Uri.parse(folder);String documentId=DocumentsContract.getDocumentId(tree);
+        Uri children=DocumentsContract.buildChildDocumentsUriUsingTree(tree,documentId);
+        JSONArray entries=new JSONArray();String parent="";
+        String rootId=DocumentsContract.getTreeDocumentId(tree);
+        if(!documentId.equals(rootId)){
+            int slash=documentId.lastIndexOf('/');
+            if(slash>=0){Uri parentUri=DocumentsContract.buildDocumentUriUsingTree(tree,documentId.substring(0,slash));parent=transferDir(parentUri.toString());transferFolders.add(parentUri.toString());}
+        }
+        String[] columns={DocumentsContract.Document.COLUMN_DOCUMENT_ID,DocumentsContract.Document.COLUMN_DISPLAY_NAME,DocumentsContract.Document.COLUMN_MIME_TYPE,DocumentsContract.Document.COLUMN_SIZE};
+        try(Cursor cursor=context.getContentResolver().query(children,columns,null,null,null)){
+            if(cursor==null)return error(403,"无法读取该目录");
+            while(cursor.moveToNext()){
+                String childId=cursor.getString(0),name=cursor.getString(1),mime=cursor.getString(2);
+                if(name==null||name.isEmpty()||name.equals(".")||name.equals(".."))continue;
+                Uri child=DocumentsContract.buildDocumentUriUsingTree(tree,childId);boolean dir=DocumentsContract.Document.MIME_TYPE_DIR.equals(mime);long size=dir||cursor.isNull(3)?0:Math.max(0,cursor.getLong(3));
+                if(dir)transferFolders.add(child.toString());else transferFiles.put(child.toString(),size);
+                entries.put(new JSONObject().put("name",name).put("path",dir?transferDir(child.toString()):transferFilePath(child.toString())).put("dir",dir).put("size",size));
+            }
+        }catch(Exception ex){return error(403,"无法读取该目录");}
+        int nameStart=Math.max(documentId.lastIndexOf('/'),documentId.lastIndexOf(':'));
+        String currentName=nameStart>=0&&nameStart<documentId.length()-1?documentId.substring(nameStart+1):documentId;
+        for(LocalLibrary.Root root:db.roots())if(root.uri.equals(folder)){currentName=root.name;break;}
+        return json(200,new JSONObject().put("current",requested).put("currentName",currentName).put("parent",parent).put("roots",roots).put("entries",entries));
+    }
+
+    private Result transferFile(String method,Uri uri,byte[] body)throws Exception{
+        String requested=uri.getQueryParameter("path"),id=uri.getQueryParameter("id");
+        if(requested==null)return error(400,"传输路径无效");
+        if("GET".equals(method)){
+            String document=decodeTransferFile(requested);
+            Long fileSize=document==null?null:transferFiles.get(document);
+            if(fileSize==null||!authorizedTransferFolderForFile(document))return error(403,"传输只能访问已列出的资源文件");
+            Uri file=Uri.parse(document);InputStream input=context.getContentResolver().openInputStream(file);
+            if(input==null)return error(404,"文件不可访问");
+            long offset;try{offset=Long.parseLong(uri.getQueryParameter("offset"));}catch(Exception ex){input.close();return error(400,"文件偏移无效");}
+            long length;try{length=Long.parseLong(uri.getQueryParameter("length"));}catch(Exception ex){input.close();return error(400,"分块长度无效");}
+            if(offset<0||offset>fileSize||length<0||length>(1<<20)||length>fileSize-offset){input.close();return error(400,"分块范围无效");}
+            long skipped=0;while(skipped<offset){long count=input.skip(offset-skipped);if(count<=0){input.close();return error(416,"文件偏移超出范围");}skipped+=count;}
+            return new Result(200,"application/octet-stream",new LimitedInputStream(input,length),length);
+        }
+        if(!"PUT".equals(method)&&!"DELETE".equals(method))return error(405,"请求方法不支持");
+        if(id==null||!id.matches("[0-9a-f]{16,64}"))return error(400,"传输 ID 无效");
+        File temp=new File(context.getCacheDir(),"transfer-"+id+".part");
+        if("DELETE".equals(method)){if(temp.exists()&&!temp.delete())return error(500,"无法清理未完成文件");return new Result(204,"application/octet-stream",new ByteArrayInputStream(new byte[0]),0);}
+        String[] target=requested.split(":",-1);
+        if(target.length!=3||!"safout".equals(target[0]))return error(400,"目标路径无效");
+        String folder=decodeToken(target[1]),name=decodeToken(target[2]);
+        if(folder==null||name==null||!authorizedTransferFolder(folder)||!safeTransferName(name))return error(403,"目标目录或文件名无效");
+        long offset,total;try{offset=Long.parseLong(uri.getQueryParameter("offset"));total=Long.parseLong(uri.getQueryParameter("total"));}catch(Exception ex){return error(400,"文件大小无效");}
+        if(offset<0||total<0||body.length>(1<<20)||offset>total-body.length)return error(400,"文件大小无效");
+        try(RandomAccessFile output=new RandomAccessFile(temp,"rw")){
+            if(offset==0){if(temp.exists()&&temp.length()>0)return error(409,"传输临时文件已存在");output.setLength(0);}
+            else if(!temp.isFile()||temp.length()!=offset)return error(409,"传输分块顺序无效");
+            output.seek(offset);output.write(body);output.getFD().sync();
+        }catch(Exception ex){return error(500,"写入传输分块失败");}
+        if("1".equals(uri.getQueryParameter("final"))){
+            if(!temp.isFile()||temp.length()!=total)return error(409,"传输文件大小不完整");
+            Uri folderUri=Uri.parse(folder);Uri children=DocumentsContract.buildChildDocumentsUriUsingTree(folderUri,DocumentsContract.getDocumentId(folderUri));
+            String[] columns={DocumentsContract.Document.COLUMN_DISPLAY_NAME};
+            try(Cursor cursor=context.getContentResolver().query(children,columns,null,null,null)){
+                if(cursor==null)return error(403,"无法读取目标目录");while(cursor.moveToNext())if(name.equals(cursor.getString(0)))return error(409,"目标文件已存在");
+            }
+            Uri created=DocumentsContract.createDocument(context.getContentResolver(),folderUri,"application/octet-stream",name);
+            if(created==null)return error(500,"无法在手机目录创建文件");
+            try(InputStream input=new FileInputStream(temp);OutputStream output=context.getContentResolver().openOutputStream(created,"w")){
+                if(output==null)throw new IOException("destination unavailable");byte[] buffer=new byte[32768];int count;while((count=input.read(buffer))!=-1)output.write(buffer,0,count);output.flush();
+            }catch(Exception ex){try{DocumentsContract.deleteDocument(context.getContentResolver(),created);}catch(Exception ignored){}return error(500,"无法完成目标文件写入");}
+            if(!temp.delete())return error(500,"文件已写入，但临时文件清理失败");
+        }
+        return new Result(204,"application/octet-stream",new ByteArrayInputStream(new byte[0]),0);
+    }
+
+    private boolean authorizedTransferFolder(String value){
+        if(!transferFolders.contains(value))return false;
+        for(LocalLibrary.Root root:db.roots())try{Uri rootUri=Uri.parse(root.uri),candidate=Uri.parse(value);if(rootUri.getAuthority().equals(candidate.getAuthority())&&DocumentsContract.getTreeDocumentId(rootUri).equals(DocumentsContract.getTreeDocumentId(candidate)))return true;}catch(Exception ignored){}
+        return false;
+    }
+    private boolean authorizedTransferFolderForFile(String file){
+        try{Uri item=Uri.parse(file);String treeId=DocumentsContract.getTreeDocumentId(item);for(LocalLibrary.Root root:db.roots()){Uri rootUri=Uri.parse(root.uri);if(rootUri.getAuthority().equals(item.getAuthority())&&treeId.equals(DocumentsContract.getTreeDocumentId(rootUri)))return true;}}catch(Exception ignored){}return false;
+    }
+    private static boolean safeTransferName(String value){return !value.isEmpty()&&!value.equals(".")&&!value.equals("..")&&!value.contains("/")&&!value.contains("\\")&&value.length()<=255;}
+    private static String token(String value){return Base64.encodeToString(value.getBytes(StandardCharsets.UTF_8),Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING);}
+    private static String decodeToken(String value){try{return new String(Base64.decode(value,Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING),StandardCharsets.UTF_8);}catch(Exception ex){return null;}}
+    private static String transferDir(String value){return "safdir:"+token(value);}
+    private static String transferFilePath(String value){return "saffile:"+token(value);}
+    private static String decodeTransferDir(String value){return value.startsWith("safdir:")?decodeToken(value.substring(7)):null;}
+    private static String decodeTransferFile(String value){return value.startsWith("saffile:")?decodeToken(value.substring(8)):null;}
 
     private Result page(Uri uri,boolean selection)throws Exception{
         int limit=integer(uri.getQueryParameter("limit"),48,1,1000),offset=integer(uri.getQueryParameter("offset"),0,0,Integer.MAX_VALUE);

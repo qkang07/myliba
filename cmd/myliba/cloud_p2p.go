@@ -263,11 +263,11 @@ func cloudSelectedICEPair(peer *webrtc.PeerConnection) string {
 		if !localOK || !remoteOK {
 			continue
 		}
-		localType := string(local.CandidateType) + "/" + strings.ToLower(local.Protocol) + "/" + cloudIPFamily(local.IP)
+		localType := local.CandidateType.String() + "/" + strings.ToLower(local.Protocol) + "/" + cloudIPFamily(local.IP)
 		if local.NetworkType != "" {
 			localType += "/" + strings.ToLower(local.NetworkType)
 		}
-		remoteType := string(remote.CandidateType) + "/" + strings.ToLower(remote.Protocol) + "/" + cloudIPFamily(remote.IP)
+		remoteType := remote.CandidateType.String() + "/" + strings.ToLower(remote.Protocol) + "/" + cloudIPFamily(remote.IP)
 		return localType + " ↔ " + remoteType
 	}
 	return ""

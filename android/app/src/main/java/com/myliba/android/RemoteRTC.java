@@ -163,7 +163,10 @@ final class RemoteRTC implements AutoCloseable {
         if(!done.await(15,TimeUnit.SECONDS)||offer[0]==null)throw new IOException("RTC offer failed: "+failure[0]);return offer[0];
     }
     Reply fetch(String method,String path,byte[] body,int max)throws Exception{
-        ByteArrayOutputStream output=new ByteArrayOutputStream();Reply response=stream(method,path,body,new JSONObject(),output,max);
+        return fetch(method,path,body,new JSONObject(),max);
+    }
+    Reply fetch(String method,String path,byte[] body,JSONObject headers,int max)throws Exception{
+        ByteArrayOutputStream output=new ByteArrayOutputStream();Reply response=stream(method,path,body,headers,output,max);
         return new Reply(response.status,response.headers,output.toByteArray());
     }
     Reply stream(String method,String path,byte[] body,JSONObject headers,OutputStream output,long max)throws Exception{

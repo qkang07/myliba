@@ -2,19 +2,16 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ArrowDown, ArrowLeft, ArrowRight, Check, File, Folder, LoaderCircle, RefreshCw, WifiOff, X } from "@lucide/vue";
 import {
-  browseTransferDirectory,
-  cancelTransferFile,
   selectResourceNode,
-  readTransferChunk,
-  writeTransferChunk,
   type HubResourceNode,
   type TransferDirectory,
   type TransferEntry,
 } from "./api";
+import { TransferNodeConnection } from "./transferRTC";
 
-const props = defineProps<{ nodes: HubResourceNode[]; selectedNodeId: string }>();
+const props = defineProps<{ nodes: HubResourceNode[]; selectedNodeId: string; iceServers: RTCIceServer[] }>();
 const emit = defineEmits<{ close: [] }>();
-const availableNodes = computed(() => props.nodes.filter((node) => node.online && node.kind === "desktop"));
+const availableNodes = computed(() => props.nodes.filter((node) => node.online));
 const sourceNodeId = ref("");
 const targetNodeId = ref("");
 const sourceDir = ref<TransferDirectory>({ current: "", parent: "", roots: [], entries: [] });
@@ -25,7 +22,12 @@ const listing = ref(false);
 const error = ref("");
 const progress = ref({ name: "", transferred: 0, total: 0 });
 const controller = ref<AbortController | null>(null);
+const sourceConnection = ref<TransferNodeConnection | null>(null);
+const targetConnection = ref<TransferNodeConnection | null>(null);
+const sourceConnectionNodeId = ref("");
+const targetConnectionNodeId = ref("");
 const originalNodeId = props.selectedNodeId;
+let disposed = false;
 const chunkSize = 1024 * 1024;
 
 const sourceFiles = computed(() => sourceDir.value.entries.filter((entry) => !entry.dir));
@@ -38,8 +40,11 @@ async function loadDirectory(side: "source" | "target", path = "") {
   listing.value = true;
   error.value = "";
   try {
-    await selectResourceNode(nodeId);
-    const data = await browseTransferDirectory(path);
+    const connection = await ensureConnection(side, nodeId);
+    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    const response = await connection.fetch(`/api/transfers/browse${query}`);
+    if (!response.ok) throw await responseError(response);
+    const data = await response.json() as TransferDirectory;
     if (side === "source") { sourceDir.value = data; sourceSelected.value = new Set(); }
     else targetDir.value = data;
   } catch (cause) {
@@ -47,17 +52,35 @@ async function loadDirectory(side: "source" | "target", path = "") {
   } finally { listing.value = false; }
 }
 
+async function ensureConnection(side: "source" | "target", nodeId: string) {
+  const current = side === "source" ? sourceConnection.value : targetConnection.value;
+  const currentId = side === "source" ? sourceConnectionNodeId.value : targetConnectionNodeId.value;
+  if (current && currentId === nodeId) return current;
+  current?.close();
+  const connection = await TransferNodeConnection.open(nodeId, props.iceServers);
+  if (side === "source") { sourceConnection.value = connection; sourceConnectionNodeId.value = nodeId; }
+  else { targetConnection.value = connection; targetConnectionNodeId.value = nodeId; }
+  return connection;
+}
+
+async function responseError(response: Response) {
+  const body = await response.json().catch(() => undefined);
+  return new Error(body?.error || `节点传输请求失败 (${response.status})`);
+}
+
 async function switchNode(side: "source" | "target", id: string) {
   if (side === "source") {
     sourceNodeId.value = id;
-    if (targetNodeId.value === id) targetNodeId.value = availableNodes.value.find((node) => node.id !== id)?.id || "";
+    const targetChanged = targetNodeId.value === id;
+    if (targetChanged) { targetNodeId.value = availableNodes.value.find((node) => node.id !== id)?.id || ""; targetDir.value = { current: "", parent: "", roots: [], entries: [] }; }
     await loadDirectory("source");
-    if (targetNodeId.value && targetDir.value.current === "") await loadDirectory("target");
+    if (targetNodeId.value && (targetChanged || targetDir.value.current === "")) await loadDirectory("target");
   } else {
     targetNodeId.value = id;
-    if (sourceNodeId.value === id) sourceNodeId.value = availableNodes.value.find((node) => node.id !== id)?.id || "";
+    const sourceChanged = sourceNodeId.value === id;
+    if (sourceChanged) { sourceNodeId.value = availableNodes.value.find((node) => node.id !== id)?.id || ""; sourceDir.value = { current: "", parent: "", roots: [], entries: [] }; sourceSelected.value = new Set(); }
     await loadDirectory("target");
-    if (sourceNodeId.value && sourceDir.value.current === "") await loadDirectory("source");
+    if (sourceNodeId.value && (sourceChanged || sourceDir.value.current === "")) await loadDirectory("source");
   }
 }
 
@@ -84,27 +107,32 @@ async function transfer() {
   try {
     for (const file of selectedFiles.value) {
       const id = crypto.randomUUID().replaceAll("-", "");
-      const targetPath = `${targetDir.value.current.replace(/[\\/]$/, "")}${targetDir.value.current.includes("\\") ? "\\" : "/"}${file.name}`;
+      const targetPath = transferTargetPath(targetDir.value.current, file.name);
       let offset = 0;
       progress.value = { name: file.name, transferred: 0, total: file.size };
       try {
-        await selectResourceNode(sourceNodeId.value);
+        const source = await ensureConnection("source", sourceNodeId.value);
+        const target = await ensureConnection("target", targetNodeId.value);
         if (file.size === 0) {
-          await selectResourceNode(targetNodeId.value);
-          await writeTransferChunk(targetPath, id, 0, 0, new Blob([]), true, signalController.signal);
+          const query = new URLSearchParams({ path: targetPath, id, offset: "0", total: "0", final: "1" });
+          const response = await target.fetch(`/api/transfers/file?${query}`, { method: "PUT", body: new Blob([]), signal: signalController.signal, headers: { "Content-Type": "application/octet-stream" } });
+          if (!response.ok) throw await responseError(response);
         }
         while (offset < file.size) {
           const length = Math.min(chunkSize, file.size - offset);
-          const response = await readTransferChunk(file.path, offset, length, signalController.signal);
+          const sourceQuery = new URLSearchParams({ path: file.path, offset: String(offset), length: String(length) });
+          const response = await source.fetch(`/api/transfers/file?${sourceQuery}`, { signal: signalController.signal });
+          if (!response.ok) throw await responseError(response);
           const chunk = await response.blob();
-          await selectResourceNode(targetNodeId.value);
-          await writeTransferChunk(targetPath, id, offset, file.size, chunk, offset + length === file.size, signalController.signal);
+          const targetQuery = new URLSearchParams({ path: targetPath, id, offset: String(offset), total: String(file.size) });
+          if (offset + length === file.size) targetQuery.set("final", "1");
+          const written = await target.fetch(`/api/transfers/file?${targetQuery}`, { method: "PUT", body: chunk, signal: signalController.signal, headers: { "Content-Type": "application/octet-stream" } });
+          if (!written.ok) throw await responseError(written);
           offset += length;
           progress.value = { name: file.name, transferred: offset, total: file.size };
-          if (offset < file.size) await selectResourceNode(sourceNodeId.value);
         }
       } catch (cause) {
-        try { await selectResourceNode(targetNodeId.value); await cancelTransferFile(targetPath, id); } catch { /* no partial file may have been created */ }
+        try { const target = await ensureConnection("target", targetNodeId.value); const query = new URLSearchParams({ path: targetPath, id }); await target.fetch(`/api/transfers/file?${query}`, { method: "DELETE" }); } catch { /* best effort cleanup */ }
         throw cause;
       }
     }
@@ -117,11 +145,20 @@ async function transfer() {
   } finally {
     controller.value = null;
     busy.value = false;
+    if (disposed) { sourceConnection.value?.close(); targetConnection.value?.close(); }
   }
 }
 
 function directoryTitle(dir: TransferDirectory) {
-  return dir.current || "选择已添加的资源根目录";
+  return dir.current.startsWith("safdir:") ? dir.currentName || "手机资源目录" : dir.current || "选择已添加的资源根目录";
+}
+
+function transferTargetPath(directory: string, name: string) {
+  if (directory.startsWith("safdir:")) {
+    const encode = (value: string) => btoa(unescape(encodeURIComponent(value))).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    return `safout:${directory.slice(7)}:${encode(name)}`;
+  }
+  return `${directory.replace(/[\\/]$/, "")}${directory.includes("\\") ? "\\" : "/"}${name}`;
 }
 
 onMounted(async () => {
@@ -133,7 +170,9 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
   controller.value?.abort();
+  if (!busy.value) { sourceConnection.value?.close(); targetConnection.value?.close(); }
   if (originalNodeId && props.nodes.some((node) => node.id === originalNodeId)) void selectResourceNode(originalNodeId).catch(() => undefined);
 });
 </script>
@@ -141,16 +180,16 @@ onBeforeUnmount(() => {
 <template>
   <section class="node-transfer-page">
     <header class="transfer-heading">
-      <div><span class="transfer-eyebrow">NODE TO NODE</span><h1>文件传输</h1><p>在两个在线节点的已添加资源目录之间复制文件。传输不会扫描或建立索引。</p></div>
+      <div><span class="transfer-eyebrow">NODE TO NODE</span><h1>节点间文件传输</h1><p>支持在线桌面与手机资源节点互传。浏览器用 WebRTC 分块转发，Hub 只负责连接信令；目标文件不会加入索引。</p></div>
       <button type="button" class="transfer-close" @click="emit('close')"><X :size="16" />返回资源空间</button>
     </header>
 
-    <div v-if="availableNodes.length < 2" class="transfer-notice"><WifiOff :size="18" />目前仅支持桌面资源节点；需要至少两个在线桌面节点才能开始传输。</div>
+    <div v-if="availableNodes.length < 2" class="transfer-notice"><WifiOff :size="18" />需要至少两个在线资源节点才能开始传输，可在桌面和手机之间互传。</div>
     <template v-else>
       <div class="transfer-columns">
         <section class="transfer-pane">
           <header class="transfer-pane-heading"><span class="transfer-step">01</span><div><strong>来源节点</strong><small>选择要发送的文件</small></div>
-            <select :value="sourceNodeId" :disabled="busy" aria-label="来源节点" @change="switchNode('source', ($event.target as HTMLSelectElement).value)"><option v-for="node in availableNodes" :key="node.id" :value="node.id">{{ node.name }}</option></select>
+            <select :value="sourceNodeId" :disabled="busy" aria-label="来源节点" @change="switchNode('source', ($event.target as HTMLSelectElement).value)"><option v-for="node in availableNodes" :key="node.id" :value="node.id">{{ node.name }} · {{ node.kind === 'android' ? '手机' : '桌面' }}</option></select>
           </header>
           <div class="transfer-path"><button v-if="sourceDir.parent" type="button" :disabled="busy || listing" aria-label="上一级" @click="loadDirectory('source', sourceDir.parent)"><ArrowLeft :size="15" /></button><span :title="directoryTitle(sourceDir)">{{ directoryTitle(sourceDir) }}</span><button type="button" :disabled="busy || listing" aria-label="刷新目录" @click="loadDirectory('source', sourceDir.current)"><RefreshCw :size="14" /></button></div>
           <div class="transfer-file-list">
@@ -166,7 +205,7 @@ onBeforeUnmount(() => {
 
         <section class="transfer-pane">
           <header class="transfer-pane-heading"><span class="transfer-step">02</span><div><strong>目标节点</strong><small>选择文件保存位置</small></div>
-            <select :value="targetNodeId" :disabled="busy" aria-label="目标节点" @change="switchNode('target', ($event.target as HTMLSelectElement).value)"><option v-for="node in availableNodes.filter((node) => node.id !== sourceNodeId)" :key="node.id" :value="node.id">{{ node.name }}</option></select>
+            <select :value="targetNodeId" :disabled="busy" aria-label="目标节点" @change="switchNode('target', ($event.target as HTMLSelectElement).value)"><option v-for="node in availableNodes.filter((node) => node.id !== sourceNodeId)" :key="node.id" :value="node.id">{{ node.name }} · {{ node.kind === 'android' ? '手机' : '桌面' }}</option></select>
           </header>
           <div class="transfer-path"><button v-if="targetDir.parent" type="button" :disabled="busy || listing" aria-label="上一级" @click="loadDirectory('target', targetDir.parent)"><ArrowLeft :size="15" /></button><span :title="directoryTitle(targetDir)">{{ directoryTitle(targetDir) }}</span><button type="button" :disabled="busy || listing" aria-label="刷新目录" @click="loadDirectory('target', targetDir.current)"><RefreshCw :size="14" /></button></div>
           <div class="transfer-file-list">

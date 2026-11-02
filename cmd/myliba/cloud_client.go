@@ -50,6 +50,7 @@ type cloudAsset struct {
 }
 
 type cloudManifest struct {
+	Protected   bool              `json:"protected,omitempty"`
 	Name        string            `json:"name"`
 	Size        int64             `json:"size"`
 	Modified    string            `json:"modified"`
@@ -60,6 +61,8 @@ type cloudManifest struct {
 	Chunks      []cloudChunk      `json:"chunks"`
 	Kind        string            `json:"kind,omitempty"`
 	Tags        []string          `json:"tags,omitempty"`
+	FolderID    string            `json:"folderId,omitempty"`
+	FolderName  string            `json:"folderName,omitempty"`
 	Local       []indexedLocation `json:"local,omitempty"`
 	Assets      []cloudAsset      `json:"assets,omitempty"`
 	ContentSize int64             `json:"contentSize,omitempty"`
@@ -68,17 +71,26 @@ type cloudManifest struct {
 }
 
 type cloudFileView struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Size         int64    `json:"size"`
-	OriginalSize int64    `json:"originalSize"`
-	Modified     string   `json:"modified"`
-	History      bool     `json:"history"`
-	SourceID     string   `json:"sourceId,omitempty"`
-	Chunks       int      `json:"chunks"`
-	RevisionID   string   `json:"revisionId"`
-	MinReplicas  int      `json:"minReplicas"`
-	Variants     []string `json:"variants"`
+	Protected         bool              `json:"-"`
+	CatalogCreatedAt  string            `json:"-"`
+	LocalOnly         bool              `json:"localOnly,omitempty"`
+	Locations         []indexedLocation `json:"locations,omitempty"`
+	Tags              []string          `json:"tags,omitempty"`
+	FolderID          string            `json:"folderId,omitempty"`
+	FolderName        string            `json:"folderName,omitempty"`
+	ID                string            `json:"id"`
+	Name              string            `json:"name"`
+	Size              int64             `json:"size"`
+	OriginalSize      int64             `json:"originalSize"`
+	Modified          string            `json:"modified"`
+	History           bool              `json:"history"`
+	SourceID          string            `json:"sourceId,omitempty"`
+	Chunks            int               `json:"chunks"`
+	RevisionID        string            `json:"revisionId"`
+	Replicas          int               `json:"replicas"`
+	MinReplicas       int               `json:"minReplicas"`
+	AvailableReplicas int               `json:"availableReplicas"`
+	Variants          []string          `json:"variants"`
 }
 
 type cloudClient struct {
@@ -421,7 +433,7 @@ func latestCloudRecords(records []cloudRecord) []cloudRecord {
 	byObject := map[string]cloudRecord{}
 	for _, record := range records {
 		previous, ok := byObject[record.ObjectID]
-		if !ok || record.CreatedAt > previous.CreatedAt ||
+		if !ok || catalogAfter(record, previous) ||
 			(record.CreatedAt == previous.CreatedAt && record.RevisionID > previous.RevisionID) {
 			byObject[record.ObjectID] = record
 		}
@@ -430,7 +442,7 @@ func latestCloudRecords(records []cloudRecord) []cloudRecord {
 	for _, record := range byObject {
 		result = append(result, record)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt > result[j].CreatedAt })
+	sort.Slice(result, func(i, j int) bool { return catalogAfter(result[i], result[j]) })
 	return result
 }
 
@@ -461,7 +473,7 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		minReplicas := 0
+		minReplicas, availableReplicas := c.replicaCounts(record)
 		variants := []string{}
 		for _, asset := range manifest.Assets {
 			if asset.Kind == "video" {
@@ -469,25 +481,21 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		sort.Strings(variants)
-		if len(record.BlockIDs) == 0 {
-			minReplicas = 1
-		}
-		for index, id := range record.BlockIDs {
-			count := len(c.runtime.blockLocations(id))
-			if c.runtime.disk.has("blocks", id) && count == 0 {
-				count = 1
-			}
-			if index == 0 || count < minReplicas {
-				minReplicas = count
-			}
-		}
 		items = append(items, cloudFileView{
+			Protected:        manifest.Protected,
+			CatalogCreatedAt: record.CreatedAt,
+			Tags:             manifest.Tags, FolderID: manifest.FolderID, FolderName: manifest.FolderName,
 			ID: record.ObjectID, Name: manifest.Name, Size: manifest.ContentSize, OriginalSize: manifest.Size,
 			Modified: manifest.Modified, History: manifest.History,
 			SourceID: manifest.SourceID, Chunks: len(record.BlockIDs),
-			RevisionID: record.RevisionID, MinReplicas: minReplicas,
+			RevisionID: record.RevisionID, Replicas: minReplicas, MinReplicas: minReplicas, AvailableReplicas: availableReplicas,
 			Variants: variants,
 		})
+	}
+	items, err = c.mergeCatalogSearch(items, r.URL.Query().Get("scope") == "all")
+	if err != nil {
+		writeError(w, 500, "无法读取跨设备索引")
+		return
 	}
 	c.jobsMu.Lock()
 	jobs := make(map[string]string, len(c.jobs))
@@ -499,6 +507,80 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 	lan := append([]string(nil), c.runtime.lan...)
 	c.runtime.mu.RUnlock()
 	writeJSON(w, 200, map[string]any{"files": items, "jobs": jobs, "nodeId": c.runtime.id, "libraryId": c.libraryID(), "peers": c.runtime.activePeers(), "peerStatus": c.runtime.peerStatuses(), "directEndpoint": c.runtime.endpoint, "lan": lan})
+}
+
+// recordReachable accepts blocks spread across different connected nodes.
+func (c *cloudClient) recordReachable(record cloudRecord) bool {
+	manifest, err := c.openManifest(record)
+	if err != nil || manifest.IndexOnly {
+		return false
+	}
+	if manifest.Size == 0 {
+		return true
+	}
+	statuses := c.runtime.peerStatuses()
+	checkedAt := time.Now().Add(-time.Minute)
+	for _, chunk := range manifest.Chunks {
+		blockID := chunk.ID
+		if c.runtime.disk.has("blocks", blockID) {
+			continue
+		}
+		found := false
+		for _, node := range c.runtime.blockLocations(blockID) {
+			status := statuses[node.ID]
+			if node.Endpoint != "" && status.State == "connected" && status.CheckedAt.After(checkedAt) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// replicaCounts reports complete file copies (every encrypted block is present
+// on the same node) and the subset whose node endpoint was recently reachable.
+func (c *cloudClient) replicaCounts(record cloudRecord) (int, int) {
+	if len(record.BlockIDs) == 0 {
+		return 1, 1
+	}
+	complete := map[string]bool(nil)
+	for _, blockID := range record.BlockIDs {
+		locations := map[string]bool{}
+		for _, node := range c.runtime.blockLocations(blockID) {
+			if node.ID != "" {
+				locations[node.ID] = true
+			}
+		}
+		if c.runtime.disk.has("blocks", blockID) {
+			locations[c.runtime.id] = true
+		}
+		if complete == nil {
+			complete = locations
+			continue
+		}
+		for nodeID := range complete {
+			if !locations[nodeID] {
+				delete(complete, nodeID)
+			}
+		}
+	}
+	available := 0
+	statuses := c.runtime.peerStatuses()
+	now := time.Now()
+	for nodeID := range complete {
+		if nodeID == c.runtime.id {
+			available++
+			continue
+		}
+		status := statuses[nodeID]
+		if status.State == "connected" && !status.CheckedAt.IsZero() && now.Sub(status.CheckedAt) <= time.Minute {
+			available++
+		}
+	}
+	return len(complete), available
 }
 
 func (c *cloudClient) upload(w http.ResponseWriter, r *http.Request) {
@@ -581,6 +663,8 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 	}
 	if c.runtime.db != nil {
 		var rootID string
+		// Store organization inside the encrypted revision, independent of the original.
+		_ = c.runtime.db.QueryRow(`SELECT f.id,f.name FROM resource_folders rf JOIN folders f ON f.id=rf.folder_id WHERE rf.resource_id=?`, objectID).Scan(&manifest.FolderID, &manifest.FolderName)
 		if err := c.runtime.db.QueryRow(`SELECT root_id FROM resources WHERE id=? AND path=?`, objectID, path).Scan(&rootID); err == nil {
 			manifest.Local = []indexedLocation{{NodeID: c.runtime.id, StorageID: rootID, Path: path}}
 		}
@@ -594,6 +678,14 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 			}
 			tags.Close()
 		}
+	}
+	if c.indexer != nil {
+		index, err := c.indexer.buildFileIndex(objectID, false)
+		if err != nil {
+			return err
+		}
+		manifest.Tags = append([]string{}, index.Tags...)
+		manifest.FolderID, manifest.FolderName, manifest.Protected = index.FolderID, index.FolderName, index.Protected
 	}
 	plainHash := sha256.New()
 	buffer := make([]byte, cloudChunkSize)
@@ -708,9 +800,10 @@ func (c *cloudClient) versions(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		replicas, availableReplicas := c.replicaCounts(record)
 		items = append(items, cloudFileView{ID: objectID, Name: manifest.Name, Size: manifest.ContentSize,
 			OriginalSize: manifest.Size, Modified: manifest.Modified, History: true,
-			Chunks: len(record.BlockIDs), RevisionID: record.RevisionID})
+			Chunks: len(record.BlockIDs), RevisionID: record.RevisionID, Replicas: replicas, MinReplicas: replicas, AvailableReplicas: availableReplicas})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Modified > items[j].Modified })
 	writeJSON(w, 200, items)
@@ -748,7 +841,7 @@ func (c *cloudClient) historyRecords(objectID string) ([]cloudRecord, error) {
 		if ordered[i].CreatedAt == ordered[j].CreatedAt {
 			return ordered[i].RevisionID > ordered[j].RevisionID
 		}
-		return ordered[i].CreatedAt > ordered[j].CreatedAt
+		return catalogAfter(ordered[i], ordered[j])
 	})
 	result := make([]cloudRecord, 0, len(ordered))
 	seenRevisions := map[string]bool{}

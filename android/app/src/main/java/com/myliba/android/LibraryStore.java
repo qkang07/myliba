@@ -13,8 +13,9 @@ final class LibraryStore {
         List<String> tags=new ArrayList<>();
     }
     static final class Group {
-        final String id,name; final int count; LocalFilters filters;
-        Group(String id,String name,int count){this.id=id;this.name=name;this.count=count;}
+        final String id,name; final int count; final boolean passwordProtected; LocalFilters filters;
+        Group(String id,String name,int count){this(id,name,count,false);}
+        Group(String id,String name,int count,boolean passwordProtected){this.id=id;this.name=name;this.count=count;this.passwordProtected=passwordProtected;}
     }
     static final class Facet {
         final String key,name;final int count;
@@ -38,7 +39,7 @@ final class LibraryStore {
         }else{
             JSONObject session=client.json("GET","/api/session",null);m.online=session.optBoolean("nodeOnline",false);
             JSONArray roots=client.array("/api/roots");for(int i=0;i<roots.length();i++){JSONObject r=roots.getJSONObject(i);int n=r.optInt("count");m.roots.add(new Group(r.getString("id"),r.optString("path"),n));m.total+=n;}
-            JSONObject fs=client.json("GET","/api/folders",null);m.unfiled=fs.optInt("unfiledCount");JSONArray folders=fs.optJSONArray("items");if(folders!=null)for(int i=0;i<folders.length();i++){JSONObject f=folders.getJSONObject(i);m.folders.add(new Group(f.getString("id"),f.getString("name"),f.optInt("count")));}
+            JSONObject fs=client.json("GET","/api/folders",null);m.unfiled=fs.optInt("unfiledCount");JSONArray folders=fs.optJSONArray("items");if(folders!=null)for(int i=0;i<folders.length();i++){JSONObject f=folders.getJSONObject(i);m.folders.add(new Group(f.getString("id"),f.getString("name"),f.optInt("count"),f.optBoolean("passwordProtected")));}
             JSONArray cs=client.array("/api/collections");for(int i=0;i<cs.length();i++){JSONObject c=cs.getJSONObject(i);Group g=new Group(c.getString("id"),c.getString("name"),0);g.filters=fromRemote(c.getJSONObject("filters"));m.collections.add(g);}
             JSONArray ts=client.array("/api/tags?folderId="+RemoteClient.enc(folder));for(int i=0;i<ts.length();i++){JSONObject t=ts.getJSONObject(i);m.tags.add(new Facet(t.getString("name"),t.getString("name"),t.optInt("count")));}
             JSONArray as=client.array(path(filters,"/api/attribute-tags",0,0));for(int i=0;i<as.length();i++){JSONObject t=as.getJSONObject(i);m.attributes.add(new Facet(t.getString("key"),t.getString("label"),t.optInt("count")));}
@@ -71,6 +72,9 @@ final class LibraryStore {
         if(!remote){if(id==null)local.createFolder(name);else local.renameFolder(id,name);return;}
         client.json(id==null?"POST":"PUT","/api/folders"+(id==null?"":"/"+RemoteClient.enc(id)),RemoteClient.object("name",clean(name,64)));
     }
+    boolean folderUnlocked(String id)throws Exception{client.setActiveFolderAccess(id);JSONObject access=client.json("GET","/api/folders/"+RemoteClient.enc(id)+"/access",null);return !access.optBoolean("protected")||access.optBoolean("unlocked");}
+    void unlockFolder(String id,String password)throws Exception{JSONObject result=client.json("POST","/api/folders/"+RemoteClient.enc(id)+"/unlock",RemoteClient.object("password",password));client.setFolderAccessToken(id,result.optString("accessToken"));}
+    void setFolderPassword(String id,String password)throws Exception{client.json("PUT","/api/folders/"+RemoteClient.enc(id)+"/password",RemoteClient.object("password",password));client.clearFolderAccessToken(id);}
     void deleteFolder(String id)throws Exception{if(!remote)local.removeFolder(id);else client.json("DELETE","/api/folders/"+RemoteClient.enc(id),null);}
     void saveCollection(String id,String name,LocalFilters f)throws Exception{
         if(!remote){local.saveCollection(id,name,f);return;}

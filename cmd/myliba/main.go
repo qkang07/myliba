@@ -622,8 +622,30 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"indexed": count})
 }
 
-func resourceWhere(r *http.Request) ([]string, []any, error) {
-	return resourceWhereWithoutAttributeCategory(r, "")
+func (s *server) resourceWhere(r *http.Request, excludedCategory string) ([]string, []any, error) {
+	where, args, err := resourceWhereWithoutAttributeCategory(r, excludedCategory)
+	if err != nil || r.URL.Query().Get("reachable") != "1" {
+		return where, args, err
+	}
+	ids := []string{}
+	if s.cloud != nil {
+		records, err := s.cloud.contentRecords()
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, record := range latestCloudRecords(records) {
+			if s.cloud.recordReachable(record) {
+				ids = append(ids, record.ObjectID)
+			}
+		}
+	}
+	encoded, err := json.Marshal(ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	where = append(where, `(r.available=1 OR r.id IN (SELECT value FROM json_each(?)))`)
+	args = append(args, string(encoded))
+	return where, args, nil
 }
 
 func resourceWhereWithoutAttributeCategory(r *http.Request, excludedCategory string) ([]string, []any, error) {
@@ -687,7 +709,7 @@ func resourceWhereWithoutAttributeCategory(r *http.Request, excludedCategory str
 }
 
 func (s *server) listResourceSelection(w http.ResponseWriter, r *http.Request) {
-	where, args, err := resourceWhere(r)
+	where, args, err := s.resourceWhere(r, "")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -747,7 +769,7 @@ func (s *server) listResourceSelection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listResources(w http.ResponseWriter, r *http.Request) {
-	where, args, err := resourceWhere(r)
+	where, args, err := s.resourceWhere(r, "")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

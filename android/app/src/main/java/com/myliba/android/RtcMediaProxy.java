@@ -16,11 +16,15 @@ final class RtcMediaProxy implements AutoCloseable {
     private final ServerSocket listener;private final ExecutorService workers=Executors.newCachedThreadPool();
     private volatile boolean closed;
     RtcMediaProxy(RemoteClient client,String resourceID)throws Exception{
-        this(client,resourceID,"original");
+        this(client,resourceID,"original",false);
     }
     RtcMediaProxy(RemoteClient client,String resourceID,String quality)throws Exception{
+        this(client,resourceID,quality,false);
+    }
+    RtcMediaProxy(RemoteClient client,String resourceID,String quality,boolean cloud)throws Exception{
         if(!quality.matches("original|360p|720p|1080p"))throw new IOException("不支持的清晰度");
-        this.client=client;videoBase="/api/resources/"+RemoteClient.enc(resourceID)+"/video/"+quality;this.quality=quality;path="/api/resources/"+RemoteClient.enc(resourceID)+"/file";key=UUID.randomUUID().toString();
+        String root=cloud?"/api/cloud/files/":"/api/resources/";
+        this.client=client;videoBase=root+RemoteClient.enc(resourceID)+"/video/"+quality;this.quality=quality;path=root+RemoteClient.enc(resourceID)+"/file";key=UUID.randomUUID().toString();
         listener=new ServerSocket(0,8,InetAddress.getByName("127.0.0.1"));
         workers.execute(()->{while(!closed)try{Socket socket=listener.accept();workers.execute(()->serve(socket));}catch(IOException ex){if(!closed)break;}});
     }

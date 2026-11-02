@@ -166,7 +166,7 @@ func (s *server) attributeTags(w http.ResponseWriter, r *http.Request) {
 	}
 	counts := map[string]attributeTag{}
 	for _, category := range []string{"type", "size", "extension"} {
-		where, args, err := resourceWhereWithoutAttributeCategory(r, category)
+		where, args, err := s.resourceWhere(r, category)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

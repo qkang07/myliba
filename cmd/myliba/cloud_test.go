@@ -367,8 +367,8 @@ func TestCloudInventoryPaginationAndHashValidation(t *testing.T) {
 	if err := disk.put("blocks", id, bytes.NewReader(data), cloudMaxBlobSize); err != nil {
 		t.Fatal(err)
 	}
-	if err := disk.put("blocks", id, bytes.NewReader([]byte("wrong")), cloudMaxBlobSize); err != nil {
-		t.Fatal(err)
+	if err := disk.put("blocks", id, bytes.NewReader([]byte("wrong")), cloudMaxBlobSize); err == nil {
+		t.Fatal("hash-mismatched block must be rejected, even when the object already exists")
 	}
 	request := httptest.NewRequest(http.MethodGet, "/cloud/inventory", nil)
 	request.Header.Set("Authorization", "Bearer "+token)

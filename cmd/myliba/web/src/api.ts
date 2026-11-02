@@ -56,6 +56,7 @@ export interface CollectionFilters {
   rootId: string;
   folderId: string;
   unorganized: boolean;
+  reachable: boolean;
   sort: ResourceSort;
 }
 
@@ -199,7 +200,7 @@ export function removeResourceNode(id: string) {
 }
 
 export interface TransferEntry { name: string; path: string; dir: boolean; size: number }
-export interface TransferDirectory { current: string; parent: string; roots: Array<{ name: string; path: string }>; entries: TransferEntry[] }
+export interface TransferDirectory { current: string; currentName?: string; parent: string; roots: Array<{ name: string; path: string }>; entries: TransferEntry[] }
 
 async function transferFetch(path: string, init?: RequestInit) {
   const response = await fetch(path, { credentials: "same-origin", ...init });
@@ -355,6 +356,11 @@ export function login(password: string) {
 }
 
 export interface CloudFile {
+  localOnly?: boolean;
+  locations?: Array<{ nodeId: string; storageId: string; path: string }>;
+  tags?: string[];
+  folderId?: string;
+  folderName?: string;
   id: string;
   name: string;
   size: number;
@@ -364,7 +370,9 @@ export interface CloudFile {
   sourceId?: string;
   chunks: number;
   revisionId: string;
+  replicas?: number;
   minReplicas: number;
+  availableReplicas?: number;
   variants: VideoQuality[];
 }
 
@@ -461,8 +469,8 @@ export interface CloudSpeedTest {
   samples?: Array<{ bytes: number; durationMillis: number; connectMillis: number; speedBps: number }>;
 }
 
-export async function getCloudFiles(): Promise<CloudView> {
-  const view = await request<CloudView>("/api/cloud/files");
+export async function getCloudFiles(includeDevices = false): Promise<CloudView> {
+  const view = await request<CloudView>("/api/cloud/files" + (includeDevices ? "?scope=all" : ""));
   return { ...view, peers: view.peers ?? [] };
 }
 
@@ -503,6 +511,7 @@ function resourceSearchParams(params: CollectionFilters & { limit: number; offse
   const search = new URLSearchParams({
     q: params.query,
     unorganized: params.unorganized ? "1" : "",
+    reachable: params.reachable ? "1" : "",
     kind: params.kind,
     rootId: params.rootId,
     folderId: params.folderId,

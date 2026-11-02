@@ -5,9 +5,9 @@ import ImagePreview from "./ImagePreview.vue";
 import StreamingVideo from "./StreamingVideo.vue";
 import VideoPreviewEditor from "./VideoPreviewEditor.vue";
 import {
-  addResourceTag, createFileShare, createThumbnailVariant, fileURL, getResource, getResourceFile, getResourceThumbnailVariant, listFileShares, revokeFileShare, uploadResourceToCloud,
+  addResourceTag, createFileShare, createThumbnailVariant, fileURL, getCloudFiles, getResource, getResourceFile, getResourceThumbnailVariant, listFileShares, revokeFileShare, uploadResourceToCloud,
   getTagSuggestions, getTags, getVideoInfo, moveResourcesToFolder, removeResourceTag,
-  type FileShare, type Resource, type TagSuggestion, type TagSummary, type VirtualFolder,
+  type CloudFile, type FileShare, type Resource, type TagSuggestion, type TagSummary, type VirtualFolder,
 } from "./api";
 
 const props = defineProps<{ id: string; folders: VirtualFolder[]; remote: boolean; phoneNode?: boolean }>();
@@ -21,6 +21,9 @@ const previewError = ref("");
 const previewURL = ref("");
 const cloudStatus = ref("");
 const cloudBusy = ref(false);
+const cloudFile = ref<CloudFile | null>(null);
+const cloudJob = ref("");
+const cloudLookupError = ref(false);
 const shares = ref<FileShare[]>([]);
 const shareHours = ref(168);
 const shareBusy = ref(false);
@@ -39,6 +42,7 @@ const captureBusy = ref(false);
 const imageViewerOpen = ref(false);
 const expandedPreview = ref(false);
 let generation = 0;
+let cloudPollTimer: ReturnType<typeof setTimeout> | undefined;
 
 const mimeType = computed(() => {
   const ext = resource.value?.name.split(".").pop()?.toLowerCase() || "";
@@ -128,6 +132,8 @@ async function generateAllCaptures() {
   } finally { captureBusy.value = false; }
 }
 async function refreshResource() {
+  if (cloudPollTimer) clearTimeout(cloudPollTimer);
+  cloudPollTimer = undefined;
   if (previewURL.value) URL.revokeObjectURL(previewURL.value);
   previewURL.value = "";
   closeImageViewer();
@@ -139,6 +145,9 @@ async function refreshResource() {
   duration.value = 0;
   durationError.value = "";
   resource.value = null;
+  cloudFile.value = null;
+  cloudJob.value = "";
+  cloudLookupError.value = false;
   shares.value = [];
   shareError.value = "";
   clearImages();
@@ -146,6 +155,7 @@ async function refreshResource() {
     const item = await getResource(props.id);
     if (current !== generation) return;
     resource.value = item;
+    void refreshCloudStatus(item.id);
     loading.value = false;
     shareURL.value = "";
     if (!props.phoneNode) void listFileShares(item.id).then((items) => { if (current === generation) shares.value = items; }).catch(() => { if (current === generation) shares.value = []; });
@@ -266,12 +276,31 @@ async function download() {
 }
 async function uploadToCloud() {
   if (!resource.value || cloudBusy.value) return;
+  const resourceID = resource.value.id;
   cloudBusy.value = true;
   try {
-    await uploadResourceToCloud(resource.value.id);
-    cloudStatus.value = "已加入上传队列，可在云层查看进度";
+    await uploadResourceToCloud(resourceID);
+    cloudStatus.value = "已提交云层上传；上传完成后可在云层文件中查找";
+    await refreshCloudStatus(resourceID);
   } catch (cause) { cloudStatus.value = cause instanceof Error ? cause.message : "加入云层失败"; }
   finally { cloudBusy.value = false; }
+}
+async function refreshCloudStatus(resourceID: string) {
+  try {
+    const view = await getCloudFiles();
+    if (resource.value?.id !== resourceID) return;
+    cloudLookupError.value = false;
+    cloudFile.value = view.files.find((file) => file.id === resourceID || file.sourceId === resourceID) ?? null;
+    cloudJob.value = view.jobs[resourceID] ?? "";
+    if (cloudFile.value || cloudJob.value.startsWith("失败")) cloudStatus.value = "";
+    if (cloudJob.value === "上传中") cloudPollTimer = setTimeout(() => void refreshCloudStatus(resourceID), 2000);
+    else if (cloudFile.value) cloudPollTimer = setTimeout(() => void refreshCloudStatus(resourceID), 15000);
+  } catch {
+    if (resource.value?.id !== resourceID) return;
+    cloudFile.value = null;
+    cloudJob.value = "";
+    cloudLookupError.value = true;
+  }
 }
 async function createShare() {
   if (!resource.value || shareBusy.value) return;
@@ -326,6 +355,7 @@ function onPreviewKeydown(event: KeyboardEvent) {
 document.addEventListener("keydown", onPreviewKeydown);
 watch(() => props.id, () => void refreshResource(), { immediate: true });
 onBeforeUnmount(() => {
+  if (cloudPollTimer) clearTimeout(cloudPollTimer);
   if (previewURL.value) URL.revokeObjectURL(previewURL.value);
   generation++;
   clearImages();
@@ -345,8 +375,9 @@ onBeforeUnmount(() => {
         <span class="detail-kind-icon"><component :is="fileIcon" :size="25" /></span>
         <div><p class="eyebrow">资源详情 · {{ kindLabel }}</p><h1>{{ resource.name }}</h1><p>{{ resource.available ? "源文件可用" : "源文件暂不可用" }} · 文件总大小 {{ formatBytes(resource.contentSize ?? resource.size) }}</p></div>
         <button class="button button-secondary" :disabled="!resource.available" @click="download"><Download :size="15" />下载原文件</button>
-        <button v-if="!remote" class="button button-secondary" :disabled="!resource.available || cloudBusy" @click="uploadToCloud">加入云层</button>
+        <button v-if="!remote && !cloudFile && cloudJob !== '上传中' && !cloudJob.startsWith('已加入云层')" class="button button-secondary" :disabled="!resource.available || cloudBusy" @click="uploadToCloud">{{ cloudBusy ? '提交中…' : cloudJob.startsWith('失败') ? '重试加入云层' : '加入云层' }}</button>
       </header>
+      <p v-if="cloudFile || cloudJob || cloudLookupError" class="detail-cloud-state" role="status"><Check v-if="cloudFile" :size="15" /><CircleAlert v-else-if="cloudLookupError || cloudJob.startsWith('失败')" :size="15" /><LoaderCircle v-else class="spin" :size="15" />{{ cloudFile ? `已在云层 · ${cloudFile.replicas ?? cloudFile.minReplicas} 份副本 · ${cloudFile.availableReplicas ?? '—'} 份可用（60 秒内端点探测）` : cloudLookupError ? '云层状态暂不可用' : `云层状态：${cloudJob}` }}<span v-if="cloudFile && cloudFile.availableReplicas === 0"> · 当前没有已检测为可联通的副本</span></p>
       <p v-if="cloudStatus" class="detail-error" role="status">{{ cloudStatus }}</p>
       <section v-if="!phoneNode" class="detail-panel share-panel" aria-label="外链分享">
         <div class="detail-panel-heading"><h2><Link2 :size="17" />外链分享</h2><span>仅此文件 · 节点在线时直传</span></div>
@@ -400,7 +431,7 @@ onBeforeUnmount(() => {
           <section class="detail-panel">
             <div class="detail-panel-heading"><h2>所属文件夹</h2></div>
             <label class="detail-folder-field">文件夹<select :value="resource.folderId" :disabled="folderBusy" @change="changeFolder"><option value="">未归组</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
-            <p class="detail-folder-hint">移动只调整资源分组，不改变原文件位置。</p>
+            <p class="detail-folder-hint">归组只改变资源库中的所属文件夹，不移动或复制原文件。</p>
           </section>
           <section class="detail-panel">
             <div class="detail-panel-heading"><h2>属性标签</h2><span>随文件属性自动更新</span></div>

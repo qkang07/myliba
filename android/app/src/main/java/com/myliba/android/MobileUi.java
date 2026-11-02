@@ -138,6 +138,7 @@ final class MobileUi {
                 case "document":case "file":lines(c,5,3,14,3,19,8,19,21,5,21,5,3);lines(c,14,3,14,8,19,8);lines(c,8,12,16,12);lines(c,8,16,14,16);break;
                 case "tag":lines(c,3,3,12,3,22,13,13,22,3,12,3,3);c.drawCircle(8,8,1.4f,p);break;
                 case "download":lines(c,12,3,12,15,7,10);lines(c,12,15,17,10);lines(c,4,16,4,21,20,21,20,16);break;
+                case "cloud":c.drawArc(4,9,15,21,90,180,false,p);c.drawArc(8,4,21,17,180,190,false,p);c.drawArc(9,10,21,21,270,180,false,p);lines(c,4,15,20,15);break;
                 case "refresh":c.drawArc(4,4,20,20,40,280,false,p);lines(c,20,3,20,9,14,9);break;
                 case "spark":lines(c,12,2,15,9,22,12,15,15,12,22,9,15,2,12,9,9,12,2);break;
                 case "shield":lines(c,12,2,21,6,20,15,16,20,12,22,8,20,4,15,3,6,12,2);lines(c,8,12,11,15,17,9);break;

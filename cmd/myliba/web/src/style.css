@@ -600,7 +600,24 @@ body.detail-preview-open { overflow: hidden; }
 .virtual-folder-hint { margin-top: 14px; }
 .folder-context-bar { display: flex; min-height: 30px; align-items: center; gap: 10px; margin-bottom: 21px; color: var(--text-muted); font-size: 12px; }
 .folder-context-bar strong { min-width: 0; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
-.folder-scope-hint { margin: -12px 0 20px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.folder-scope-hint { margin: -12px 0 20px; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.home-search-panel { margin-bottom: 24px; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.home-search-panel > label { display: flex; align-items: center; gap: 8px; color: var(--green); font-size: 16px; }
+.home-search-panel > p { margin: 10px 0 16px; color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+.home-search-form { display: flex; flex-wrap: wrap; gap: 10px; }
+.home-search-form input { flex: 1 1 240px; min-width: 0; min-height: 44px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; font-size: 14px; }
+.home-search-form .button, .home-first-use .button { min-height: 44px; font-size: 13px; }
+.home-first-use { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+.home-first-use > span { flex: 1 1 240px; }
+.search-scope-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 16px; padding: 12px 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.search-scope-bar > span { overflow-wrap: anywhere; }
+.search-scope-bar .quiet-button { min-height: 36px; text-align: left; font-size: 12px; }
+.empty-state-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+@media (max-width: 600px) {
+  .home-search-panel { padding: 16px; }
+  .home-search-form input { flex-basis: 100%; width: 100%; }
+  .home-search-form .button { flex: 1 1 auto; }
+}
 .folder-context-actions { display: flex; gap: 10px; margin-left: auto; }
 .folder-rename-form { display: flex; gap: 8px; margin: -8px 0 18px; }
 .folder-gate-backdrop { position: fixed; z-index: 110; inset: 0; display: grid; place-items: center; padding: 20px; background: rgb(20 31 24 / 54%); backdrop-filter: blur(4px); }
@@ -713,6 +730,15 @@ body.detail-preview-open { overflow: hidden; }
 @media (max-width: 720px) { .hub-settings-toggle { max-width: 155px; } .hub-settings-body { padding: 12px 15px 16px; } }
 .cloud-dialog { max-width: min(760px, 94vw); }
 .cloud-panel-body { max-height: min(75vh, 760px); overflow-y: auto; }
+.cloud-file-search { display: flex; align-items: center; gap: .55rem; margin: .65rem 0; padding: .65rem .8rem; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); }
+.cloud-file-search input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; }
+.cloud-file-preview { display: grid; justify-items: end; gap: .6rem; padding: .75rem; margin: -.25rem 0 .75rem 1.5rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface, #f7f8f7); }
+.cloud-file-preview img, .cloud-file-preview iframe { width: 100%; max-height: 65vh; border: 0; object-fit: contain; }
+.cloud-file-preview img { height: auto; }
+.cloud-file-preview iframe { height: min(65vh, 680px); background: white; }
+.cloud-file-preview audio { width: 100%; }
+.detail-cloud-state { display: flex; align-items: center; flex-wrap: wrap; gap: .35rem; margin: -.35rem 0 1rem; color: var(--green); font-size: .84rem; }
+.detail-cloud-state span { color: var(--muted); }
 .cloud-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 1.25rem; margin-bottom: .5rem; }
 .cloud-recovery-key { display: block; overflow-wrap: anywhere; user-select: all; padding: .75rem; margin-top: .5rem; border-radius: .5rem; background: var(--surface, #f4f5f7); }
 .cloud-history { margin: -.3rem 0 .7rem 1.5rem; border-left: 2px solid currentColor; padding-left: .8rem; }

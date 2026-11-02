@@ -649,7 +649,7 @@ func (h *remoteHub) send(conn *websocket.Conn, message wireMessage) error {
 }
 
 func filteredHeaders(headers http.Header, response bool) http.Header {
-	allowed := map[string]bool{"Content-Type": true, "Range": true, "If-Modified-Since": true, "If-None-Match": true, "X-Myliba-Share-Key": true}
+	allowed := map[string]bool{"Content-Type": true, "Range": true, "If-Modified-Since": true, "If-None-Match": true, "X-Myliba-Share-Key": true, "X-Myliba-Folder-Access": true}
 	if response {
 		allowed = map[string]bool{"Content-Type": true, "Content-Disposition": true, "Content-Length": true, "Content-Range": true, "Accept-Ranges": true, "Last-Modified": true, "Etag": true, "Cache-Control": true, "Content-Security-Policy": true}
 	}

@@ -17,6 +17,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  Cloud,
   Clock3,
   Bookmark,
   BookmarkPlus,
@@ -117,7 +118,9 @@ const ownerSession = ref(true);
 const nodeOnline = ref(false);
 const resourceNodes = ref<HubResourceNode[]>([]);
 const selectedResourceNodeID = ref("");
+const resourceIceServers = ref<RTCIceServer[]>([]);
 const transferOpen = ref(false);
+const cloudPanelRef = ref<InstanceType<typeof CloudPanel> | null>(null);
 const selectedResourceNodeKind = computed(() => resourceNodes.value.find((node) => node.id === selectedResourceNodeID.value)?.kind);
 const nodeTransport = ref<"connecting" | "webrtc" | "turn" | "relay">("relay");
 const nodePathSummary = ref("");
@@ -165,6 +168,7 @@ const sidebarFolderCreateOpen = ref(false);
 const editingFolderName = ref("");
 const total = ref(0);
 const query = ref("");
+const homeQuery = ref("");
 const selectedTags = ref<string[]>([]);
 const multipleFilters = ref(false);
 const selectedKind = ref("");
@@ -179,6 +183,7 @@ const collectionBusy = ref(false);
 const tagFilterOpen = ref(false);
 const tagFilterQuery = ref("");
 const unorganizedOnly = ref(false);
+const reachableOnly = ref(false);
 const pageOffset = ref(0);
 const pageSize = 48;
 const selectedIDs = ref(new Set<string>());
@@ -259,10 +264,11 @@ const onShortcut = (event: KeyboardEvent) => {
     return;
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    if (!authenticated.value || transferOpen.value || folderGateOpen.value) return;
     event.preventDefault();
     tagFilterOpen.value = false;
-    if (activeFolderID.value === null) openFolder("all");
-    void nextTick(() => document.querySelector<HTMLInputElement>("#resource-search")?.focus());
+    if (detailResourceID.value) closeDetail();
+    void nextTick(() => document.querySelector<HTMLInputElement>(activeFolderID.value === null ? "#home-search" : "#resource-search")?.focus());
   }
 };
 
@@ -276,7 +282,7 @@ const onTagEditorOutside = (event: MouseEvent) => {
 function currentFilters(): CollectionFilters {
   return {
     query: query.value.trim(), tags: [...selectedTags.value], attributes: [...selectedAttributes.value], kind: selectedKind.value,
-    rootId: selectedRootID.value, folderId: activeFolderID.value || "all", unorganized: unorganizedOnly.value, sort: sortOrder.value,
+    rootId: selectedRootID.value, folderId: activeFolderID.value || "all", unorganized: unorganizedOnly.value, reachable: reachableOnly.value, sort: sortOrder.value,
   };
 }
 
@@ -290,7 +296,7 @@ function sameFilters(left: CollectionFilters, right: CollectionFilters) {
   const leftAttributes = effectiveAttributes(left);
   const rightAttributes = effectiveAttributes(right);
   return left.query === right.query && left.rootId === right.rootId &&
-    left.unorganized === right.unorganized && left.sort === right.sort && (left.folderId || "all") === (right.folderId || "all") &&
+    left.unorganized === right.unorganized && !!left.reachable === !!right.reachable && left.sort === right.sort && (left.folderId || "all") === (right.folderId || "all") &&
     left.tags.length === right.tags.length && left.tags.every((tag) => right.tags.includes(tag)) &&
     leftAttributes.length === rightAttributes.length && leftAttributes.every((key) => rightAttributes.includes(key));
 }
@@ -307,7 +313,7 @@ const pageTitle = computed(() => {
   if (activeCollection.value) return activeCollection.value.name;
   if (selectedTags.value.length > 1) return `标签筛选（${selectedTags.value.length}）`;
   if (selectedTags.value.length === 1) return `标签：${selectedTags.value[0]}`;
-  if (unorganizedOnly.value) return "待整理";
+  if (unorganizedOnly.value) return "未添加标签";
   return query.value.trim() || activeAttributeKeys.value.length || selectedRootID.value ? "筛选结果" : activeFolderID.value === null ? "文件夹" : folderTitle.value;
 });
 const selectedCount = computed(() => selectedIDs.value.size);
@@ -319,7 +325,10 @@ const previewPosition = computed(() => previewIndex.value < 0 ? 1 : previewIndex
 const previewTotal = computed(() => Math.max(total.value, resources.value.length));
 const canPreviewPrevious = computed(() => previewIndex.value > 0);
 const canPreviewNext = computed(() => previewIndex.value >= 0 && (previewIndex.value < resources.value.length - 1 || hasMore.value));
-const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || activeAttributeKeys.value.length || selectedRootID.value || sortOrder.value !== "modified_desc"));
+const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || reachableOnly.value || activeAttributeKeys.value.length || selectedRootID.value));
+const libraryScopeLabel = computed(() => remoteMode.value
+  ? resourceNodes.value.find((node) => node.id === selectedResourceNodeID.value)?.name || "当前设备"
+  : "本机资源库");
 const matchingTags = computed(() => {
   const needle = tagFilterQuery.value.trim().toLocaleLowerCase();
   return tags.value.filter((tag) => tag.count > 0 && tag.name.toLocaleLowerCase().includes(needle));
@@ -592,6 +601,7 @@ async function loadResources(append = false) {
       tags: selectedTags.value,
       attributes: selectedAttributes.value,
       unorganized: unorganizedOnly.value,
+      reachable: reachableOnly.value,
       kind: selectedKind.value,
       rootId: selectedRootID.value,
       folderId: activeFolderID.value,
@@ -762,6 +772,11 @@ function setDetailRoute(id: string) {
   window.history.pushState({}, "", url.pathname + url.search + url.hash);
 }
 
+function openCloudSource(id: string) {
+  setDetailRoute(id);
+  window.scrollTo(0, 0);
+}
+
 function openDetail(resource: Resource) {
   setDetailRoute(resource.id);
   window.scrollTo(0, 0);
@@ -805,6 +820,7 @@ function resetFolderFilters() {
   selectedRootID.value = "";
   sortOrder.value = "modified_desc";
   unorganizedOnly.value = false;
+  reachableOnly.value = false;
   query.value = "";
   void nextTick(() => { suppressQueryWatch = false; });
   tagFilterOpen.value = false;
@@ -826,11 +842,12 @@ function clearLockedFolderView() {
 	clearSelection();
 }
 
-function openFolder(id: string | null) {
+function openFolder(id: string | null, searchQuery = "") {
   if (detailResourceID.value) detailResourceID.value = "";
   activeFolderID.value = id;
   setActiveFolderAccess(id);
   resetFolderFilters();
+  query.value = searchQuery.trim();
   const url = new URL(window.location.href);
   url.searchParams.delete("resource");
   if (id === null) url.searchParams.delete("folder");
@@ -953,11 +970,11 @@ async function moveSelectedToFolder() {
       bulkProgress.value = { done: offset + batch.length, total: ids.length };
     }
     await Promise.all([loadFolders(), loadTags(), loadResources()]);
-    notify("已移动 " + ids.length + " 项资源");
+    notify("已归组 " + ids.length + " 项资源");
   } catch (error) {
     await Promise.all([loadFolders(), loadTags(), loadResources()]);
     showError(error);
-    if (bulkProgress.value.done && errorMessage.value) errorMessage.value += `；已移动 ${bulkProgress.value.done} 项，剩余 ${selectedCount.value} 项仍已选`;
+    if (bulkProgress.value.done && errorMessage.value) errorMessage.value += `；已归组 ${bulkProgress.value.done} 项，剩余 ${selectedCount.value} 项仍已选`;
   } finally { bulkBusy.value = ""; }
 }
 
@@ -976,6 +993,7 @@ function chooseAll() {
   selectedRootID.value = "";
   sortOrder.value = "modified_desc";
   unorganizedOnly.value = false;
+  reachableOnly.value = false;
   query.value = "";
   void loadResources();
 }
@@ -1072,6 +1090,7 @@ async function chooseCollection(item: SmartCollection) {
   multipleFilters.value = selectedTags.value.length > 1 || singleFilters(activeAttributeKeys.value, true).length < activeAttributeKeys.value.length;
   selectedRootID.value = item.filters.rootId;
   unorganizedOnly.value = item.filters.unorganized;
+  reachableOnly.value = !!item.filters.reachable;
   sortOrder.value = item.filters.sort;
   const folderID = item.filters.folderId || "all";
   activeFolderID.value = folderID;
@@ -1457,6 +1476,7 @@ async function submitLogin() {
     nodeOnline.value = session.nodeOnline;
     resourceNodes.value = session.nodes ?? [];
     selectedResourceNodeID.value = session.selectedNodeId ?? "";
+    resourceIceServers.value = session.iceServers ?? [];
     webTraffic.value = session.webTraffic ?? webTraffic.value;
     password.value = "";
     if (session.nodeOnline) await establishWebRTC(session.iceServers);
@@ -1494,6 +1514,7 @@ function clearRemoteSession() {
   sortOrder.value = "modified_desc";
   query.value = "";
   unorganizedOnly.value = false;
+  reachableOnly.value = false;
   batchSuggestions.value = [];
   tagSuggestions.value = [];
   total.value = 0;
@@ -1534,6 +1555,7 @@ function handleNodeStorageChange(event: StorageEvent) {
 }
 
 async function refreshNodeStatus() {
+  if (transferOpen.value) return;
   const generation = authGeneration;
   try {
     const session = await getSession();
@@ -1551,6 +1573,7 @@ async function refreshNodeStatus() {
       ownerSession.value = session.owner ?? true;
       resourceNodes.value = session.nodes ?? [];
       selectedResourceNodeID.value = session.selectedNodeId ?? "";
+      resourceIceServers.value = session.iceServers ?? [];
       webTraffic.value = session.webTraffic ?? { downloadBps: 0, uploadBps: 0 };
       if (nodeTransport.value !== "webrtc" && nodeTransport.value !== "turn") {
         nodeTraffic.value = { downloadBps: session.nodeTraffic?.uploadBps ?? 0, uploadBps: session.nodeTraffic?.downloadBps ?? 0 };
@@ -1652,6 +1675,7 @@ onMounted(async () => {
       nodeOnline.value = session.nodeOnline;
       resourceNodes.value = session.nodes ?? [];
       selectedResourceNodeID.value = session.selectedNodeId ?? "";
+      resourceIceServers.value = session.iceServers ?? [];
       webTraffic.value = session.webTraffic ?? webTraffic.value;
       nodeTraffic.value = session.nodeTraffic ?? nodeTraffic.value;
     }
@@ -1709,7 +1733,7 @@ onBeforeUnmount(() => {
       <div v-if="activeFolderID !== null" class="folder-children" :aria-label="folderTitle + '的内容'">
         <div class="folder-children-title">{{ folderTitle }} · 内容</div>
         <nav class="primary-nav" aria-label="当前文件夹">
-          <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>待整理</span></button>
+          <button class="nav-link" :class="{ active: unorganizedOnly && !activeCollection }" @click="chooseUnorganized"><Clock3 :size="17" /><span>未添加标签</span></button>
         </nav>
 
         <div class="sidebar-section-label collection-section-title">
@@ -1770,14 +1794,14 @@ onBeforeUnmount(() => {
           <HubSettings v-if="!remoteMode && authenticated" />
           <HubCloudDashboard v-if="remoteMode && authenticated && ownerSession" />
           <DeviceManager v-if="remoteMode && authenticated && ownerSession" />
-          <CloudPanel v-if="authenticated" :resources="resources" :remote="remoteMode" />
+          <CloudPanel v-if="authenticated" ref="cloudPanelRef" :resources="resources" :remote="remoteMode" @open-resource="openCloudSource" />
           <button v-if="authenticated" class="button button-secondary preprocess-toggle" type="button" @click="preprocessOpen = true"><Clock3 :size="14" />后台任务 <span v-if="preprocessQueue.counts.pending + preprocessQueue.counts.running">({{ preprocessQueue.counts.pending + preprocessQueue.counts.running }})</span></button>
           <button v-if="remoteMode && authenticated" class="quiet-button signout-button" title="退出登录" @click="signOut"><LogOut :size="15" /><span>退出</span></button>
         </div>
       </header>
 
       <main class="page-content">
-        <NodeTransfer v-if="transferOpen && remoteMode && authenticated" :nodes="resourceNodes" :selected-node-id="selectedResourceNodeID" @close="transferOpen = false" />
+        <NodeTransfer v-if="transferOpen && remoteMode && authenticated" :nodes="resourceNodes" :selected-node-id="selectedResourceNodeID" :ice-servers="resourceIceServers" @close="transferOpen = false" />
         <ResourceDetail v-else-if="detailResourceID && authenticated" :id="detailResourceID" :folders="folders" :remote="remoteMode" :phone-node="selectedResourceNodeKind === 'android'" @back="closeDetail" @tags-changed="loadTags(); loadResources()" @folder-changed="onDetailFolderChanged" />
         <template v-else>
         <section v-if="activeFolderID === null" class="page-intro">
@@ -1792,6 +1816,20 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
+        <section v-if="activeFolderID === null && authenticated" class="home-search-panel" aria-label="查找文件">
+          <label for="home-search"><Search :size="18" /><strong>查找文件</strong></label>
+          <p>搜索 {{ libraryScopeLabel }} 中已收录的文件名、路径和手动标签。统一检索可查找设备已同步的索引与云层文件。</p>
+          <form class="home-search-form" @submit.prevent="openFolder('all', homeQuery)">
+            <input id="home-search" v-model="homeQuery" type="search" placeholder="输入文件名、路径或标签" autocomplete="off" />
+            <button class="button button-primary" type="submit"><Search :size="15" />搜索资源库</button>
+            <button class="button button-secondary" type="button" @click="cloudPanelRef?.open(homeQuery)"><Cloud :size="15" />统一检索</button>
+          </form>
+          <div v-if="!remoteMode && !roots.length && initialized" class="home-first-use">
+            <span>先添加一个本机目录，就能搜索和整理其中的文件。原文件留在原处。</span>
+            <button class="button button-secondary" type="button" @click="openFolderPicker()"><Plus :size="15" />添加本机目录</button>
+          </div>
+        </section>
+
         <section v-if="activeFolderID === null" class="virtual-folders-panel" aria-label="文件夹">
           <div class="virtual-folders-heading"><div><p class="eyebrow">顶层分组</p><h2>我的文件夹</h2><p>先按文件夹整理资源，进入后再用标签细分。文件保留在原位置。</p></div></div>
           <form class="virtual-folder-create" @submit.prevent="submitFolder"><label class="sr-only" for="new-folder-name">文件夹名称</label><input id="new-folder-name" v-model="newFolderName" maxlength="80" placeholder="新文件夹名称" /><button class="button button-primary" type="submit" :disabled="folderBusy || !newFolderName.trim()"><Plus :size="15" />新建文件夹</button></form>
@@ -1799,13 +1837,13 @@ onBeforeUnmount(() => {
             <button v-for="folder in folders" :key="folder.id" class="virtual-folder-card" type="button" @click="openFolder(folder.id)"><span class="virtual-folder-icon"><KeyRound v-if="folder.passwordProtected" :size="20" /><FolderOpen v-else :size="22" /></span><strong>{{ folder.name }}</strong><small>{{ folder.passwordProtected && activeFolderID !== folder.id ? '需要密码' : `${folder.count} 项资源` }}</small></button>
             <button class="virtual-folder-card virtual-folder-unfiled" type="button" @click="openFolder('unfiled')"><span class="virtual-folder-icon"><FolderOpen :size="22" /></span><strong>未归组</strong><small>{{ unfiledCount }} 项资源</small></button>
           </div>
-          <p v-if="!folders.length" class="virtual-folder-hint">已有资源都在“未归组”。新建文件夹后，可批量选择文件并移动。</p>
+          <p v-if="!folders.length" class="virtual-folder-hint">已有资源都在“未归组”。新建文件夹后，可批量选择文件并归组，原文件位置不变。</p>
         </section>
 
         <section v-if="activeFolderID === null && !remoteMode" class="roots-panel">
           <div class="panel-heading">
             <span class="panel-icon"><FolderOpen :size="18" /></span>
-            <span class="panel-heading-copy"><strong>索引目录</strong><small>选择要纳入资源库的文件夹，不会移动或修改原文件。</small></span>
+            <span class="panel-heading-copy"><strong>已收录的本机目录</strong><small>选择要纳入资源库的文件夹，不会移动或修改原文件。</small></span>
           </div>
           <form class="root-form" @submit.prevent="submitRoot">
             <label class="sr-only" for="root-path">文件夹路径</label>
@@ -1875,7 +1913,7 @@ onBeforeUnmount(() => {
 
         <template v-else>
 		<div class="folder-context-bar"><button class="quiet-button" @click="openFolder(null)"><House :size="14" />文件夹首页</button><span>/</span><strong>{{ folderTitle }}</strong><div v-if="activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-context-actions"><button class="quiet-button" @click="openFolderPicker(activeFolderID || '')"><FolderSync :size="14" />扫描本地目录</button><button class="quiet-button" @click="editingFolderName = folderTitle; folderEditorOpen = !folderEditorOpen"><Pencil :size="14" />重命名</button><button class="quiet-button" @click="folderGateMode = 'set'; folderGatePassword = ''; folderGateError = ''; folderGateOpen = true"><KeyRound :size="14" />{{ folders.find((item) => item.id === activeFolderID)?.passwordProtected ? '修改密码' : '设置密码' }}</button><button v-if="folders.find((item) => item.id === activeFolderID)?.passwordProtected" class="quiet-button" @click="removeFolderPassword"><X :size="14" />取消密码</button><button class="quiet-button" @click="removeFolder"><Trash2 :size="14" />删除</button></div></div>
-        <p v-if="activeFolderID === 'unfiled'" class="folder-scope-hint">尚未放入虚拟文件夹的资源会显示在这里；“待整理”指没有手动标签的资源。</p>
+        <p v-if="activeFolderID === 'unfiled'" class="folder-scope-hint">尚未放入虚拟文件夹的资源会显示在这里；“未添加标签”是另一种筛选，与是否归组无关。</p>
         <form v-if="folderEditorOpen && activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-rename-form" @submit.prevent="saveFolderName"><input v-model="editingFolderName" maxlength="80" aria-label="文件夹名称" /><button class="button button-primary" :disabled="folderBusy || !editingFolderName.trim()">保存</button><button type="button" class="button button-secondary" @click="folderEditorOpen = false">取消</button></form>
         <div v-if="visibleCollections.length" class="mobile-collections" aria-label="常用查询">
           <span>常用查询</span>
@@ -1895,10 +1933,16 @@ onBeforeUnmount(() => {
               <button v-if="query" class="search-clear" type="button" aria-label="清除搜索" @click="query = ''"><X :size="14" /></button>
             </label>
             <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: selectedTags.length || activeAttributeKeys.length }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>标签筛选{{ selectedTags.length + activeAttributeKeys.length ? ' · ' + (selectedTags.length + activeAttributeKeys.length) : '' }}</span><ChevronDown :size="14" /></button>
+            <button v-if="authenticated" class="button button-secondary cloud-search-entry" type="button" @click="cloudPanelRef?.open(query)"><Cloud :size="15" /><span>统一检索</span></button>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'grid' }" title="网格视图" @click="listMode = 'grid'"><LayoutGrid :size="16" /></button>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'list' }" title="列表视图" @click="listMode = 'list'"><List :size="16" /></button>
           </div>
         </section>
+
+        <div class="search-scope-bar" aria-label="当前搜索范围">
+          <span>搜索范围：{{ libraryScopeLabel }} / {{ folderTitle }} · 不含单独的云层目录</span>
+          <button v-if="activeFolderID !== 'all'" class="quiet-button" type="button" title="保留关键词，清除文件夹和其他筛选；不跨设备搜索" @click="openFolder('all', query)">在此设备全部资源中搜索</button>
+        </div>
 
         <section v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-panel" aria-label="标签筛选">
           <div class="tag-filter-panel-heading"><strong>标签筛选</strong><button type="button" aria-label="收起标签筛选" @click="tagFilterOpen = false"><ChevronDown :size="15" /></button></div>
@@ -1922,6 +1966,7 @@ onBeforeUnmount(() => {
         </section>
 
         <div class="resource-filter-controls" aria-label="更多筛选和排序">
+          <label><input v-model="reachableOnly" type="checkbox" @change="loadResources()" />仅显示源文件可用的资源</label>
           <label>来源<select v-model="selectedRootID" @change="loadResources()"><option value="">全部目录</option><option v-for="root in roots" :key="root.id" :value="root.id">{{ root.path }}</option></select></label>
           <label>排序<select v-model="sortOrder" @change="loadResources()"><option value="modified_desc">最近修改</option><option value="modified_asc">最早修改</option><option value="name_asc">名称 A-Z</option><option value="name_desc">名称 Z-A</option><option value="size_desc">文件最大</option></select></label>
         </div>
@@ -1988,8 +2033,8 @@ onBeforeUnmount(() => {
           <input v-model="bulkTagName" maxlength="40" type="text" placeholder="输入要添加的标签" :disabled="!!bulkBusy || selectingAll" @keydown.enter.prevent="applyBatchTag" />
           <button class="button button-primary" :disabled="!bulkTagName.trim() || !!bulkBusy || selectingAll" @click="applyBatchTag"><LoaderCircle v-if="bulkBusy === 'tag'" class="spin" :size="15" /><Plus v-else :size="15" />{{ bulkBusy === 'tag' ? `添加中 ${bulkProgress.done}/${bulkProgress.total}` : '批量添加标签' }}</button>
           <span class="bulk-divider"></span>
-          <label class="bulk-folder-picker">移动到<select v-model="bulkFolderID" :disabled="!!bulkBusy || selectingAll"><option value="">未归组</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
-          <button class="button button-secondary" :disabled="!!bulkBusy || selectingAll" @click="moveSelectedToFolder"><LoaderCircle v-if="bulkBusy === 'folder'" class="spin" :size="15" /><FolderOpen v-else :size="15" />{{ bulkBusy === 'folder' ? `移动中 ${bulkProgress.done}/${bulkProgress.total}` : '移动' }}</button>
+          <label class="bulk-folder-picker">归入文件夹<select v-model="bulkFolderID" :disabled="!!bulkBusy || selectingAll"><option value="">未归组</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
+          <button class="button button-secondary" :disabled="!!bulkBusy || selectingAll" @click="moveSelectedToFolder"><LoaderCircle v-if="bulkBusy === 'folder'" class="spin" :size="15" /><FolderOpen v-else :size="15" />{{ bulkBusy === 'folder' ? `归组中 ${bulkProgress.done}/${bulkProgress.total}` : '归组' }}</button>
           <button class="quiet-button cancel-selection" :disabled="!!bulkBusy" @click="clearSelection">取消选择</button>
         </div>
 
@@ -2044,12 +2089,32 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
-        <section v-else-if="initialized && !loading" class="empty-state">
+        <section v-else-if="initialized && !loading && !errorMessage" class="empty-state">
           <span class="empty-icon"><FolderOpen :size="25" /></span>
-          <h2>{{ isFiltered ? "没有找到匹配资源" : unorganizedOnly ? "整理完成" : "这里还没有资源" }}</h2>
-          <p>{{ isFiltered ? "试试其他关键词，或清除筛选条件。" : unorganizedOnly ? "当前没有未添加手动标签的资源。" : activeFolderID === "unfiled" ? "新索引的文件会先出现在这里。" : "从未归组选择资源，再移动到这个文件夹。" }}</p>
-          <button v-if="!isFiltered && !unorganizedOnly && activeFolderID !== 'unfiled'" class="button button-primary" @click="openFolder('unfiled')"><FolderOpen :size="16" />前往未归组</button>
-          <button v-else-if="isFiltered" class="button button-secondary" @click="chooseAll">清除筛选</button>
+          <template v-if="remoteMode && !nodeOnline">
+            <h2>{{ selectedResourceNodeID ? '当前设备暂时离线' : '尚未选择资源设备' }}</h2>
+            <p>请在顶部选择在线设备，或连接原设备后重试。云层文件可从云层目录另行查找。</p>
+            <button class="button button-secondary" type="button" @click="cloudPanelRef?.open(query)"><Cloud :size="15" />统一检索</button>
+          </template>
+          <template v-else-if="!remoteMode && !roots.length">
+            <h2>添加第一个本机目录</h2>
+            <p>收录后即可按文件名、路径和标签查找；不会移动或修改原文件。</p>
+            <button class="button button-primary" type="button" @click="openFolderPicker()"><Plus :size="15" />添加本机目录</button>
+          </template>
+          <template v-else-if="isFiltered">
+            <h2>当前范围内没有匹配文件</h2>
+            <p>搜索范围：{{ libraryScopeLabel }} / {{ folderTitle }}。可清除筛选，或改为搜索云层保存的文件与分类。</p>
+            <div class="empty-state-actions">
+              <button class="button button-secondary" type="button" @click="chooseAll">清除筛选</button>
+              <button v-if="activeFolderID !== 'all'" class="button button-secondary" type="button" @click="openFolder('all', query)">在此设备全部资源中搜索</button>
+              <button class="button button-secondary" type="button" @click="cloudPanelRef?.open(query)"><Cloud :size="15" />统一检索</button>
+            </div>
+          </template>
+          <template v-else>
+            <h2>这里还没有资源</h2>
+            <p>{{ activeFolderID === 'all' || activeFolderID === 'unfiled' ? '已添加的目录尚未收录文件，可在首页查看目录并重新扫描。' : '从未归组中选择文件，归入此文件夹。原文件位置不会改变。' }}</p>
+            <button class="button button-primary" type="button" @click="openFolder(activeFolderID === 'all' || activeFolderID === 'unfiled' ? null : 'unfiled')"><FolderOpen :size="16" />{{ activeFolderID === 'all' || activeFolderID === 'unfiled' ? '查看已收录目录' : '前往未归组' }}</button>
+          </template>
         </section>
 
         <div v-if="hasMore && !loading" class="load-more-wrap"><button class="button button-secondary" @click="pageOffset = resources.length; loadResources(true)">加载更多</button></div>
@@ -2134,7 +2199,7 @@ onBeforeUnmount(() => {
       <section class="directory-picker" role="dialog" aria-modal="true" aria-labelledby="directory-picker-title">
         <header class="directory-picker-header">
           <span class="panel-icon"><FolderOpen :size="18" /></span>
-          <div><h2 id="directory-picker-title">{{ directoryPickerPurpose === "storage" ? "选择存储目录" : "选择索引目录" }}</h2><p>{{ directoryPickerPurpose === "storage" ? "Myliba 会在此目录保存缩略图、视频片段等生成内容。" : folderScanTarget ? `扫描后会将资源加入「${folderTitle}」，原文件不会移动或复制。` : '浏览本机文件夹，原文件不会移动或复制。' }}</p></div>
+          <div><h2 id="directory-picker-title">{{ directoryPickerPurpose === "storage" ? "选择存储目录" : "选择要收录的本机目录" }}</h2><p>{{ directoryPickerPurpose === "storage" ? "Myliba 会在此目录保存缩略图、视频片段等生成内容。" : folderScanTarget ? `扫描后会将资源加入「${folderTitle}」，原文件不会移动或复制。` : '浏览本机文件夹，原文件不会移动或复制。' }}</p></div>
           <button class="quiet-button directory-close" aria-label="关闭" @click="directoryPickerOpen = false"><X :size="18" /></button>
         </header>
         <div class="directory-picker-toolbar">

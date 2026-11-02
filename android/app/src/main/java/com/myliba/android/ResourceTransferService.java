@@ -25,21 +25,21 @@ public final class ResourceTransferService extends Service {
         if(intent==null)return START_NOT_STICKY;
         if("cancel".equals(intent.getAction())){String id=intent.getStringExtra("id");AtomicBoolean flag=cancelled.get(id);if(flag!=null)flag.set(true);return START_NOT_STICKY;}
         String id=UUID.randomUUID().toString(),name=intent.getStringExtra("name"),resource=intent.getStringExtra("resource"),base=intent.getStringExtra("base"),node=intent.getStringExtra("node");
-        long total=intent.getLongExtra("total",-1);
+        long total=intent.getLongExtra("total",-1);boolean cloud=intent.getBooleanExtra("cloud",false);
         if("retry".equals(intent.getAction())){
             id=intent.getStringExtra("id");JSONObject previous=find(id);if(previous==null||cancelled.containsKey(id)||!("失败".equals(previous.optString("status"))||"已取消".equals(previous.optString("status")))){if(active.get()==0)stopSelf(startId);return START_NOT_STICKY;}
-            name=previous.optString("name");resource=previous.optString("resource");base=previous.optString("base");node=previous.optString("node");total=previous.optLong("total",-1);
+            name=previous.optString("name");resource=previous.optString("resource");base=previous.optString("base");node=previous.optString("node");total=previous.optLong("total",-1);cloud=previous.optBoolean("cloud",false);
         }
         if(id==null||name==null||name.isEmpty()||resource==null||resource.isEmpty()||base==null||base.isEmpty()){if(active.get()==0)stopSelf(startId);return START_NOT_STICKY;}
-        AtomicBoolean flag=new AtomicBoolean();cancelled.put(id,flag);record(id,name,total,0,"等待下载","","",base,resource,node);
+        AtomicBoolean flag=new AtomicBoolean();cancelled.put(id,flag);record(id,name,total,0,"等待下载","","",base,resource,node,cloud);
         active.incrementAndGet();if(Build.VERSION.SDK_INT>=34)startForeground(4321,notification("下载中 · "+name),ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);else startForeground(4321,notification("下载中 · "+name));
-        final String taskId=id,taskName=name,taskResource=resource,taskBase=base,taskNode=node;final long taskTotal=total;
-        work.execute(()->{download(taskId,taskName,taskResource,taskBase,taskNode,taskTotal,flag);cancelled.remove(taskId);if(active.decrementAndGet()<=0)stopSelf();});
+        final String taskId=id,taskName=name,taskResource=resource,taskBase=base,taskNode=node;final long taskTotal=total;final boolean taskCloud=cloud;
+        work.execute(()->{download(taskId,taskName,taskResource,taskBase,taskNode,taskTotal,taskCloud,flag);cancelled.remove(taskId);if(active.decrementAndGet()<=0)stopSelf();});
         return START_STICKY;
     }
     private Notification notification(String text){Intent open=new Intent(this,MainActivity.class);PendingIntent click=PendingIntent.getActivity(this,2,open,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
         return new Notification.Builder(this,"resource-transfer").setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle("Myliba 文件传输").setContentText(text).setContentIntent(click).setOngoing(true).build();}
-    private void download(String id,String name,String resource,String base,String node,long total,AtomicBoolean flag){
+    private void download(String id,String name,String resource,String base,String node,long total,boolean cloud,AtomicBoolean flag){
         Uri destination=null;File fallback=null;RemoteClient client=null;long[] count={0};long[] last={0};
         try{
             client=new RemoteClient(base,getSharedPreferences("MainActivity",MODE_PRIVATE),this);
@@ -55,7 +55,7 @@ public final class ResourceTransferService extends Service {
                 @Override public void write(byte[] bytes,int off,int len)throws IOException{check();out.write(bytes,off,len);update(len);}
                 private void check()throws IOException{if(flag.get())throw new IOException("已取消");}
                 private void update(int n){count[0]+=n;long now=System.currentTimeMillis();if(now-last[0]>350){record(id,name,total,count[0],"下载中","","");last[0]=now;}}
-            };client.download("/api/resources/"+RemoteClient.enc(resource)+"/file?download=1",progress);progress.flush();}
+            };client.download((cloud?"/api/cloud/files/":"/api/resources/")+RemoteClient.enc(resource)+"/file?download=1",progress);progress.flush();}
             if(Build.VERSION.SDK_INT>=29){ContentValues done=new ContentValues();done.put(MediaStore.Downloads.IS_PENDING,0);getContentResolver().update(destination,done,null,null);}
             record(id,name,total,count[0],"已完成",destination!=null?destination.toString():ResourceDownloadProvider.uri(id,name).toString(),"");
         }catch(Exception ex){if(destination!=null)getContentResolver().delete(destination,null,null);if(fallback!=null)fallback.delete();record(id,name,total,count[0],flag.get()?"已取消":"失败","",ex.getMessage()==null?"传输中断":ex.getMessage());}
@@ -64,9 +64,10 @@ public final class ResourceTransferService extends Service {
     static JSONArray records(Context context){synchronized(RECORDS){try{return new JSONArray(context.getSharedPreferences(PREFS,MODE_PRIVATE).getString("items","[]"));}catch(Exception ex){return new JSONArray();}}}
     private JSONObject find(String id){if(id==null)return null;JSONArray items=records(this);for(int i=0;i<items.length();i++){JSONObject item=items.optJSONObject(i);if(item!=null&&id.equals(item.optString("id")))return item;}return null;}
     private void recoverInterrupted(){synchronized(RECORDS){JSONArray old=records(this),next=new JSONArray();boolean changed=false;for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item==null)continue;String state=item.optString("status");if("下载中".equals(state)||"等待下载".equals(state)){try{item.put("status","失败").put("error","传输中断，请重新下载");changed=true;}catch(JSONException ignored){}}next.put(item);}if(changed)getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
-    private void record(String id,String name,long total,long downloaded,String state,String uri,String error){record(id,name,total,downloaded,state,uri,error,null,null,null);}
-    private void record(String id,String name,long total,long downloaded,String state,String uri,String error,String base,String resource,String node){synchronized(RECORDS){JSONArray old=records(this),next=new JSONArray();boolean found=false;for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item==null)continue;if(id.equals(item.optString("id"))){found=true;next.put(entry(id,name,total,downloaded,state,uri,error,base==null?item.optString("base"):base,resource==null?item.optString("resource"):resource,node==null?item.optString("node"):node));}else next.put(item);}if(!found)next.put(entry(id,name,total,downloaded,state,uri,error,base,resource,node));getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
-    private static JSONObject entry(String id,String name,long total,long downloaded,String state,String uri,String error,String base,String resource,String node){return RemoteClient.object("id",id,"name",name,"total",total,"downloaded",downloaded,"status",state,"uri",uri,"error",error,"base",base==null?"":base,"resource",resource==null?"":resource,"node",node==null?"":node);}
+    private void record(String id,String name,long total,long downloaded,String state,String uri,String error){record(id,name,total,downloaded,state,uri,error,null,null,null,null);}
+    private void record(String id,String name,long total,long downloaded,String state,String uri,String error,String base,String resource,String node){record(id,name,total,downloaded,state,uri,error,base,resource,node,null);}
+    private void record(String id,String name,long total,long downloaded,String state,String uri,String error,String base,String resource,String node,Boolean cloud){synchronized(RECORDS){JSONArray old=records(this),next=new JSONArray();boolean found=false;for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item==null)continue;if(id.equals(item.optString("id"))){found=true;next.put(entry(id,name,total,downloaded,state,uri,error,base==null?item.optString("base"):base,resource==null?item.optString("resource"):resource,node==null?item.optString("node"):node,cloud==null?item.optBoolean("cloud"):cloud));}else next.put(item);}if(!found)next.put(entry(id,name,total,downloaded,state,uri,error,base,resource,node,cloud!=null&&cloud));getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
+    private static JSONObject entry(String id,String name,long total,long downloaded,String state,String uri,String error,String base,String resource,String node,boolean cloud){return RemoteClient.object("id",id,"name",name,"total",total,"downloaded",downloaded,"status",state,"uri",uri,"error",error,"base",base==null?"":base,"resource",resource==null?"":resource,"node",node==null?"":node,"cloud",cloud);}
     static void remove(Context context,String id){synchronized(RECORDS){JSONArray old=records(context),next=new JSONArray();for(int i=0;i<old.length();i++){JSONObject item=old.optJSONObject(i);if(item!=null&&!id.equals(item.optString("id")))next.put(item);}context.getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("items",next.toString()).apply();}}
     @Override public IBinder onBind(Intent intent){return null;}
     @Override public void onDestroy(){work.shutdownNow();super.onDestroy();}

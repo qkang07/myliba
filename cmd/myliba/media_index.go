@@ -934,15 +934,19 @@ type indexedAsset struct {
 }
 
 type fileIndexView struct {
-	FileID      string         `json:"fileId"`
-	RevisionID  string         `json:"revisionId"`
-	Name        string         `json:"name"`
-	Kind        string         `json:"kind"`
-	Modified    string         `json:"modified"`
-	Tags        []string       `json:"tags"`
-	Original    indexedContent `json:"original"`
-	Assets      []indexedAsset `json:"assets"`
-	ContentSize int64          `json:"contentSize"`
+	FolderID          string         `json:"folderId,omitempty"`
+	FolderName        string         `json:"folderName,omitempty"`
+	OrganizationKnown bool           `json:"organizationKnown,omitempty"`
+	Protected         bool           `json:"protected,omitempty"`
+	FileID            string         `json:"fileId"`
+	RevisionID        string         `json:"revisionId"`
+	Name              string         `json:"name"`
+	Kind              string         `json:"kind"`
+	Modified          string         `json:"modified"`
+	Tags              []string       `json:"tags"`
+	Original          indexedContent `json:"original"`
+	Assets            []indexedAsset `json:"assets"`
+	ContentSize       int64          `json:"contentSize"`
 }
 
 func versionKeyFromMetadata(size int64, modified string) string {
@@ -987,6 +991,11 @@ func (s *server) buildFileIndex(id string, includeCloud bool) (fileIndexView, er
 		return index, localErr
 	}
 	if localErr == nil {
+		index.OrganizationKnown = true
+		err := s.db.QueryRow(`SELECT f.id,f.name,f.password_hash<>'' FROM resource_folders rf JOIN folders f ON f.id=rf.folder_id WHERE rf.resource_id=?`, id).Scan(&index.FolderID, &index.FolderName, &index.Protected)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return index, err
+		}
 		nodeID := ""
 		if s.cloud != nil {
 			nodeID = s.cloud.runtime.id

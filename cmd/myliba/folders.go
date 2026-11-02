@@ -138,6 +138,7 @@ func (s *server) renameFolder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "无法读取文件夹")
 		return
 	}
+	s.queueAllLocalIndexes()
 	writeJSON(w, http.StatusOK, item)
 }
 
@@ -195,6 +196,7 @@ func (s *server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "无法删除文件夹")
 		return
 	}
+	s.queueAllLocalIndexes()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -278,6 +280,7 @@ func (s *server) moveResourcesToFolder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "无法移动资源")
 		return
 	}
+	s.queueAllLocalIndexes()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": count})
 }
 
@@ -310,6 +313,7 @@ func (s *server) assignRootToFolder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "无法读取扫描结果")
 		return
 	}
+	s.queueAllLocalIndexes()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": count})
 }
 
@@ -424,6 +428,7 @@ func (s *server) setFolderPassword(w http.ResponseWriter, r *http.Request) {
 		}
 		http.SetCookie(w, &http.Cookie{Name: folderCookieName(r.PathValue("id")), Value: "", Path: "/api", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 	}
+	s.queueAllLocalIndexes()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "passwordProtected": password != ""})
 }
 

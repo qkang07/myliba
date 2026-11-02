@@ -75,7 +75,7 @@ func (c *cloudClient) primeLocalDigests() error {
 			continue
 		}
 		previous, exists := latest[record.ObjectID]
-		if !exists || record.CreatedAt > previous.CreatedAt {
+		if !exists || catalogAfter(record, previous) {
 			latest[record.ObjectID] = record
 		}
 	}
@@ -133,7 +133,7 @@ func (c *cloudClient) localIndexes(objectID string) ([]fileIndexView, error) {
 			continue
 		}
 		previous, ok := latest[record.AuthorID]
-		if !ok || record.CreatedAt > previous.CreatedAt {
+		if !ok || catalogAfter(record, previous) {
 			latest[record.AuthorID] = record
 		}
 	}
@@ -141,7 +141,7 @@ func (c *cloudClient) localIndexes(objectID string) ([]fileIndexView, error) {
 	for _, record := range latest {
 		ordered = append(ordered, record)
 	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].CreatedAt > ordered[j].CreatedAt })
+	sort.Slice(ordered, func(i, j int) bool { return catalogAfter(ordered[i], ordered[j]) })
 	indexes := make([]fileIndexView, 0, len(ordered))
 	for _, record := range ordered {
 		manifest, err := c.openManifest(record)

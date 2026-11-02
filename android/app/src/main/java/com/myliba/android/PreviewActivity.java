@@ -63,6 +63,7 @@ public final class PreviewActivity extends Activity {
     private boolean closing;
     private MobileUi ui;
     private boolean remote;
+    private boolean cloud;
     private File remoteCache;
     private RtcMediaProxy mediaProxy;
     private LinearLayout toolbar, browserNav;
@@ -88,6 +89,7 @@ public final class PreviewActivity extends Activity {
         if (value == null) { finish(); return; }
         fileUri = Uri.parse(value);
         remote = getIntent().hasExtra("server");
+        cloud = getIntent().getBooleanExtra("cloud",false);
         mime = getIntent().getStringExtra("mime");
         if (mime == null) mime = "application/octet-stream";
         fileSize=getIntent().getLongExtra("size",-1);
@@ -154,7 +156,11 @@ public final class PreviewActivity extends Activity {
     }
 
     private void loadRemote() {
-        if (mime.startsWith("image/") || mime.startsWith("video/")) {
+        if (cloud && mime.startsWith("video/")) {
+            showMessage("云层视频可以在线播放，点击上方“播放原片”。");
+            return;
+        }
+        if (!cloud && (mime.startsWith("image/") || mime.startsWith("video/"))) {
             loadThumbnail();
             return;
         }
@@ -171,18 +177,20 @@ public final class PreviewActivity extends Activity {
         worker.execute(() -> {
             try {
                 remoteCache = File.createTempFile("preview-", ".bin", getCacheDir());
-                try (FileOutputStream out = new FileOutputStream(remoteCache)) { downloadWithProgress(client,"/api/resources/" + RemoteClient.enc(getIntent().getStringExtra("resource")) + "/file",out,fileSize,"正在读取预览文件"); }
+                try (FileOutputStream out = new FileOutputStream(remoteCache)) { downloadWithProgress(client,remoteFilePath(),out,fileSize,"正在读取预览文件"); }
                 runOnUiThread(() -> { if (!closing) { fileUri = Uri.fromFile(remoteCache); openPreview(); } });
             } catch (Exception error) { fail(error); }finally{client.close();}
         });
     }
+
+    private String remoteFilePath(){return (cloud?"/api/cloud/files/":"/api/resources/")+RemoteClient.enc(getIntent().getStringExtra("resource"))+"/file";}
 
     private void loadThumbnail() {
         showLoading("正在加载预览图…",-1);
         worker.execute(() -> {
             try {
                 Bitmap bitmap;
-                if(remote){
+                if(remote&&!cloud){
                     RemoteClient client=new RemoteClient(getIntent().getStringExtra("server"),getSharedPreferences("MainActivity",MODE_PRIVATE),this);
                     try{
                         String path="/api/resources/"+RemoteClient.enc(getIntent().getStringExtra("resource"))+"/thumbnail?size=mobile";
@@ -226,7 +234,7 @@ public final class PreviewActivity extends Activity {
                     RemoteClient client=new RemoteClient(getIntent().getStringExtra("server"),getSharedPreferences("MainActivity",MODE_PRIVATE),this);
                     try{
                         remoteCache=File.createTempFile("preview-original-",".bin",getCacheDir());
-                        try(FileOutputStream out=new FileOutputStream(remoteCache)){downloadWithProgress(client,"/api/resources/"+RemoteClient.enc(getIntent().getStringExtra("resource"))+"/file",out,fileSize,"正在读取原图");}
+                        try(FileOutputStream out=new FileOutputStream(remoteCache)){downloadWithProgress(client,remoteFilePath(),out,fileSize,"正在读取原图");}
                         fileUri=Uri.fromFile(remoteCache);
                     }finally{client.close();}
                 }
@@ -372,7 +380,7 @@ public final class PreviewActivity extends Activity {
         if (remote) {
             try{
                 RemoteClient client = new RemoteClient(getIntent().getStringExtra("server"), getSharedPreferences("MainActivity", MODE_PRIVATE), this);
-                mediaProxy=new RtcMediaProxy(client,getIntent().getStringExtra("resource"));
+                mediaProxy=new RtcMediaProxy(client,getIntent().getStringExtra("resource"),"original",cloud);
                 video.setVideoURI(Uri.parse(mediaProxy.url()));
             }catch(Exception ex){hideLoading();showMessage("无法启动 WebRTC 媒体播放："+ex.getMessage());if(originalAction!=null)originalAction.setEnabled(true);return;}
         } else video.setVideoURI(fileUri);
@@ -380,7 +388,7 @@ public final class PreviewActivity extends Activity {
         FrameLayout.LayoutParams videoParams=new FrameLayout.LayoutParams(-1,-1,Gravity.CENTER);
         stage.addView(video,videoParams);
         content.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
-        if(remote&&mime.startsWith("video/")&&!"android".equals(getIntent().getStringExtra("source_node_kind"))){videoQualityAction=button("清晰度：原片",this::chooseVideoQuality);toolbar.addView(videoQualityAction);}
+        if(remote&&mime.startsWith("video/")&&(!cloud||getIntent().getBooleanExtra("cloud_variants",false))&&(!"android".equals(getIntent().getStringExtra("source_node_kind")))){videoQualityAction=button("清晰度：原片",this::chooseVideoQuality);toolbar.addView(videoQualityAction);}
         video.setOnPreparedListener(player->{videoFailed=false;stage.setVideoSize(player.getVideoWidth(),player.getVideoHeight());hideLoading();if(videoRestorePosition>0){video.seekTo(videoRestorePosition);videoRestorePosition=0;}if(videoResume)video.start();});
         video.setOnInfoListener((player,what,extra)->{if(what==android.media.MediaPlayer.MEDIA_INFO_BUFFERING_START)showLoading("正在缓冲视频…",-1);else if(what==android.media.MediaPlayer.MEDIA_INFO_BUFFERING_END)hideLoading();return false;});
         video.setOnErrorListener((player, what, extra) -> {hideLoading();videoFailed=true;if(remote&&videoQualityAction!=null)android.widget.Toast.makeText(this,"视频无法播放，请尝试其他清晰度或原片",android.widget.Toast.LENGTH_LONG).show();else showMessage(remote?"视频无法播放，请返回详情下载原片。":"视频无法播放，可用其他应用打开。");if(originalAction!=null)originalAction.setEnabled(true);return true;});
@@ -393,7 +401,7 @@ public final class PreviewActivity extends Activity {
             if(!videoFailed){videoRestorePosition=video.getCurrentPosition();videoResume=video.isPlaying();}videoFailed=false;video.stopPlayback();
             if(mediaProxy!=null)mediaProxy.close();
             videoQuality=values[index];videoQualityAction.setText("清晰度："+(index==0?"原片":values[index]));showLoading("正在准备视频片段…",-1);
-            try{RemoteClient client=new RemoteClient(getIntent().getStringExtra("server"),getSharedPreferences("MainActivity",MODE_PRIVATE),this);mediaProxy=new RtcMediaProxy(client,getIntent().getStringExtra("resource"),videoQuality);video.setVideoURI(Uri.parse(mediaProxy.url()));}
+            try{RemoteClient client=new RemoteClient(getIntent().getStringExtra("server"),getSharedPreferences("MainActivity",MODE_PRIVATE),this);mediaProxy=new RtcMediaProxy(client,getIntent().getStringExtra("resource"),videoQuality,cloud);video.setVideoURI(Uri.parse(mediaProxy.url()));}
             catch(Exception ex){hideLoading();showMessage("无法启动视频流："+ex.getMessage());}
         }).show();
     }
@@ -406,7 +414,39 @@ public final class PreviewActivity extends Activity {
         catch (RuntimeException error) { showMessage("没有可打开此文件的应用，或目录授权已失效。"); }
     }
     private void toggleImageControls(){if(!mime.startsWith("image/"))return;imageControlsVisible=!imageControlsVisible;toolbar.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);if(browserNav!=null)browserNav.setVisibility(imageControlsVisible?View.VISIBLE:View.GONE);}
-    private void navigateMedia(int step){int target=browseIndex+step;if(browseIds==null||target<0||target>=browseIds.size())return;Intent next=new Intent(this,PreviewActivity.class);String id=browseIds.get(target);next.putExtra("uri",remote?getIntent().getStringExtra("server")+"/api/resources/"+RemoteClient.enc(id)+"/file":id);next.putExtra("name",browseNames.get(target));next.putExtra("mime",browseMimes.get(target));if(remote)next.putExtra("server",getIntent().getStringExtra("server")).putExtra("resource",id).putExtra("source_node_kind",getIntent().getStringExtra("source_node_kind"));next.putStringArrayListExtra("browse_ids",browseIds);next.putStringArrayListExtra("browse_names",browseNames);next.putStringArrayListExtra("browse_mimes",browseMimes);long[] sizes=getIntent().getLongArrayExtra("browse_sizes");if(sizes!=null){next.putExtra("browse_sizes",sizes);if(target<sizes.length)next.putExtra("size",sizes[target]);}next.putExtra("browse_index",target);startActivity(next);finish();}
+    private void navigateMedia(int step) {
+        int target = browseIndex + step;
+        if (browseIds == null || target < 0 || target >= browseIds.size()) return;
+
+        Intent next = new Intent(this, PreviewActivity.class);
+        String id = browseIds.get(target);
+        next.putExtra("uri", remote
+                ? getIntent().getStringExtra("server") + "/api/resources/" + RemoteClient.enc(id) + "/file"
+                : id);
+        next.putExtra("name", browseNames.get(target));
+        next.putExtra("mime", browseMimes.get(target));
+        if (remote) {
+            next.putExtra("server", getIntent().getStringExtra("server"))
+                    .putExtra("resource", id)
+                    .putExtra("source_node_kind", getIntent().getStringExtra("source_node_kind"));
+        }
+        next.putStringArrayListExtra("browse_ids", browseIds);
+        next.putStringArrayListExtra("browse_names", browseNames);
+        next.putStringArrayListExtra("browse_mimes", browseMimes);
+        long[] sizes = getIntent().getLongArrayExtra("browse_sizes");
+        if (sizes != null) {
+            next.putExtra("browse_sizes", sizes);
+            if (target < sizes.length) next.putExtra("size", sizes[target]);
+        }
+        next.putExtra("browse_index", target);
+        startActivity(next);
+        if (step > 0) {
+            overridePendingTransition(R.anim.preview_enter_from_right, R.anim.preview_exit_to_left);
+        } else {
+            overridePendingTransition(R.anim.preview_enter_from_left, R.anim.preview_exit_to_right);
+        }
+        finish();
+    }
 
     private void fail(Exception error) { runOnUiThread(() -> { if (!closing) {hideLoading();showMessage("预览失败：" + error.getMessage());} }); }
 

@@ -21,7 +21,15 @@ func TestCloudDownloadPrefersMatchingLocalOriginalAndFallsBackForChangedFile(t *
 	t.Cleanup(func() { db.Close() })
 	if _, err := db.Exec(`CREATE TABLE resources (id TEXT PRIMARY KEY, path TEXT, size INTEGER, modified_at TEXT, available INTEGER);
 		CREATE TABLE file_assets (id TEXT PRIMARY KEY, resource_id TEXT, version_key TEXT, kind TEXT, spec TEXT, codec TEXT);
-		CREATE TABLE file_asset_locations (asset_id TEXT, storage_id TEXT, path TEXT)`); err != nil {
+		CREATE TABLE file_asset_locations (asset_id TEXT, storage_id TEXT, path TEXT);
+		CREATE TABLE folders (id TEXT, name TEXT);
+		CREATE TABLE resource_folders (resource_id TEXT, folder_id TEXT);
+		CREATE TABLE tags (id TEXT, name TEXT);
+		CREATE TABLE resource_tags (resource_id TEXT, tag_id TEXT);
+		INSERT INTO folders VALUES ('travel','旅行');
+		INSERT INTO resource_folders VALUES ('clip','travel');
+		INSERT INTO tags VALUES ('tag','家庭');
+		INSERT INTO resource_tags VALUES ('clip','tag')`); err != nil {
 		t.Fatal(err)
 	}
 	runtime := testCloudRuntime(t, filepath.Join(dir, "cloud"), "")
@@ -51,6 +59,10 @@ func TestCloudDownloadPrefersMatchingLocalOriginalAndFallsBackForChangedFile(t *
 		t.Fatalf("cloud record: %+v %v", record, err)
 	}
 	blockPath, err := runtime.disk.path("blocks", record.BlockIDs[0])
+	_, saved, metadataErr := client.findRecord("clip")
+	if metadataErr != nil || saved.FolderID != "travel" || saved.FolderName != "旅行" || len(saved.Tags) != 1 || saved.Tags[0] != "家庭" {
+		t.Fatalf("organization not preserved: %+v %v", saved, metadataErr)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,5 +107,15 @@ func TestCloudDownloadPrefersMatchingLocalOriginalAndFallsBackForChangedFile(t *
 	client.download(response, request)
 	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), original) {
 		t.Fatalf("cloud fallback: status=%d body=%q", response.Code, response.Body.String())
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM resource_folders; DELETE FROM resource_tags; DELETE FROM folders; DELETE FROM tags`); err != nil {
+		t.Fatal(err)
+	}
+	_, saved, metadataErr = client.findRecord("clip")
+	if metadataErr != nil || saved.FolderName != "旅行" || len(saved.Tags) != 1 || saved.Tags[0] != "家庭" {
+		t.Fatalf("organization lost without local original or classification: %+v %v", saved, metadataErr)
 	}
 }
