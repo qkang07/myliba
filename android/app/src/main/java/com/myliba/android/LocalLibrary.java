@@ -35,6 +35,8 @@ final class LocalLibrary extends SQLiteOpenHelper {
         final long modified;
         final String tags;
         final String folderId;
+        final String fileId;
+        final String revisionId;
 
         Item(Cursor cursor) {
             uri = cursor.getString(0);
@@ -46,6 +48,8 @@ final class LocalLibrary extends SQLiteOpenHelper {
             modified = cursor.getLong(6);
             tags = cursor.getString(7);
             folderId = cursor.getString(8);
+            fileId = cursor.getString(9);
+            revisionId = cursor.getString(10);
         }
     }
 
@@ -96,7 +100,7 @@ final class LocalLibrary extends SQLiteOpenHelper {
     }
 
     LocalLibrary(Context context) {
-        super(context, "local-library.db", null, 3);
+        super(context, "local-library.db", null, 5);
     }
 
     @Override public void onConfigure(SQLiteDatabase db) {
@@ -105,29 +109,58 @@ final class LocalLibrary extends SQLiteOpenHelper {
 
     @Override public void onCreate(SQLiteDatabase db) {
         db.execSQL("CREATE TABLE roots (uri TEXT PRIMARY KEY, name TEXT NOT NULL)");
-        db.execSQL("CREATE TABLE items (uri TEXT PRIMARY KEY, root_uri TEXT NOT NULL REFERENCES roots(uri) ON DELETE CASCADE, name TEXT NOT NULL, path TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, modified INTEGER NOT NULL, scan_token TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file', folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL)");
+        db.execSQL("CREATE TABLE items (uri TEXT PRIMARY KEY, root_uri TEXT NOT NULL REFERENCES roots(uri) ON DELETE CASCADE, name TEXT NOT NULL, path TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, modified INTEGER NOT NULL, scan_token TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file', folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL, file_id TEXT NOT NULL UNIQUE, revision_id TEXT NOT NULL)");
         db.execSQL("CREATE INDEX items_root ON items(root_uri)");
         db.execSQL("CREATE TABLE tags (item_uri TEXT NOT NULL REFERENCES items(uri) ON DELETE CASCADE, name TEXT NOT NULL, PRIMARY KEY(item_uri, name))");
         createOrganizationTables(db);
         createOrganizationIndexes(db);
+        createAliasTables(db);
+        createIndexSyncTables(db);
     }
 
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        if (oldVersion == 2) { db.execSQL("UPDATE items SET kind='image' WHERE lower(name) LIKE '%.arw'"); return; }
-        if (oldVersion != 1) throw new IllegalStateException("Missing local library migration from " + oldVersion);
-        createOrganizationTables(db);
-        db.execSQL("ALTER TABLE items ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'");
-        db.execSQL("ALTER TABLE items ADD COLUMN folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL");
-        createOrganizationIndexes(db);
-        List<String[]> existing = new ArrayList<>();
-        try (Cursor cursor = db.rawQuery("SELECT uri, name FROM items", null)) {
-            while (cursor.moveToNext()) existing.add(new String[]{cursor.getString(0), cursor.getString(1)});
+        if (oldVersion == 1) {
+            createOrganizationTables(db);
+            db.execSQL("ALTER TABLE items ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'");
+            db.execSQL("ALTER TABLE items ADD COLUMN folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL");
+            createOrganizationIndexes(db);
+            List<String[]> existing = new ArrayList<>();
+            try (Cursor cursor = db.rawQuery("SELECT uri, name FROM items", null)) {
+                while (cursor.moveToNext()) existing.add(new String[]{cursor.getString(0), cursor.getString(1)});
+            }
+            for (String[] item : existing) {
+                ContentValues values = new ContentValues();
+                values.put("kind", kindFor(item[1]));
+                db.update("items", values, "uri=?", new String[]{item[0]});
+            }
+            oldVersion = 2;
         }
-        for (String[] item : existing) {
-            ContentValues values = new ContentValues();
-            values.put("kind", kindFor(item[1]));
-            db.update("items", values, "uri=?", new String[]{item[0]});
+        if (oldVersion == 2) {
+            db.execSQL("UPDATE items SET kind='image' WHERE lower(name) LIKE '%.arw'");
+            oldVersion = 3;
         }
+        if (oldVersion == 3) {
+            db.execSQL("ALTER TABLE items ADD COLUMN file_id TEXT");
+            db.execSQL("ALTER TABLE items ADD COLUMN revision_id TEXT");
+            List<String> uris = new ArrayList<>();
+            try (Cursor cursor = db.rawQuery("SELECT uri FROM items", null)) {
+                while (cursor.moveToNext()) uris.add(cursor.getString(0));
+            }
+            for (String uri : uris) {
+                ContentValues values = new ContentValues();
+                values.put("file_id", UUID.randomUUID().toString());
+                values.put("revision_id", UUID.randomUUID().toString());
+                db.update("items", values, "uri=?", new String[]{uri});
+            }
+            db.execSQL("CREATE UNIQUE INDEX items_file_id ON items(file_id)");
+            createIndexSyncTables(db);
+            oldVersion = 4;
+        }
+        if (oldVersion == 4) {
+            createAliasTables(db);
+            oldVersion = 5;
+        }
+        if (oldVersion != newVersion) throw new IllegalStateException("Missing local library migration to " + newVersion + " from " + oldVersion);
     }
 
     private static void createOrganizationTables(SQLiteDatabase db) {
@@ -138,6 +171,24 @@ final class LocalLibrary extends SQLiteOpenHelper {
     private static void createOrganizationIndexes(SQLiteDatabase db) {
         db.execSQL("CREATE INDEX items_folder ON items(folder_id)");
         db.execSQL("CREATE INDEX tags_name ON tags(name)");
+    }
+
+    private static void createIndexSyncTables(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE index_outbox (file_id TEXT PRIMARY KEY, item_uri TEXT, token TEXT NOT NULL)");
+        db.execSQL("CREATE TRIGGER index_items_insert AFTER INSERT ON items BEGIN INSERT OR REPLACE INTO index_outbox(file_id,item_uri,token) VALUES(NEW.file_id,NEW.uri,lower(hex(randomblob(16)))); END");
+        db.execSQL("CREATE TRIGGER index_items_update AFTER UPDATE OF name,path,mime,size,modified,folder_id,revision_id ON items WHEN OLD.name IS NOT NEW.name OR OLD.path IS NOT NEW.path OR OLD.mime IS NOT NEW.mime OR OLD.size IS NOT NEW.size OR OLD.modified IS NOT NEW.modified OR OLD.folder_id IS NOT NEW.folder_id OR OLD.revision_id IS NOT NEW.revision_id BEGIN INSERT OR REPLACE INTO index_outbox(file_id,item_uri,token) VALUES(NEW.file_id,NEW.uri,lower(hex(randomblob(16)))); END");
+        db.execSQL("CREATE TRIGGER index_items_delete BEFORE DELETE ON items BEGIN INSERT OR REPLACE INTO index_outbox(file_id,item_uri,token) VALUES(OLD.file_id,NULL,lower(hex(randomblob(16)))); END");
+        db.execSQL("CREATE TRIGGER index_tags_insert AFTER INSERT ON tags BEGIN INSERT OR REPLACE INTO index_outbox(file_id,item_uri,token) SELECT file_id,uri,lower(hex(randomblob(16))) FROM items WHERE uri=NEW.item_uri; END");
+        db.execSQL("CREATE TRIGGER index_tags_delete AFTER DELETE ON tags BEGIN INSERT OR REPLACE INTO index_outbox(file_id,item_uri,token) SELECT file_id,uri,lower(hex(randomblob(16))) FROM items WHERE uri=OLD.item_uri; END");
+        db.execSQL("CREATE TRIGGER index_folders_rename AFTER UPDATE OF name ON folders BEGIN INSERT OR REPLACE INTO index_outbox(file_id,item_uri,token) SELECT file_id,uri,lower(hex(randomblob(16))) FROM items WHERE folder_id=NEW.id; END");
+        db.execSQL("INSERT OR REPLACE INTO index_outbox(file_id,item_uri,token) SELECT file_id,uri,lower(hex(randomblob(16))) FROM items");
+    }
+
+    private static void createAliasTables(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE item_aliases (uri TEXT PRIMARY KEY, file_id TEXT NOT NULL)");
+        db.execSQL("CREATE INDEX item_aliases_file_id ON item_aliases(file_id)");
+        db.execSQL("CREATE TRIGGER item_aliases_insert AFTER INSERT ON items BEGIN INSERT OR REPLACE INTO item_aliases(uri,file_id) VALUES(NEW.uri,NEW.file_id); END");
+        db.execSQL("INSERT OR REPLACE INTO item_aliases(uri,file_id) SELECT uri,file_id FROM items");
     }
 
     private static String kindFor(String name) {
@@ -210,8 +261,8 @@ final class LocalLibrary extends SQLiteOpenHelper {
         List<Item> items = new ArrayList<>();
         try (Cursor cursor = db.rawQuery(
                 "SELECT i.uri, i.root_uri, i.name, i.path, i.mime, i.size, i.modified, " +
-                "COALESCE((SELECT group_concat(t.name, ' · ') FROM tags t WHERE t.item_uri=i.uri), ''), i.folder_id " +
-                "FROM items i WHERE " + where + " ORDER BY " + order + " LIMIT ? OFFSET ?", args.toArray(new String[0]))) {
+                "COALESCE((SELECT group_concat(t.name, ' · ') FROM tags t WHERE t.item_uri=i.uri), ''), i.folder_id, " +
+                "i.file_id, i.revision_id FROM items i WHERE " + where + " ORDER BY " + order + " LIMIT ? OFFSET ?", args.toArray(new String[0]))) {
             while (cursor.moveToNext()) items.add(new Item(cursor));
         }
         return new Page(items, total);
@@ -220,8 +271,8 @@ final class LocalLibrary extends SQLiteOpenHelper {
     Item item(String uri) {
         try (Cursor cursor = getReadableDatabase().rawQuery(
                 "SELECT i.uri, i.root_uri, i.name, i.path, i.mime, i.size, i.modified, " +
-                "COALESCE((SELECT group_concat(t.name, ' · ') FROM tags t WHERE t.item_uri=i.uri), ''), i.folder_id " +
-                "FROM items i WHERE i.uri=?", new String[]{uri})) {
+                "COALESCE((SELECT group_concat(t.name, ' · ') FROM tags t WHERE t.item_uri=i.uri), ''), i.folder_id, " +
+                "i.file_id, i.revision_id FROM items i WHERE i.uri=?", new String[]{uri})) {
             return cursor.moveToFirst() ? new Item(cursor) : null;
         }
     }
@@ -510,8 +561,22 @@ final class LocalLibrary extends SQLiteOpenHelper {
         values.put("modified", modified);
         values.put("scan_token", scanToken);
         values.put("kind", kindFor(name));
+        boolean changed = true;
+        try (Cursor cursor = db.rawQuery("SELECT size,modified,mime FROM items WHERE uri=?", new String[]{uri})) {
+            if (cursor.moveToFirst()) changed = cursor.getLong(0) != size || cursor.getLong(1) != modified || !cursor.getString(2).equals(mime);
+        }
+        if (changed) values.put("revision_id", UUID.randomUUID().toString());
         if (db.update("items", values, "uri=?", new String[]{uri}) == 0) {
+            String fileID = aliasFileID(db, uri);
+            values.put("file_id", fileID == null ? UUID.randomUUID().toString() : fileID);
+            values.put("revision_id", UUID.randomUUID().toString());
             db.insertOrThrow("items", null, values);
+        }
+    }
+
+    private static String aliasFileID(SQLiteDatabase db, String uri) {
+        try (Cursor cursor = db.rawQuery("SELECT file_id FROM item_aliases WHERE uri=?", new String[]{uri})) {
+            return cursor.moveToFirst() ? cursor.getString(0) : null;
         }
     }
 

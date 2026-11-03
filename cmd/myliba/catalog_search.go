@@ -115,6 +115,9 @@ func (c *cloudClient) mergeCatalogSearch(files []cloudFileView, includeLocal boo
 		sort.Strings(keys)
 		for _, key := range keys {
 			index := indexes[key]
+			if index.Deleted {
+				continue
+			}
 			add(cloudFileView{ID: index.FileID + "@" + index.RevisionID, SourceID: index.FileID, Name: index.Name, Modified: index.Modified,
 				OriginalSize: index.Original.Size, Size: index.ContentSize, Tags: index.Tags, FolderID: index.FolderID, FolderName: index.FolderName,
 				RevisionID: index.RevisionID, LocalOnly: true, Locations: index.Original.Local, Variants: []string{}}, index.FileID)

@@ -313,7 +313,7 @@ func (c *cloudClient) openManifest(record cloudRecord) (cloudManifest, error) {
 		index := manifest.LocalIndex
 		total := index.Original.Size
 		for _, location := range index.Original.Local {
-			if location.NodeID != record.AuthorID || location.Path == "" {
+			if location.NodeID != record.AuthorID || (location.Path == "" && location.ResourceRef == "") || len(location.ResourceRef) > 4096 {
 				return manifest, errors.New("invalid local source location")
 			}
 		}

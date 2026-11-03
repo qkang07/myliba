@@ -43,6 +43,16 @@ The Android app has no access to the home node's local-only folder-management AP
 
 ## Phone resource node
 
+### Publish phone files to unified search
+
+In **设置 → 手机资源节点**, enable **将手机索引加入统一检索** and enter the existing library's 64-character recovery key from the desktop Cloud panel. Leave the field blank on later saves to retain the key. The key is encrypted with Android Keystore; it is not sent to the Hub. Switching to a different paired Hub clears this configuration. Start or restart the resource node after saving.
+
+While the resource node is running, a worker checks the durable SQLite outbox every 20 seconds. Scans and organization changes enqueue the affected stable file IDs in the same database transaction; unchanged files are not rebuilt on every publisher pass. It publishes encrypted file metadata, folder names, tags and an opaque resource reference to the Hub's catalog using the paired device credential. Original files are not uploaded. Other clients sharing the same recovery key discover these records through their existing catalog sync and show them in unified search.
+
+Tag changes, folder moves, renames and deletions are replacement snapshots. Removed files or revoked source directories publish tombstones after the local index is updated. Failed uploads retain both the SQLite outbox item and encrypted pending record; acknowledgments and content digests survive service restarts. An acknowledgment clears only the matching outbox token, so a newer edit made during upload remains pending. Version 5 of the phone database assigns persistent file and revision IDs and retains a URI-to-file alias after a source disappears, so reauthorizing the same SAF document reuses its identity. The first upgraded publish tombstones the former URI-derived IDs to prevent duplicate search results. Disabling publication stops new updates but does not revoke records already held by other devices. Only the resource-node client holds the recovery key; storage-only mode does not need it.
+
+Tests: `android/tools/LocalIndexInterop.java` generates public test vectors using the production Java crypto codec. `TestAndroidPublishedIndexCrossDeviceSync` verifies their authenticated HTTP upload, duplicate retries, Go decryption, folder/tag replacement, clearing and removal through a second node's catalog. Android compilation and these protocol tests do not replace physical-device/background-lifetime verification.
+
 Index one or more phone folders under **本机 → 来源**, pair the phone through **家中资源库**, then open **手机资源节点** and start the foreground service. The paired credential is encrypted in app-private preferences and is also used for browsing and cloud access. The app registers a stable phone node ID over an outbound WebSocket. In the Hub web page or another native app, select this phone under the resource-node selector. Its indexed files, tags, virtual folders and saved queries are served from the phone; file bytes travel over direct WebRTC. The Hub handles authentication, node discovery, signaling and metadata fallback. Keep the service running and the phone online while accessing its files. Android background lifetime and public-network ICE behavior still need real-device verification.
 
 The **手机资源节点** uses this phone's paired device credential. The **云层存储节点** is a separate service that uses the same device authorization.

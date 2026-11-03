@@ -52,7 +52,7 @@ public final class MainActivity extends Activity {
     private final Runnable hubRetry=()->{if(!destroyed&&home&&!loading&&hubStore!=null)reload(false,true);};
     private final Runnable transferRefresh=new Runnable(){@Override public void run(){if(!destroyed&&tab==3){renderTransfers();handler.postDelayed(this,1000);}}};
     private final Runnable nodeRefresh=new Runnable(){@Override public void run(){if(!destroyed&&storageOnly){if(displayedNodeRunning!=CloudStorageService.running)render();else updateStorageOnlyStatus();handler.postDelayed(this,3000);}}};
-    private final Runnable resourceNodeRefresh=new Runnable(){@Override public void run(){if(!destroyed&&!storageOnly&&tab==2){if(resourceNodeStatus!=null)resourceNodeStatus.setText(ResourceNodeService.status);if(thumbnailTaskStatus!=null)thumbnailTaskStatus.setText(getSharedPreferences(LocalThumbnailTaskService.PREFS,MODE_PRIVATE).getString("status",LocalThumbnailTaskService.status));if(thumbnailTaskSwitch!=null&&thumbnailTaskSwitch.isChecked()!=LocalThumbnailTaskService.isEnabled())setThumbnailTaskChecked(LocalThumbnailTaskService.isEnabled());handler.postDelayed(this,3000);}}};
+    private final Runnable resourceNodeRefresh=new Runnable(){@Override public void run(){if(!destroyed&&!storageOnly&&tab==2){if(resourceNodeStatus!=null)resourceNodeStatus.setText(ResourceNodeService.status+"\n"+LocalIndexPublisher.status);if(thumbnailTaskStatus!=null)thumbnailTaskStatus.setText(getSharedPreferences(LocalThumbnailTaskService.PREFS,MODE_PRIVATE).getString("status",LocalThumbnailTaskService.status));if(thumbnailTaskSwitch!=null&&thumbnailTaskSwitch.isChecked()!=LocalThumbnailTaskService.isEnabled())setThumbnailTaskChecked(LocalThumbnailTaskService.isEnabled());handler.postDelayed(this,3000);}}};
     private final Runnable networkSpeedRefresh=new Runnable(){@Override public void run(){if(destroyed||tab!=2)return;long now=SystemClock.elapsedRealtime(),rx=android.net.TrafficStats.getUidRxBytes(getApplicationInfo().uid),tx=android.net.TrafficStats.getUidTxBytes(getApplicationInfo().uid);if(networkSpeedStatus!=null&&rx>=0&&tx>=0){String rate="当前网速：采样中";if(trafficSampleAt>0&&now>trafficSampleAt){long bps=((rx-trafficSampleRx)+(tx-trafficSampleTx))*1000/(now-trafficSampleAt);rate="当前网速："+size(Math.max(0,bps))+"/秒";}networkSpeedStatus.setText(rate);}trafficSampleRx=rx;trafficSampleTx=tx;trafficSampleAt=now;handler.postDelayed(this,1000);}};
 
     @Override public void onCreate(Bundle saved){
@@ -447,13 +447,19 @@ public final class MainActivity extends Activity {
         sheet.body.addView(ui.text("节点名称",12,INK,true));EditText name=ui.input("例如：我的手机",settings.getString("name",android.os.Build.MODEL));sheet.body.addView(name,ui.top(7));
         sheet.body.addView(ui.text("Hub HTTPS 地址",12,INK,true),ui.top(16));EditText hub=ui.input("https://hub.example.com",settings.getString("hub",prefs.getString("server_url","")));sheet.body.addView(hub,ui.top(7));
         sheet.body.addView(ui.text("这台手机已由主人授权，启动节点无需再输入密钥。",12,GREEN,false),ui.top(16));
-        TextView state=ui.text(ResourceNodeService.status,12,MUTED,false);sheet.body.addView(state,ui.top(13));
+        Switch indexSync=new Switch(this);indexSync.setText("将手机索引加入统一检索");indexSync.setChecked(settings.getBoolean("index_enabled",false));sheet.body.addView(indexSync,ui.top(16));
+        EditText indexKey=ui.input("已有云库的恢复密钥（64 位；留空保留已存密钥）","");indexKey.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);sheet.body.addView(indexKey,ui.top(7));
+        sheet.body.addView(ui.text("启用后每 20 秒发送待发布变更，只发布加密索引，不上传原件。扫描、标签和归组修改会写入可恢复队列；此处会显示待发布数量。请使用电脑云层中的恢复密钥；密钥由 Android Keystore 保护。停用不会撤回其他设备已收到的目录。",12,MUTED,false),ui.top(9));
+        TextView state=ui.text(ResourceNodeService.status+"\n"+LocalIndexPublisher.status,12,MUTED,false);sheet.body.addView(state,ui.top(13));
         sheet.footer.addView(ui.button(ResourceNodeService.running?"保存并重启资源节点":"启动资源节点",true,()->{
             String h=hub.getText().toString().trim(),n=name.getText().toString().trim(),t=savedToken;
             if(paired&&!h.replaceAll("/+$","").equals(settings.getString("hub",""))){state.setText("更换 Hub 请先在家中资源库为这台手机重新授权");state.setTextColor(RED);return;}
             if(!validCloudAddress(h)||n.isEmpty()||n.length()>80||t.length()<32||t.contains("\r")||t.contains("\n")){state.setText("请先通过主人密码授权手机，再检查 Hub 地址和节点名称");state.setTextColor(RED);return;}
             String protectedToken;try{protectedToken=CloudSecretStore.protect(t);}catch(Exception ex){state.setText("无法保存节点密钥："+message(ex));state.setTextColor(RED);return;}
-            settings.edit().putString("hub",h.replaceAll("/+$","")).putString("name",n).putString("token",protectedToken).apply();
+            String protectedIndexKey=settings.getString("index_key","");
+            try{String supplied=indexKey.getText().toString().trim();if(!supplied.isEmpty()){LocalIndexCrypto.key(supplied);protectedIndexKey=CloudSecretStore.protect(supplied);}else if(indexSync.isChecked())LocalIndexCrypto.key(CloudSecretStore.read(settings,"index_key"));}
+            catch(Exception ex){state.setText("无法启用索引同步："+message(ex));state.setTextColor(RED);return;}
+            settings.edit().putString("hub",h.replaceAll("/+$","")).putString("name",n).putString("token",protectedToken).putBoolean("index_enabled",indexSync.isChecked()).putString("index_key",protectedIndexKey).apply();
             stopService(new Intent(this,ResourceNodeService.class));
             handler.postDelayed(()->{startForegroundService(new Intent(this,ResourceNodeService.class));if(tab==2)handler.postDelayed(this::render,500);},400);sheet.close();
         }));

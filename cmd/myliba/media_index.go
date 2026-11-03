@@ -908,9 +908,10 @@ func (s *server) backfillMediaAssets() {
 }
 
 type indexedLocation struct {
-	NodeID    string `json:"nodeId"`
-	StorageID string `json:"storageId"`
-	Path      string `json:"path"`
+	NodeID      string `json:"nodeId"`
+	StorageID   string `json:"storageId"`
+	Path        string `json:"path,omitempty"`
+	ResourceRef string `json:"resourceRef,omitempty"`
 }
 
 type indexedCloudContent struct {
@@ -934,6 +935,7 @@ type indexedAsset struct {
 }
 
 type fileIndexView struct {
+	Deleted           bool           `json:"deleted,omitempty"`
 	FolderID          string         `json:"folderId,omitempty"`
 	FolderName        string         `json:"folderName,omitempty"`
 	OrganizationKnown bool           `json:"organizationKnown,omitempty"`
@@ -1127,7 +1129,7 @@ func mergeIndexedLocations(existing, more []indexedLocation) []indexedLocation {
 	for _, location := range more {
 		found := false
 		for _, current := range existing {
-			if current.NodeID == location.NodeID && current.StorageID == location.StorageID && current.Path == location.Path {
+			if current.NodeID == location.NodeID && current.StorageID == location.StorageID && current.Path == location.Path && current.ResourceRef == location.ResourceRef {
 				found = true
 				break
 			}

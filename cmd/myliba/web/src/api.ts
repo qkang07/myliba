@@ -357,7 +357,7 @@ export function login(password: string) {
 
 export interface CloudFile {
   localOnly?: boolean;
-  locations?: Array<{ nodeId: string; storageId: string; path: string }>;
+  locations?: Array<{ nodeId: string; storageId: string; path?: string; resourceRef?: string }>;
   tags?: string[];
   folderId?: string;
   folderName?: string;

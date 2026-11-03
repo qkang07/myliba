@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { Cloud, Download, LoaderCircle, Play, RefreshCw, Upload, X } from "@lucide/vue";
+import { Cloud, Download, ExternalLink, LoaderCircle, Play, RefreshCw, Upload, X } from "@lucide/vue";
 import StreamingVideo from "./StreamingVideo.vue";
 import {
-  diagnoseCloudPeer, getCloudFile, getCloudFiles, getCloudRecovery, getCloudVersions, getResource, importCloudRecovery,
+  diagnoseCloudPeer, getCloudFile, getCloudFiles, getCloudRecovery, getCloudVersions, getResource, importCloudRecovery, selectResourceNode,
   speedTestCloudPeer, uploadResourceToCloud, type CloudFile, type CloudPeerDiagnosis, type CloudSpeedTest, type CloudView, type Resource,
 } from "./api";
 
@@ -57,6 +57,29 @@ async function upload(resource: Resource) {
 }
 function cloudMembership(resource: Resource) {
   return view.value.files.find((file) => !file.localOnly && (file.id === resource.id || file.sourceId === resource.id));
+}
+function readableLocation(file: CloudFile) {
+  return file.locations?.find((location) => location.nodeId && location.resourceRef);
+}
+async function openDeviceFile(file: CloudFile) {
+  const location = readableLocation(file);
+  if (!location?.resourceRef) return;
+  if (!props.remote) {
+    error.value = "请从 Hub 资源库打开此文件；来源设备路径不会暴露给本机索引。";
+    return;
+  }
+  activeDownload.value = file.id;
+  try {
+    await selectResourceNode(location.nodeId);
+    try { window.localStorage.setItem("myliba:selected-resource-node", location.nodeId); } catch { /* Session state remains authoritative. */ }
+    const target = new URL(window.location.href);
+    target.searchParams.delete("folder");
+    target.searchParams.set("resource", location.resourceRef);
+    window.location.replace(target.href);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "无法连接来源设备";
+    activeDownload.value = "";
+  }
 }
 async function download(id: string, name: string, revisionId?: string) {
   if (activeDownload.value) return;
@@ -229,13 +252,14 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); closePreview(); });
           <p v-else-if="!view.files.length">尚无已同步的文件。设备发布索引或文件加入云层后会显示在这里。</p>
           <p v-else-if="!matchingFiles.length">没有匹配的已同步文件。</p>
           <template v-for="file in matchingFiles" :key="file.id">
-          <p v-if="file.localOnly">仅设备索引 · 未存入云层。请切换到来源设备读取原件。</p>
-          <p v-for="location in file.locations || []" :key="location.nodeId + location.path">来源设备 {{ location.nodeId }} · {{ location.path }}</p>
+          <p v-if="file.localOnly">仅设备索引 · 未存入云层。{{ remote ? '来源设备在线时可直接打开。' : '请从 Hub 资源库连接来源设备。' }}</p>
+          <p v-for="location in file.locations || []" :key="location.nodeId + (location.resourceRef || location.path || '')">来源设备 {{ location.nodeId }}{{ location.resourceRef ? ' · 可解析' : ' · 旧索引需重新同步' }}</p>
           <p v-if="file.folderName || file.tags?.length">{{ file.folderName ? '文件夹：' + file.folderName : '未归组' }}<span v-if="file.tags?.length"> · 标签：{{ file.tags.join('、') }}</span></p>
           <div class="hub-profile-row">
             <div><strong>{{ file.name }}</strong><small v-if="!file.localOnly">文件总大小 {{ formatSize(file.size) }} · 原件 {{ formatSize(file.originalSize ?? file.size) }} · {{ file.chunks }} 块 · {{ file.replicas ?? file.minReplicas }} 份副本 · {{ file.availableReplicas ?? "—" }} 份可用（60 秒内端点探测） · {{ file.history ? "保留历史" : "无历史" }}</small><small v-else>文件大小 {{ formatSize(file.originalSize) }} · {{ file.locations?.length || 0 }} 处已记录的原件位置</small></div>
             <button v-if="previewKind(file)" class="button button-secondary" type="button" :disabled="!!activeDownload" @click="preview(file)"><LoaderCircle v-if="activeDownload === file.id" class="spin" :size="14" /><Play v-else :size="14" />{{ activeDownload === file.id ? "读取中" : activeVideo === file.id || activePreview?.fileID === file.id ? "收起预览" : "预览" }}</button>
             <button v-if="file.history" class="button button-secondary" type="button" @click="toggleVersions(file.id)">历史</button>
+            <button v-if="remote && file.localOnly && readableLocation(file)" class="button button-secondary" type="button" :disabled="!!activeDownload" @click="openDeviceFile(file)"><ExternalLink :size="14" />打开来源</button>
             <button v-if="!file.localOnly" class="button button-secondary" type="button" :disabled="!!activeDownload" @click="download(file.id, file.name)">
               <LoaderCircle v-if="activeDownload === file.id" class="spin" :size="14" /><Download v-else :size="14" />下载
             </button>

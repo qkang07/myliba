@@ -43,9 +43,9 @@ final class NodeResourceApi {
     private static int integer(String raw,int fallback,int min,int max){try{int value=Integer.parseInt(raw);return Math.max(min,Math.min(max,value));}catch(Exception ex){return fallback;}}
     private static String kind(LocalLibrary.Item item){return LibraryStore.kind(item.name,item.mime);}
     private JSONObject resource(LocalLibrary.Item item)throws Exception{
-        return new JSONObject().put("id",id(item.uri)).put("name",item.name).put("path",item.path)
+        return new JSONObject().put("id",id(item.uri)).put("fileId",item.fileId).put("resourceRef",id(item.uri)).put("name",item.name).put("path",item.path)
             .put("size",item.size).put("contentSize",item.size).put("modified",Instant.ofEpochMilli(item.modified).toString())
-            .put("kind",kind(item)).put("available",true).put("versionId","").put("folderId",item.folderId==null?"":item.folderId)
+            .put("kind",kind(item)).put("available",true).put("versionId",item.revisionId).put("folderId",item.folderId==null?"":item.folderId)
             .put("tags",new JSONArray(db.tags(item.uri))).put("attributeTags",new JSONArray());
     }
     private static LocalFilters filters(Uri uri){
