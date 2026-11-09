@@ -649,7 +649,7 @@ func (h *remoteHub) send(conn *websocket.Conn, message wireMessage) error {
 }
 
 func filteredHeaders(headers http.Header, response bool) http.Header {
-	allowed := map[string]bool{"Content-Type": true, "Range": true, "If-Modified-Since": true, "If-None-Match": true, "X-Myliba-Share-Key": true, "X-Myliba-Folder-Access": true}
+	allowed := map[string]bool{"Content-Type": true, "Range": true, "If-Modified-Since": true, "If-None-Match": true, "X-Myliba-Share-Key": true, "X-Myliba-Folder-Access": true, "X-Myliba-Library-Read": true}
 	if response {
 		allowed = map[string]bool{"Content-Type": true, "Content-Disposition": true, "Content-Length": true, "Content-Range": true, "Accept-Ranges": true, "Last-Modified": true, "Etag": true, "Cache-Control": true, "Content-Security-Policy": true}
 	}
@@ -716,9 +716,53 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet || method == http.MethodPost
 	case len(parts) == 3 && parts[1] == "cloud" && parts[2] == "files":
 		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "library" && parts[2] == "search":
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "library" && parts[2] == "offline-index":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "library" && parts[2] == "snapshots" && parts[3] == "status":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "library" && parts[2] == "cleanup" && parts[3] == "plan":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "library" && parts[2] == "cleanup" && parts[3] == "execute":
+		return method == http.MethodPost
+	case len(parts) == 5 && parts[1] == "library" && parts[2] == "read" && (parts[4] == "file" || parts[4] == "thumbnail" || parts[4] == "video-preview"):
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "library" && parts[2] == "legacy-folders":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "library" && parts[2] == "legacy-folders" && parts[3] == "merge":
+		return method == http.MethodPost
+	case len(parts) == 3 && parts[1] == "library" && parts[2] == "members":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "library" && parts[2] == "members" && parts[3] == "rejoin":
+		return method == http.MethodPost
+	case len(parts) == 5 && parts[1] == "library" && parts[2] == "members" && parts[4] == "retire":
+		return method == http.MethodPost
+	case len(parts) == 3 && parts[1] == "library" && parts[2] == "queries":
+		return method == http.MethodGet || method == http.MethodPost
+	case len(parts) == 4 && parts[1] == "library" && parts[2] == "queries":
+		return method == http.MethodPut || method == http.MethodDelete
+	case len(parts) == 5 && parts[1] == "library" && parts[2] == "files" && (parts[4] == "resolve" || parts[4] == "stream-session"):
+		return method == http.MethodPost
+	case len(parts) == 5 && parts[1] == "library" && parts[2] == "files" && (parts[4] == "release-check" || parts[4] == "release"):
+		return method == http.MethodPost
+	case len(parts) == 5 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "original":
+		return method == http.MethodPost
+	case len(parts) == 6 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "original" && parts[5] == "chunk":
+		return method == http.MethodPut
+	case len(parts) == 3 && parts[1] == "cloud" && parts[2] == "transfers":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "cloud" && parts[2] == "transfers":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "cloud" && parts[2] == "recovery" && parts[3] == "attest":
+		return method == http.MethodPost
+	case len(parts) == 4 && parts[1] == "cloud" && parts[2] == "recovery" && parts[3] == "status":
+		return method == http.MethodGet
 	case len(parts) == 5 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "file":
 		return method == http.MethodGet
 	case len(parts) == 8 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "assets" && parts[6] == "parts":
+		return method == http.MethodGet
+	case len(parts) == 10 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "versions" && parts[6] == "assets" && parts[8] == "parts":
 		return method == http.MethodGet
 	case len(parts) == 6 && parts[1] == "cloud" && parts[2] == "files" && parts[4] == "video":
 		return method == http.MethodGet
@@ -819,8 +863,11 @@ func hubRelayContentPath(path string) bool {
 	if parts[1] == "resources" {
 		return parts[3] == "file" || parts[3] == "thumbnail" || parts[3] == "video-preview" || parts[3] == "video" && len(parts) > 5
 	}
+	if parts[1] == "library" && len(parts) == 5 && parts[2] == "read" {
+		return parts[4] == "file" || parts[4] == "thumbnail" || parts[4] == "video-preview"
+	}
 	if parts[1] == "cloud" && len(parts) >= 5 && parts[2] == "files" {
-		return parts[4] == "file" || parts[4] == "assets" || parts[4] == "video" && len(parts) > 6 || parts[4] == "versions" && len(parts) > 6 && parts[6] == "file"
+		return parts[4] == "file" || parts[4] == "assets" || parts[4] == "video" && len(parts) > 6 || parts[4] == "versions" && len(parts) > 6 && (parts[6] == "file" || parts[6] == "assets" && len(parts) == 10)
 	}
 	return false
 }

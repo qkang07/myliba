@@ -50,13 +50,14 @@ function initialize(): Promise<void> {
   return initialized;
 }
 
-export async function openVirtualMedia(resourceID: string, options: { cloud?: boolean; shareKey?: string } = {}): Promise<{ url: string; close: () => void }> {
+export async function openVirtualMedia(resourceID: string, options: { cloud?: boolean; shareKey?: string; streamToken?: string } = {}): Promise<{ url: string; close: () => void }> {
   await initialize();
   const token = crypto.randomUUID();
   const path = options.cloud ? `/api/cloud/files/${encodeURIComponent(resourceID)}/file` : options.shareKey ? `/api/shares/${encodeURIComponent(resourceID)}/file` : fileURL(resourceID);
+  const streamHeaders: Record<string, string> = options.streamToken ? { "X-Myliba-Library-Read": options.streamToken } : {};
   const source: Source = { read: (range, signal) => options.shareKey
     ? webRTCFetch(path, { signal, headers: { Range: range, "X-Myliba-Share-Key": options.shareKey } })
-    : apiFetch(path, { signal, headers: { Range: range } }), controllers: new Set() };
+    : apiFetch(path, { signal, headers: { Range: range, ...streamHeaders } }), controllers: new Set() };
   sources.set(token, source);
   return { url: `/__myliba_media/${token}`, close: () => { sources.delete(token); for (const abort of source.controllers) abort.abort(); } };
 }

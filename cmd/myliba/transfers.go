@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"errors"
 	"io"
 	"net/http"
@@ -8,15 +9,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const transferChunkLimit = 1 << 20
 
 type transferEntry struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-	Dir  bool   `json:"dir"`
-	Size int64  `json:"size"`
+	Name       string   `json:"name"`
+	Path       string   `json:"path"`
+	Dir        bool     `json:"dir"`
+	Size       int64    `json:"size"`
+	FileID     string   `json:"fileId,omitempty"`
+	RevisionID string   `json:"revisionId,omitempty"`
+	FolderName string   `json:"folderName,omitempty"`
+	Tags       []string `json:"tags,omitempty"`
 }
 
 func (s *server) transferBrowse(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +60,11 @@ func (s *server) transferBrowse(w http.ResponseWriter, r *http.Request) {
 		if err != nil || (!child.IsDir() && !child.Mode().IsRegular()) {
 			continue
 		}
-		entries = append(entries, transferEntry{Name: item.Name(), Path: filepath.Join(path, item.Name()), Dir: child.IsDir(), Size: child.Size()})
+		entry := transferEntry{Name: item.Name(), Path: filepath.Join(path, item.Name()), Dir: child.IsDir(), Size: child.Size()}
+		if !entry.Dir {
+			s.transferEntryIdentity(&entry)
+		}
+		entries = append(entries, entry)
 	}
 	parent := filepath.Dir(path)
 	if parent == path {
@@ -63,6 +73,34 @@ func (s *server) transferBrowse(w http.ResponseWriter, r *http.Request) {
 		parent = ""
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"current": path, "parent": parent, "roots": []any{}, "entries": entries})
+}
+
+// transferEntryIdentity exposes no path beyond the already-authorized browse
+// response. It supplies an optional P2 envelope for a peer that understands
+// logical identities; unindexed files remain transferable as ordinary files.
+func (s *server) transferEntryIdentity(entry *transferEntry) {
+	var resourceID string
+	if err := s.db.QueryRow(`SELECT id FROM resources WHERE path=?`, entry.Path).Scan(&resourceID); err != nil {
+		return
+	}
+	fileID, err := s.unifiedFileID(resourceID)
+	if err != nil {
+		return
+	}
+	entry.FileID = fileID
+	_ = s.db.QueryRow(`SELECT current_version_id FROM resources WHERE id=?`, resourceID).Scan(&entry.RevisionID)
+	_ = s.db.QueryRow(`SELECT f.name FROM resource_folders rf JOIN folders f ON f.id=rf.folder_id WHERE rf.resource_id=?`, resourceID).Scan(&entry.FolderName)
+	rows, err := s.db.Query(`SELECT t.name FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id WHERE rt.resource_id=? ORDER BY t.name COLLATE NOCASE`, resourceID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tag string
+		if rows.Scan(&tag) == nil {
+			entry.Tags = append(entry.Tags, tag)
+		}
+	}
 }
 
 func (s *server) transferFile(w http.ResponseWriter, r *http.Request) {
@@ -186,8 +224,140 @@ func (s *server) transferWriteChunk(w http.ResponseWriter, r *http.Request, path
 			writeError(w, http.StatusInternalServerError, "文件已写入，但临时文件清理失败")
 			return
 		}
+		if fileID := strings.TrimSpace(r.URL.Query().Get("fileId")); fileID != "" {
+			if err := s.registerTransferredFile(path, fileID, strings.TrimSpace(r.URL.Query().Get("revisionId")), strings.TrimSpace(r.URL.Query().Get("folderName")), r.URL.Query()["tag"]); err != nil {
+				writeError(w, http.StatusInternalServerError, "文件已写入，但无法登记统一索引："+err.Error())
+				return
+			}
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// registerTransferredFile creates a new local location for an existing logical
+// file. The incoming folder/tag values are an initial snapshot only: if this
+// logical file is already known locally, its local classification wins until
+// P3's causal operation protocol is available.
+func (s *server) registerTransferredFile(path, fileID, revisionID, folderName string, tags []string) error {
+	if !validTransferIdentity(fileID) || !validTransferIdentity(revisionID) {
+		return errors.New("传输身份无效")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("目标文件不可用")
+	}
+	var rootID string
+	rows, err := s.db.Query(`SELECT id,path FROM roots`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, root string
+		if err := rows.Scan(&id, &root); err == nil && pathWithin(path, root) {
+			rootID = id
+			break
+		}
+	}
+	rows.Close()
+	if rootID == "" {
+		return errors.New("目标目录不属于资源根目录")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	resourceID := newID()
+	resourceVersionID := revisionID
+	var existingVersion string
+	if err = tx.QueryRow(`SELECT id FROM versions WHERE id=?`, resourceVersionID).Scan(&existingVersion); err == nil {
+		resourceVersionID = newID()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	stamp := now()
+	modified := info.ModTime().UTC().Format(time.RFC3339Nano)
+	physicalID := localFileID(path)
+	if _, err = tx.Exec(`INSERT INTO resources(id,root_id,path,file_id,current_version_id,name,size,modified_at,kind,available,first_seen_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?,?,?,1,?,?)`, resourceID, rootID, path, physicalID, resourceVersionID, filepath.Base(path), info.Size(), modified, fileKind(path), stamp, stamp); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO versions(id,resource_id,size,modified_at,discovered_at) VALUES(?,?,?,?,?)`, resourceVersionID, resourceID, info.Size(), modified, stamp); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO library_files(file_id,created_at,updated_at) VALUES(?,?,?) ON CONFLICT(file_id) DO UPDATE SET updated_at=excluded.updated_at`, fileID, stamp, stamp); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE library_resource_aliases SET file_id=? WHERE resource_id=?`, fileID, resourceID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO library_revisions(revision_id,file_id,resource_version_id,size,modified_at,created_at) VALUES(?,?,?,?,?,?)`, revisionID, fileID, resourceVersionID, info.Size(), modified, stamp); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO library_locations(location_id,file_id,revision_id,resource_id,storage_id,resource_ref,state,updated_at)
+		VALUES(?,?,?,?,?,?, 'available',?)`, "legacy-resource:"+resourceID, fileID, revisionID, resourceID, rootID, path, stamp); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM resource_fts WHERE resource_id=?`, resourceID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO resource_fts(resource_id,name,path) VALUES(?,?,?)`, resourceID, filepath.Base(path), path); err != nil {
+		return err
+	}
+	var classified int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM library_file_folders WHERE file_id=?`, fileID).Scan(&classified); err != nil {
+		return err
+	}
+	if classified == 0 {
+		var tagCount int
+		if err = tx.QueryRow(`SELECT COUNT(*) FROM library_file_tags WHERE file_id=?`, fileID).Scan(&tagCount); err != nil {
+			return err
+		}
+		classified = tagCount
+	}
+	if classified == 0 {
+		if err = applyTransferredClassification(tx, resourceID, folderName, tags, stamp); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func validTransferIdentity(value string) bool {
+	return value != "" && len(value) <= 160 && !strings.ContainsRune(value, '\x00')
+}
+
+func applyTransferredClassification(tx *sql.Tx, resourceID, folderName string, tags []string, stamp string) error {
+	folderName = strings.TrimSpace(folderName)
+	if folderName != "" && len([]rune(folderName)) <= 80 {
+		folderID := newID()
+		if _, err := tx.Exec(`INSERT INTO folders(id,name,created_at,password_hash) VALUES(?,?,?,'') ON CONFLICT(name) DO NOTHING`, folderID, folderName, stamp); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT id FROM folders WHERE name=?`, folderName).Scan(&folderID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO resource_folders(resource_id,folder_id) VALUES(?,?)`, resourceID, folderID); err != nil {
+			return err
+		}
+	}
+	for _, name := range tags {
+		name = strings.TrimSpace(name)
+		if name == "" || len([]rune(name)) > 40 {
+			continue
+		}
+		tagID := newID()
+		if _, err := tx.Exec(`INSERT INTO tags(id,name,created_at) VALUES(?,?,?) ON CONFLICT(name) DO NOTHING`, tagID, name, stamp); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT id FROM tags WHERE name=?`, name).Scan(&tagID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO resource_tags(resource_id,tag_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING`, resourceID, tagID, stamp); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *server) transferCancel(w http.ResponseWriter, r *http.Request, path string) {

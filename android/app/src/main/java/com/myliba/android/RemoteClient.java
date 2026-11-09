@@ -72,11 +72,17 @@ final class RemoteClient {
         rtc.configure(cookie,result.optJSONArray("iceServers"));rtcConfigured=true;if(result.optBoolean("nodeOnline"))rtc.connectAsync();
     }
     JSONArray array(String path)throws Exception{
-        String s=new String(bytes("GET",path,null,8*1024*1024),StandardCharsets.UTF_8);
+        byte[] data;
+        try{data=bytes("GET",path,null,8*1024*1024);}
+        catch(Failure ex){if(ex.status!=401)throw ex;deviceSession();data=bytes("GET",path,null,8*1024*1024);}
+        String s=new String(data,StandardCharsets.UTF_8);
         if(s.trim().startsWith("["))return new JSONArray(s);
         JSONArray list=new JSONObject(s).optJSONArray("items");return list==null?new JSONArray():list;
     }
     byte[] bytes(String method,String path,JSONObject body,int max)throws Exception{
+        return bytes(method,path,body,max,"");
+    }
+    byte[] bytes(String method,String path,JSONObject body,int max,String readTicket)throws Exception{
         if(!path.startsWith("/api/session")&&!path.startsWith("/api/hub/")&&(contentPath(path)||rtc.connected())){
             boolean directRequired=contentPath(path);
             if(directRequired&&!rtcConfigured)json("GET","/api/session",null);
@@ -84,6 +90,7 @@ final class RemoteClient {
             try{
                 JSONObject requestHeaders=new JSONObject();String accessId=folderAccessId,accessToken=folderAccessToken;
                 if(!accessId.isEmpty()&&!accessToken.isEmpty())requestHeaders.put("X-Myliba-Folder-Access",new JSONArray().put(accessToken));
+                if(!readTicket.isEmpty())requestHeaders.put("X-Myliba-Library-Read",new JSONArray().put(readTicket));
                 RemoteRTC.Reply reply=rtc.fetch(method,path,payload,requestHeaders,max);
                 if(reply.status<200||reply.status>=300)throw failure(reply.status,reply.body);
                 return reply.body;
@@ -96,6 +103,7 @@ final class RemoteClient {
             c.setRequestProperty("Origin",base);c.setRequestProperty("Referer",base+"/");c.setRequestProperty("Accept","application/json, image/*");
             if(!cookie.isEmpty())c.setRequestProperty("Cookie",cookie);
             String activeFolderToken=folderAccessToken;if(!activeFolderToken.isEmpty())c.setRequestProperty("X-Myliba-Folder-Access",activeFolderToken);
+            if(!readTicket.isEmpty())c.setRequestProperty("X-Myliba-Library-Read",readTicket);
             if(body!=null){c.setDoOutput(true);c.setRequestProperty("Content-Type","application/json; charset=utf-8");try(OutputStream out=c.getOutputStream()){out.write(body.toString().getBytes(StandardCharsets.UTF_8));}}
             int status=c.getResponseCode();String set=c.getHeaderField("Set-Cookie");
             if(set!=null&&!set.isEmpty()){cookie=set.split(";",2)[0];if(base.equals(prefs.getString("server_url","")))try{prefs.edit().putString("server_cookie",CloudSecretStore.protect(cookie)).apply();}catch(Exception ex){throw new IOException("无法安全保存登录会话",ex);}}
@@ -105,15 +113,35 @@ final class RemoteClient {
         }finally{c.disconnect();}
     }
     void download(String path,OutputStream out)throws Exception{
-        streamFile(path,null,out,(status,headers)->{if(status<200||status>=300)throw new Failure(status,"文件传输失败（"+status+"）");});
+        download(path,out,"");
+    }
+    // Sends a raw (non-JSON) request body strictly over the P2P RTC data channel.
+    // Original-upload chunks are plaintext and must never relay through the Hub
+    // (docs/unified-library-design.md §10.1), so there is no HTTPS fallback here.
+    byte[] rtcRaw(String method,String path,byte[] body,int max)throws Exception{
+        if(!rtcConfigured)json("GET","/api/session",null);
+        rtc.ensureConnected();
+        JSONObject headers=new JSONObject();
+        String accessId=folderAccessId,accessToken=folderAccessToken;
+        if(!accessId.isEmpty()&&!accessToken.isEmpty())headers.put("X-Myliba-Folder-Access",new JSONArray().put(accessToken));
+        RemoteRTC.Reply reply=rtc.fetch(method,path,body,headers,max);
+        if(reply.status<200||reply.status>=300)throw failure(reply.status,reply.body);
+        return reply.body;
+    }
+    void download(String path,OutputStream out,String readTicket)throws Exception{
+        streamFile(path,null,out,(status,headers)->{if(status<200||status>=300)throw new Failure(status,"文件传输失败（"+status+"）");},null,readTicket);
     }
     void streamFile(String path,String range,OutputStream out,RemoteRTC.ResponseStart start)throws Exception{
         streamFile(path,range,out,start,null);
     }
     void streamFile(String path,String range,OutputStream out,RemoteRTC.ResponseStart start,java.util.concurrent.atomic.AtomicBoolean cancelled)throws Exception{
+        streamFile(path,range,out,start,cancelled,"");
+    }
+    private void streamFile(String path,String range,OutputStream out,RemoteRTC.ResponseStart start,java.util.concurrent.atomic.AtomicBoolean cancelled,String readTicket)throws Exception{
         if(!rtcConfigured)json("GET","/api/session",null);
-        try{rtc.ensureConnected();}catch(Exception ex){if(cancelled!=null&&cancelled.get())throw ex;AppLog.info("Remote media falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start,cancelled);return;}
+        try{rtc.ensureConnected();}catch(Exception ex){if(cancelled!=null&&cancelled.get())throw ex;AppLog.info("Remote media falling back to limited Hub relay: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start,cancelled,readTicket);return;}
         JSONObject headers=new JSONObject();if(range!=null&&!range.isEmpty())headers.put("Range",new JSONArray().put(range));
+        if(!readTicket.isEmpty())headers.put("X-Myliba-Library-Read",new JSONArray().put(readTicket));
         final int[] statusCode={0};
         final long[] forwarded={0};
         OutputStream counted=new OutputStream(){
@@ -126,12 +154,15 @@ final class RemoteClient {
                 statusCode[0]=status;
                 if(status<500){started[0]=true;if(start!=null)start.onStart(status,responseHeadersValue);}
             },cancelled);
-            if(reply.status>=500&&!started[0]){AppLog.info("Remote media falling back to limited Hub relay after RTC HTTP "+reply.status);streamFromHub(path,range,out,start,cancelled);}
+            if(reply.status>=500&&!started[0]){AppLog.info("Remote media falling back to limited Hub relay after RTC HTTP "+reply.status);streamFromHub(path,range,out,start,cancelled,readTicket);}
             else if(!started[0]&&start!=null)start.onStart(reply.status,reply.headers);
         }
-        catch(Exception ex){if((cancelled!=null&&cancelled.get())||forwarded[0]>0||started[0])throw ex;AppLog.info("Remote media falling back to limited Hub relay after RTC content failure: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start,cancelled);}
+        catch(Exception ex){if((cancelled!=null&&cancelled.get())||forwarded[0]>0||started[0])throw ex;AppLog.info("Remote media falling back to limited Hub relay after RTC content failure: "+ex.getClass().getSimpleName());streamFromHub(path,range,out,start,cancelled,readTicket);}
     }
     private void streamFromHub(String path,String range,OutputStream out,RemoteRTC.ResponseStart start,java.util.concurrent.atomic.AtomicBoolean cancelled)throws Exception{
+        streamFromHub(path,range,out,start,cancelled,"");
+    }
+    private void streamFromHub(String path,String range,OutputStream out,RemoteRTC.ResponseStart start,java.util.concurrent.atomic.AtomicBoolean cancelled,String readTicket)throws Exception{
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();
         java.util.concurrent.atomic.AtomicBoolean finished=new java.util.concurrent.atomic.AtomicBoolean();
         if(cancelled!=null){Thread watcher=new Thread(()->{while(!finished.get()&&!cancelled.get())try{Thread.sleep(100);}catch(InterruptedException ex){return;}if(cancelled.get()&&!finished.get())c.disconnect();},"media-relay-cancel");watcher.setDaemon(true);watcher.start();}
@@ -139,6 +170,7 @@ final class RemoteClient {
             c.setRequestMethod("GET");c.setConnectTimeout(12000);c.setReadTimeout(path.contains("mode=ondemand")?120000:30000);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
             c.setRequestProperty("Origin",base);c.setRequestProperty("Referer",base+"/");if(!cookie.isEmpty())c.setRequestProperty("Cookie",cookie);
             if(range!=null&&!range.isEmpty())c.setRequestProperty("Range",range);
+            if(!readTicket.isEmpty())c.setRequestProperty("X-Myliba-Library-Read",readTicket);
             int status=c.getResponseCode();if(status<200||status>=300){InputStream error=c.getErrorStream();byte[] data=new byte[0];if(error!=null){byte[] buffer=new byte[8192];int n=error.read(buffer);if(n>0)data=java.util.Arrays.copyOf(buffer,n);error.close();}if(status==401)forget();throw failure(status,data);}
             JSONObject headers=new JSONObject();for(String name:new String[]{"Content-Type","Content-Length","Content-Range","Accept-Ranges"}){String value=c.getHeaderField(name);if(value!=null)headers.put(name,new JSONArray().put(value));}
             if(start!=null)start.onStart(status,headers);
@@ -153,7 +185,7 @@ final class RemoteClient {
     String connectionDetails(){return rtc.connectionSummary();}
     void close(){rtc.close();}
     private static boolean contentPath(String path){
-        return path.matches("/api/resources/[^/]+/(file|thumbnail)(\\?.*)?")||path.matches("/api/resources/[^/]+/video/.*")||path.matches("/api/cloud/files/[^/]+/(file|assets/.*|video/.*|versions/.*/file)(\\?.*)?");
+        return path.matches("/api/library/read/[^/]+/(file|thumbnail|video-preview)(\\?.*)?")||path.matches("/api/resources/[^/]+/(file|thumbnail|video-preview)(\\?.*)?")||path.matches("/api/resources/[^/]+/video/.*")||path.matches("/api/cloud/files/[^/]+/(file|assets/.*|video/.*|versions/[^/]+/(file|assets/.*))(\\?.*)?");
     }
     private static Failure failure(int status,byte[] data){String message="服务端请求失败（"+status+"）";try{message=new JSONObject(new String(data,StandardCharsets.UTF_8)).optString("error",message);}catch(JSONException ignored){}return new Failure(status,message);}
     static JSONObject object(Object... pairs){JSONObject o=new JSONObject();try{for(int i=0;i<pairs.length;i+=2)o.put((String)pairs[i],pairs[i+1]);}catch(JSONException e){throw new IllegalArgumentException(e);}return o;}

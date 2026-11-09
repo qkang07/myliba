@@ -7,7 +7,7 @@ const folderAccessKey = (id: string) => `myliba-folder-access:${id}`;
 export function setActiveFolderAccess(id: string | null) {
   activeFolderAccessID = id || "";
 }
-const contentPath = /^\/api\/(?:resources\/[^/]+\/(?:file|thumbnail|video-preview|video\/[^/]+\/(?:init|segments\/\d+))|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/file|assets\/[^/]+\/parts\/[^/]+|video\/[^/]+\/(?:init|segments\/\d+)))(?:\?|$)/;
+const contentPath = /^\/api\/(?:library\/read\/[^/]+\/(?:file|thumbnail|video-preview)|resources\/[^/]+\/(?:file|thumbnail|video-preview|video\/[^/]+\/(?:init|segments\/\d+))|cloud\/files\/[^/]+\/(?:file|versions\/[^/]+\/(?:file|assets\/[^/]+\/parts\/[^/]+)|assets\/[^/]+\/parts\/[^/]+|video\/[^/]+\/(?:init|segments\/\d+)))(?:\?|$)/;
 
 export interface Resource {
   id: string;
@@ -199,7 +199,7 @@ export function removeResourceNode(id: string) {
   return request<void>(`/api/hub/nodes/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
-export interface TransferEntry { name: string; path: string; dir: boolean; size: number }
+export interface TransferEntry { name: string; path: string; dir: boolean; size: number; fileId?: string; revisionId?: string; folderName?: string; tags?: string[] }
 export interface TransferDirectory { current: string; currentName?: string; parent: string; roots: Array<{ name: string; path: string }>; entries: TransferEntry[] }
 
 async function transferFetch(path: string, init?: RequestInit) {
@@ -356,6 +356,7 @@ export function login(password: string) {
 }
 
 export interface CloudFile {
+	fileId?: string;
   localOnly?: boolean;
   locations?: Array<{ nodeId: string; storageId: string; path?: string; resourceRef?: string }>;
   tags?: string[];
@@ -366,10 +367,13 @@ export interface CloudFile {
   size: number;
   originalSize: number;
   modified: string;
+  ingestedAt?: string;
   history: boolean;
   sourceId?: string;
   chunks: number;
   revisionId: string;
+  revisionCount?: number;
+  currentRevision?: boolean;
   replicas?: number;
   minReplicas: number;
   availableReplicas?: number;
@@ -474,6 +478,281 @@ export async function getCloudFiles(includeDevices = false): Promise<CloudView> 
   return { ...view, peers: view.peers ?? [] };
 }
 
+export interface LibrarySearchPage {
+  items: CloudFile[];
+  total: number;
+  nextCursor: string;
+  generation: string;
+  coverage: { scope: string; deviceIndexes: boolean; generation?: string; lastCatalogAt?: string; sources?: string[]; knownNodes?: string[]; unindexedSources?: string[]; sourceLastCatalogAt?: Record<string, string>; sourceFrontiers?: Record<string, Record<string, number>>; offlineSources?: string[] };
+  jobs: Record<string, string>;
+  nodeId: string;
+  libraryId: string;
+  peers: CloudNode[];
+  peerStatus?: Record<string, CloudPeerStatus>;
+  directEndpoint: string;
+  lan?: string[];
+  facets: { folders: Array<{ id: string; name: string; count: number }>; tags: Array<{ name: string; count: number }> };
+}
+
+export interface LegacyFolderGroup { id: string; name: string; sources: string[]; count: number }
+export interface LibraryMember { nodeId: string; epoch: number; state: "active" | "retired"; updatedAt: string; lastReceiptAt: string }
+export function getLibraryMembers() { return request<{ items: LibraryMember[] }>("/api/library/members"); }
+export function retireLibraryMember(nodeId: string) { return request<{ nodeId: string; epoch: number; state: string }>(`/api/library/members/${encodeURIComponent(nodeId)}/retire`, { method: "POST" }); }
+export function rejoinLibraryMember() { return request<{ nodeId: string; epoch: number; state: string }>("/api/library/members/rejoin", { method: "POST" }); }
+export interface LibraryOfflineIndexPage { items: Array<CloudFile & { lifecycle: "active" | "trashed" }>; total: number; nextCursor: string; generation: string; libraryId: string; nodeId: string; syncedAt: string }
+export function getLibraryOfflineIndex(cursor = "") {
+  const params = new URLSearchParams({ scope: "all", limit: "200" });
+  if (cursor) params.set("cursor", cursor);
+  return request<LibraryOfflineIndexPage>(`/api/library/offline-index?${params}`);
+}
+export function getLegacyFolders() { return request<{ items: LegacyFolderGroup[] }>("/api/library/legacy-folders"); }
+export function mergeLegacyFolders(folderIds: string[], name: string) {
+  return request<{ folderId: string; name: string; files: number }>("/api/library/legacy-folders/merge", { method: "POST", body: JSON.stringify({ folderIds, name }) });
+}
+
+export function searchLibraryFiles(input: { query?: string; scope?: string; lifecycle?: "active" | "trashed"; folderId?: string; tags?: string[]; type?: "image" | "video" | "audio" | "document" | "other"; grouped?: boolean; cloudCopy?: boolean; readable?: boolean; sort?: "name_asc" | "name_desc" | "modified_desc" | "modified_asc" | "ingested_desc" | "ingested_asc"; cursor?: string; limit?: number }) {
+  const params = new URLSearchParams();
+  params.set("scope", input.scope || "all");
+  if (input.lifecycle) params.set("lifecycle", input.lifecycle);
+  if (input.query?.trim()) params.set("query", input.query.trim());
+  if (input.folderId) params.set("folderId", input.folderId);
+  if (input.type) params.set("type", input.type);
+  if (input.grouped !== undefined) params.set("grouped", String(input.grouped));
+  if (input.cloudCopy !== undefined) params.set("cloudCopy", String(input.cloudCopy));
+  if (input.readable !== undefined) params.set("readable", String(input.readable));
+  for (const tag of input.tags || []) if (tag.trim()) params.append("tag", tag.trim());
+  if (input.sort) params.set("sort", input.sort);
+  if (input.cursor) params.set("cursor", input.cursor);
+  if (input.limit) params.set("limit", String(input.limit));
+  return request<LibrarySearchPage>(`/api/library/search?${params}`);
+}
+
+export interface LibraryFileRevision {
+  revisionId: string;
+  modified: string;
+  size: number;
+  originalSize: number;
+  chunks: number;
+  replicas: number;
+  availableReplicas: number;
+  localOnly: boolean;
+  history: boolean;
+  variants: string[];
+  locations: Array<{ nodeId: string; storageId: string; path?: string; resourceRef?: string }>;
+}
+
+export interface ReleaseLocation {
+  locationId: string;
+  nodeId: string;
+  revisionId: string;
+  state: "available" | "missing";
+  resourceRef?: string;
+}
+
+export interface LibraryFileDetail {
+  fileId: string;
+  name: string;
+  currentRevisionId: string;
+  lifecycle: "active" | "trashed";
+  folderId: string;
+  folderName: string;
+  tags: string[];
+  revisions: LibraryFileRevision[];
+  locations: Array<{ nodeId: string; storageId: string; path?: string; resourceRef?: string }>;
+  releaseLocations?: ReleaseLocation[];
+  contentStatus: "readable" | "cloudMissing" | "sourceOffline" | "unavailable";
+  organizationStatus: "synced" | "conflict";
+  folderConflicts: number;
+}
+
+export function getLibraryFileDetail(fileId: string) {
+  return request<LibraryFileDetail>(`/api/library/files/${encodeURIComponent(fileId)}`);
+}
+
+export function addLibraryFileTag(fileId: string, name: string) {
+  return request<{ operationId: string; state: string }>(`/api/library/files/${encodeURIComponent(fileId)}/tags`, { method: "POST", body: JSON.stringify({ name }) });
+}
+
+export function removeLibraryFileTag(fileId: string, name: string) {
+  return request<{ operationId: string; state: string }>(`/api/library/files/${encodeURIComponent(fileId)}/tags/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
+export function moveLibraryFile(fileId: string, folderName: string) {
+  return request<{ operationId: string; state: string }>(`/api/library/files/${encodeURIComponent(fileId)}/folder`, { method: "PUT", body: JSON.stringify({ folderName }) });
+}
+
+export function renameLibraryFile(fileId: string, fileName: string, resolve = false) {
+  return request<{ operationId: string; state: string }>(`/api/library/files/${encodeURIComponent(fileId)}/name`, { method: "PUT", body: JSON.stringify({ fileName, resolve }) });
+}
+
+export function selectLibraryCurrentRevision(fileId: string, revisionId: string, resolve = false) {
+  return request<{ operationId: string; state: string }>(`/api/library/files/${encodeURIComponent(fileId)}/current-revision`, { method: "PUT", body: JSON.stringify({ revisionId, resolve }) });
+}
+
+export function setLibraryFileLifecycle(fileId: string, state: "active" | "trashed" | "deleted") {
+  return request<{ fileId: string; state: string }>(`/api/library/files/${encodeURIComponent(fileId)}/lifecycle`, { method: "POST", body: JSON.stringify({ state }) });
+}
+
+export interface LibraryReadCandidate {
+  kind: "cloud" | "device";
+  nodeId?: string;
+  resourceRef?: string;
+  objectId?: string;
+  revisionId: string;
+  available: boolean;
+  reason?: string;
+  plainHash?: string;
+  readPath?: string;
+  assetType?: "thumbnail" | "videoPreview";
+  readTicket?: string;
+}
+
+export function getLibraryReadCandidate(candidate: LibraryReadCandidate) {
+  if (!candidate.readPath?.startsWith("/api/") || candidate.readPath.includes("..")) throw new Error("读取路径无效");
+  return apiFetch(candidate.readPath, { headers: candidate.readTicket ? { "X-Myliba-Library-Read": candidate.readTicket } : {} });
+}
+
+export function resolveLibraryFile(fileId: string, revisionId: string, purpose: "original" | "preview" | "thumbnail" = "original") {
+  return request<{ fileId: string; revisionId: string; purpose: string; candidates: LibraryReadCandidate[]; reason?: string }>(`/api/library/files/${encodeURIComponent(fileId)}/resolve`, { method: "POST", body: JSON.stringify({ revisionId, purpose }) });
+}
+
+export function openLibraryStreamSession(fileId: string, candidate: LibraryReadCandidate, scope: "original" | "preview") {
+  if (!candidate.readPath?.startsWith("/api/") || candidate.readPath.includes("..") || !candidate.readTicket) throw new Error("流媒体候选无效");
+  return request<{ token: string; scope: string; expires: number }>(`/api/library/files/${encodeURIComponent(fileId)}/stream-session`, {
+    method: "POST",
+    body: JSON.stringify({ readPath: candidate.readPath, scope }),
+    headers: { "X-Myliba-Library-Read": candidate.readTicket },
+  });
+}
+
+export interface LibrarySavedQuery {
+  id: string;
+  name: string;
+  filters: { scope: string; lifecycle?: "active" | "trashed"; query: string; folderId: string; tags: string[]; type?: "image" | "video" | "audio" | "document" | "other"; grouped?: boolean; cloudCopy?: boolean; readable?: boolean; sort: "name_asc" | "name_desc" | "modified_desc" | "modified_asc" | "ingested_desc" | "ingested_asc" };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function getLibrarySavedQueries() {
+  return request<LibrarySavedQuery[]>("/api/library/queries");
+}
+
+export function createLibrarySavedQuery(name: string, filters: LibrarySavedQuery["filters"]) {
+  return request<LibrarySavedQuery>("/api/library/queries", { method: "POST", body: JSON.stringify({ name, filters }) });
+}
+
+export function deleteLibrarySavedQuery(id: string) {
+  return request<{ ok: boolean }>(`/api/library/queries/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export interface LibrarySyncStatus {
+  author: string;
+  outbox: Record<string, number>;
+  folderConflicts: number;
+  renameConflicts: number;
+  fileNameConflicts: number;
+  revisionConflicts: number;
+  frontiers: Record<string, number>;
+  receipts: Record<string, Record<string, number>>;
+  legacyImports: Record<string, { lastCatalogAt: string; count: number }>;
+  failures: Array<{ opId: string; author: string; counter: number; kind: string; error: string; createdAt: string }>;
+}
+
+export interface LibraryCleanupPlan {
+  planId: string;
+  generatedAt: string;
+  retentionDays: number;
+  eligible: Array<{ kind: "block" | "catalog" | "content"; id: string; bytes: number }>;
+  blocked: string[];
+  catalogGeneration: string;
+  snapshotFrontiers: Record<string, number>;
+  activeMembers: string[];
+}
+
+export function getLibraryCleanupPlan() { return request<LibraryCleanupPlan>("/api/library/cleanup/plan"); }
+export interface LibraryCleanupResult {
+  removedBlocks: string[];
+  removedCatalogRecords: string[];
+  removedContentRecords: string[];
+  compactedTombstones: number;
+  storageNodes: Array<{ nodeId: string; removedBlocks?: string[]; blocked?: string[]; error?: string }>;
+  sourceOriginalsRemoved: number;
+}
+export function executeLibraryCleanup(planId: string) { return request<LibraryCleanupResult>("/api/library/cleanup/execute", { method: "POST", body: JSON.stringify({ planId }) }); }
+
+export interface FolderConflict {
+  fileId: string;
+  author: string;
+  counter: number;
+  opId: string;
+  folderName: string;
+  createdAt: string;
+}
+
+export interface RenameConflict {
+  anchor: string;
+  author: string;
+  counter: number;
+  opId: string;
+  folderName: string;
+  appliedName: string;
+  createdAt: string;
+}
+
+export interface FileNameConflict {
+  fileId: string;
+  author: string;
+  counter: number;
+  opId: string;
+  fileName: string;
+  appliedName: string;
+  createdAt: string;
+}
+
+export interface RevisionConflict {
+  fileId: string;
+  author: string;
+  counter: number;
+  opId: string;
+  revisionId: string;
+  appliedRevisionId: string;
+  createdAt: string;
+}
+
+export function getLibrarySyncStatus() {
+  return request<LibrarySyncStatus>("/api/library/sync/status");
+}
+
+export function getFolderConflicts() {
+  return request<{ items: FolderConflict[] }>("/api/library/conflicts/folders");
+}
+
+export function resolveFolderConflict(fileId: string, folderName: string) {
+  return request<{ ok: boolean }>(`/api/library/conflicts/folders/${encodeURIComponent(fileId)}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ folderName }),
+  });
+}
+
+export function getRenameConflicts() {
+  return request<{ items: RenameConflict[] }>("/api/library/conflicts/renames");
+}
+
+export function resolveRenameConflict(anchor: string, folderName: string) {
+  return request<{ ok: boolean }>(`/api/library/conflicts/renames/${encodeURIComponent(anchor)}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ folderName }),
+  });
+}
+
+export function getFileNameConflicts() {
+  return request<{ items: FileNameConflict[] }>("/api/library/conflicts/file-names");
+}
+
+export function getRevisionConflicts() {
+  return request<{ items: RevisionConflict[] }>("/api/library/conflicts/revisions");
+}
+
 export function diagnoseCloudPeer(id: string) {
   return request<CloudPeerDiagnosis>(`/api/cloud/peers/${encodeURIComponent(id)}/diagnose`, { method: "POST", headers: { "X-Myliba-Local": "1" } });
 }
@@ -501,6 +780,69 @@ export function getCloudRecovery() {
 
 export function importCloudRecovery(recoveryKey: string) {
   return request<{ libraryId: string }>("/api/cloud/recovery", { method: "POST", body: JSON.stringify({ recoveryKey }), headers: { "X-Myliba-Local": "1" } });
+}
+
+export type CloudTransferState = "queued" | "reading" | "uploading" | "verifying" | "committed" | "retryableFailed" | "blocked" | "cancelled" | "deletingLocal";
+
+export interface CloudTransferTask {
+  taskId: string;
+  kind: "upload" | "release";
+  fileId: string;
+  revisionId: string;
+  objectId: string;
+  locationId: string;
+  state: CloudTransferState;
+  detail: string;
+  plainHash: string;
+  size: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function getCloudTransfers(kind?: "upload" | "release") {
+  return request<{ tasks: CloudTransferTask[] }>("/api/cloud/transfers" + (kind ? `?kind=${kind}` : ""));
+}
+
+export function getCloudTransfer(taskId: string) {
+  return request<CloudTransferTask>(`/api/cloud/transfers/${encodeURIComponent(taskId)}`);
+}
+
+export interface CloudRecoveryStatus {
+  libraryId: string;
+  selfNodeId: string;
+  independentHolder: string;
+  recoverable: boolean;
+}
+
+export function getCloudRecoveryStatus() {
+  return request<CloudRecoveryStatus>("/api/cloud/recovery/status");
+}
+
+export function selfAttestCloudRecovery() {
+  return request<{ nodeId: string; libraryId: string; verifiedAt: string; recoverable: boolean }>("/api/cloud/recovery/self-attest", { method: "POST", headers: { "X-Myliba-Local": "1" } });
+}
+
+export interface ReleaseCheck {
+  eligible: boolean;
+  reason: string;
+  fileId: string;
+  revisionId: string;
+  locationId: string;
+  nodeId: string;
+  plainHash: string;
+  domains: string[];
+  recoveryHolder: string;
+  policy: string;
+  credential?: string;
+  expires?: number;
+}
+
+export function releaseCheck(fileId: string, locationId: string, revisionId?: string) {
+  return request<ReleaseCheck>(`/api/library/files/${encodeURIComponent(fileId)}/release-check`, { method: "POST", body: JSON.stringify({ locationId, revisionId: revisionId || "" }) });
+}
+
+export function releaseOriginal(fileId: string, locationId: string, credential: string) {
+  return request<{ released: boolean; locationId: string; revisionId?: string; taskId?: string; idempotent?: boolean }>(`/api/library/files/${encodeURIComponent(fileId)}/release`, { method: "POST", body: JSON.stringify({ locationId, credential }) });
 }
 
 export function logout() {
@@ -693,11 +1035,11 @@ export function getVideoPart(id: string, quality: VideoQuality, part: "init" | n
 export function cloudVideoVariantURL(id: string, quality: VideoQuality) {
   return `/api/cloud/files/${encodeURIComponent(id)}/video/${quality}`;
 }
-export function getCloudVideoVariant(id: string, quality: VideoQuality, onDemand = false, signal?: AbortSignal) {
-  return request<VideoManifest>(cloudVideoVariantURL(id, quality) + (onDemand ? "?mode=ondemand" : ""), { signal });
+export function getCloudVideoVariant(id: string, quality: VideoQuality, onDemand = false, signal?: AbortSignal, streamToken = "") {
+  return request<VideoManifest>(cloudVideoVariantURL(id, quality) + (onDemand ? "?mode=ondemand" : ""), { signal, headers: streamToken ? { "X-Myliba-Library-Read": streamToken } : {} });
 }
-export function getCloudVideoPart(id: string, quality: VideoQuality, part: "init" | number, onDemand = false, signal?: AbortSignal) {
-  return apiFetch(`${cloudVideoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}${onDemand ? "?mode=ondemand" : ""}`, { signal });
+export function getCloudVideoPart(id: string, quality: VideoQuality, part: "init" | number, onDemand = false, signal?: AbortSignal, streamToken = "") {
+  return apiFetch(`${cloudVideoVariantURL(id, quality)}/${part === "init" ? "init" : `segments/${part}`}${onDemand ? "?mode=ondemand" : ""}`, { signal, headers: streamToken ? { "X-Myliba-Library-Read": streamToken } : {} });
 }
 
 export function removeResourceTag(id: string, tagID: string) {

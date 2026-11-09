@@ -35,6 +35,9 @@ const (
 )
 
 func (s *server) serveThumbnail(w http.ResponseWriter, r *http.Request) {
+	if s.hiddenLogicalResource(w, r.PathValue("id")) {
+		return
+	}
 	var sourcePath, kind string
 	if err := s.db.QueryRow(`SELECT path,kind FROM resources WHERE id=?`, r.PathValue("id")).Scan(&sourcePath, &kind); err != nil {
 		if err == sql.ErrNoRows {

@@ -1,6 +1,7 @@
 package com.myliba.android;
 
 import android.content.ContentResolver;
+import android.content.UriPermission;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.net.Uri;
@@ -22,6 +23,13 @@ final class TreeScanner {
 
     int scan(Uri treeUri) {
         String rootId = DocumentsContract.getTreeDocumentId(treeUri);
+        boolean authorized=false;
+        for(UriPermission grant:resolver.getPersistedUriPermissions())if(treeUri.equals(grant.getUri())&&grant.isReadPermission()){authorized=true;break;}
+        if(!authorized)throw new SecurityException("索引目录读取授权已失效，请重新授权");
+        Uri rootDocument=DocumentsContract.buildDocumentUriUsingTree(treeUri,rootId);
+        try(Cursor root=resolver.query(rootDocument,new String[]{DocumentsContract.Document.COLUMN_DOCUMENT_ID},null,null,null)){
+            if(root==null||!root.moveToFirst())throw new IllegalStateException("索引目录暂不可用，保留已收录文件身份");
+        }
         String rootUri = treeUri.toString();
         String token = UUID.randomUUID().toString();
         ArrayDeque<String[]> pending = new ArrayDeque<>();

@@ -28,6 +28,7 @@ type cloudRuntime struct {
 	disk         *cloudDisk
 	id           string
 	role         string
+	faultDomain  string
 	endpoint     string
 	db           *sql.DB
 	hubURL       string
@@ -126,7 +127,7 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 		role = "storage"
 	}
 	rt := &cloudRuntime{
-		disk: disk, id: id, role: role, endpoint: endpoint, db: db,
+		disk: disk, id: id, role: role, faultDomain: cloudFaultDomain(disk, id), endpoint: endpoint, db: db,
 		client: &http.Client{
 			Timeout:       90 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -179,6 +180,9 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 				return nil, err
 			}
 		}
+		// Direct and relayed storage endpoints share cloudDisk routes. Check
+		// admission there so neither path can bypass Hub serialization.
+		disk.catalogAdmission = rt.catalogCommittedByHub
 	}
 	return rt, nil
 }
@@ -440,6 +444,34 @@ func (c *cloudRuntime) remoteIDs(ctx context.Context, base, token string) ([]str
 }
 
 func (c *cloudRuntime) syncCatalog(ctx context.Context, base, token string) error {
+	prunedResponse, pruneErr := c.request(ctx, http.MethodGet, base, "/cloud/pruned", token, nil)
+	if pruneErr != nil {
+		return pruneErr
+	}
+	if prunedResponse.StatusCode == http.StatusOK {
+		var state struct {
+			Records []string `json:"records"`
+		}
+		pruneErr = json.NewDecoder(io.LimitReader(prunedResponse.Body, 16<<20)).Decode(&state)
+		prunedResponse.Body.Close()
+		if pruneErr != nil {
+			return pruneErr
+		}
+		for _, id := range state.Records {
+			if !validCloudHash(id) {
+				return errors.New("invalid Hub prune marker")
+			}
+			if err := c.disk.remove("catalog", id); err != nil {
+				return err
+			}
+		}
+	} else {
+		status := prunedResponse.StatusCode
+		prunedResponse.Body.Close()
+		if status != http.StatusNotFound {
+			return fmt.Errorf("Hub prune registry: HTTP %d", status)
+		}
+	}
 	remote, err := c.remoteIDs(ctx, base, token)
 	if err != nil {
 		return err
@@ -465,6 +497,9 @@ func (c *cloudRuntime) syncCatalog(ctx context.Context, base, token string) erro
 		if err == nil {
 			err = c.disk.put("catalog", id, bytes.NewReader(data), cloudMaxRecordSize)
 		}
+		if errors.Is(err, errCatalogWriterDowngrade) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -485,9 +520,34 @@ func (c *cloudRuntime) syncCatalog(ctx context.Context, base, token string) erro
 		if err != nil {
 			return err
 		}
+		if checkErr := c.disk.rejectCatalogDowngrade(data); errors.Is(checkErr, errCatalogWriterDowngrade) {
+			continue
+		} else if checkErr != nil {
+			return checkErr
+		}
 		if err := c.put(ctx, base, "catalog", id, token, data); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (c *cloudRuntime) catalogCommittedByHub(ctx context.Context, id string) error {
+	wsURL, token, err := c.credentials()
+	if err != nil || wsURL == "" || len(token) < 32 {
+		return errors.New("Hub unavailable")
+	}
+	hub, err := hubHTTPURL(wsURL)
+	if err != nil {
+		return err
+	}
+	response, err := c.request(ctx, http.MethodGet, hub, "/cloud/catalog/"+id, token, nil)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("Hub catalog admission: HTTP %d", response.StatusCode)
 	}
 	return nil
 }
@@ -545,7 +605,7 @@ func (c *cloudRuntime) peerInventory(ctx context.Context, peer cloudNode, token 
 func (c *cloudRuntime) refreshLocations(ctx context.Context, token string, peers []cloudNode) {
 	locations := map[string][]cloudNode{}
 	if ids, err := c.disk.list("blocks"); err == nil {
-		self := cloudNode{ID: c.id, Endpoint: c.endpoint, Role: c.role}
+		self := cloudNode{ID: c.id, Endpoint: c.endpoint, Role: c.role, FaultDomain: c.faultDomain}
 		for _, id := range ids {
 			locations[id] = append(locations[id], self)
 		}
@@ -636,11 +696,9 @@ func (c *cloudRuntime) syncOnce(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 	go c.probePeers(peers, token)
-	for _, peer := range peers {
-		if err := c.syncCatalog(ctx, peer.Endpoint, token); err != nil {
-			log.Printf("Cloud index sync with %s: %v", peer.ID, err)
-		}
-	}
+	// The Hub is the sole catalog authority, including during initial pairing.
+	// An unpaired client keeps its immutable local records as its outbox; direct
+	// peer catalog exchange would bypass the global writer-format gate.
 	c.refreshLocations(ctx, token, peers)
 	c.repairBlocks(ctx, token, peers)
 	return hubErr
@@ -674,7 +732,7 @@ func (c *cloudRuntime) hubPeers(ctx context.Context, hub, token string) ([]cloud
 			delete(links, id)
 		}
 	}
-	data, _ := json.Marshal(cloudNode{ID: c.id, Endpoint: endpoint, LAN: lan, LANKey: lanKey, Links: links, Relayed: cloudRelayEndpointID(c.endpoint) != "", Role: c.role, cloudStorageStats: stats})
+	data, _ := json.Marshal(cloudNode{ID: c.id, Endpoint: endpoint, LAN: lan, LANKey: lanKey, Links: links, Relayed: cloudRelayEndpointID(c.endpoint) != "", Role: c.role, FaultDomain: c.faultDomain, cloudStorageStats: stats})
 	response, err := c.request(ctx, http.MethodPost, hub, "/cloud/nodes/heartbeat", token, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -741,6 +799,7 @@ func (c *cloudRuntime) directHandler() http.Handler {
 		}
 		inner := http.NewServeMux()
 		c.disk.routesWithAuth(inner, c.authorizeCloudPeer)
+		c.cleanupRoutes(inner, c.authorizeCloudPeer)
 		if c.relayOn {
 			c.relayRoutesWithAuth(inner, c.authorizeCloudPeer)
 		}

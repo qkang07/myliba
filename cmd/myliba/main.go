@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"mime"
@@ -60,6 +61,36 @@ type resource struct {
 	AttributeTags []attributeTag `json:"attributeTags"`
 }
 
+// configureLocalLog leaves a small, durable diagnostic trail for the desktop
+// process. The Windows package is normally started without a console, so the
+// standard logger otherwise disappears precisely when a background task stalls.
+func configureLocalLog(dataDir string) {
+	file, err := os.OpenFile(filepath.Join(dataDir, "myliba.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("open local log file: %v", err)
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, file))
+	log.Printf("Myliba desktop starting; diagnostic log: %s", file.Name())
+}
+
+// The desktop database deliberately has one connection so SQLite writes are
+// serialized. If a caller leaks that connection, every later request waits in
+// database/sql. Periodic pool snapshots make such stalls diagnosable from the
+// packaged application instead of silently leaving the web UI pending.
+func monitorLocalDatabase(db *sql.DB) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var previousWaits int64
+	for range ticker.C {
+		stats := db.Stats()
+		if stats.InUse != 0 || stats.WaitCount != previousWaits {
+			log.Printf("database pool: open=%d in-use=%d idle=%d wait-count=%d wait=%s", stats.OpenConnections, stats.InUse, stats.Idle, stats.WaitCount, stats.WaitDuration)
+		}
+		previousWaits = stats.WaitCount
+	}
+}
+
 func main() {
 	if os.Getenv("MYLIBA_MODE") == "hub" {
 		if err := runHub(); err != nil {
@@ -81,12 +112,14 @@ func main() {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
+	configureLocalLog(dataDir)
 	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "library.db"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
+	go monitorLocalDatabase(db)
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`); err != nil {
 		log.Fatal(err)
 	}
@@ -146,18 +179,59 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/cloud/files", cloud.list)
+	mux.HandleFunc("GET /api/library/search", cloud.searchLibrary)
+	mux.HandleFunc("GET /api/library/offline-index", cloud.offlineLibraryIndex)
+	mux.HandleFunc("GET /api/library/legacy-folders", app.listLegacyFolders)
+	mux.HandleFunc("POST /api/library/legacy-folders/merge", app.mergeLegacyFolders)
+	mux.HandleFunc("GET /api/library/members", app.listLibraryMembers)
+	mux.HandleFunc("GET /api/library/snapshots/status", cloud.librarySnapshotStatus)
+	mux.HandleFunc("GET /api/library/cleanup/plan", cloud.libraryCleanupPlanAPI)
+	mux.HandleFunc("POST /api/library/cleanup/execute", cloud.executeLibraryCleanup)
+	mux.HandleFunc("POST /api/library/members/{nodeId}/retire", app.retireLibraryMember)
+	mux.HandleFunc("POST /api/library/members/rejoin", app.rejoinLibraryMember)
+	mux.HandleFunc("GET /api/library/files/{fileId}", cloud.libraryFileDetail)
+	mux.HandleFunc("POST /api/library/files/{fileId}/resolve", cloud.resolveLibraryFile)
+	mux.HandleFunc("POST /api/library/files/{fileId}/stream-session", cloud.openLibraryStreamSession)
+	mux.HandleFunc("GET /api/library/read/{id}/{asset}", app.serveLibraryRead)
+	mux.HandleFunc("POST /api/library/files/{fileId}/lifecycle", app.setLibraryFileLifecycle)
+	mux.HandleFunc("POST /api/library/files/{fileId}/release-check", cloud.releaseCheck)
+	mux.HandleFunc("POST /api/library/files/{fileId}/release", cloud.releaseOriginal)
+	mux.HandleFunc("POST /api/library/files/{fileId}/tags", app.addLogicalFileTag)
+	mux.HandleFunc("DELETE /api/library/files/{fileId}/tags/{tag}", app.removeLogicalFileTag)
+	mux.HandleFunc("PUT /api/library/files/{fileId}/folder", app.moveLogicalFile)
+	mux.HandleFunc("PUT /api/library/files/{fileId}/name", app.renameLogicalFile)
+	mux.HandleFunc("PUT /api/library/files/{fileId}/current-revision", app.selectCurrentRevision)
+	mux.HandleFunc("GET /api/library/queries", app.listLibrarySavedQueries)
+	mux.HandleFunc("POST /api/library/queries", app.createLibrarySavedQuery)
+	mux.HandleFunc("PUT /api/library/queries/{id}", app.updateLibrarySavedQuery)
+	mux.HandleFunc("DELETE /api/library/queries/{id}", app.deleteLibrarySavedQuery)
+	mux.HandleFunc("GET /api/library/sync/status", app.librarySyncStatus)
+	mux.HandleFunc("GET /api/library/conflicts/folders", app.libraryFolderConflicts)
+	mux.HandleFunc("POST /api/library/conflicts/folders/{fileId}/resolve", app.libraryResolveFolderConflict)
+	mux.HandleFunc("GET /api/library/conflicts/renames", app.libraryFolderRenameConflicts)
+	mux.HandleFunc("GET /api/library/conflicts/file-names", app.libraryFileNameConflicts)
+	mux.HandleFunc("GET /api/library/conflicts/revisions", app.libraryRevisionConflicts)
+	mux.HandleFunc("POST /api/library/conflicts/renames/{anchor}/resolve", app.libraryResolveFolderRenameConflict)
 	mux.HandleFunc("POST /api/cloud/peers/{id}/diagnose", cloud.diagnosePeer)
 	mux.HandleFunc("POST /api/cloud/peers/{id}/speedtest", cloud.speedTest)
 	mux.HandleFunc("GET /api/cloud/files/{id}/file", cloud.download)
 	mux.HandleFunc("GET /api/cloud/files/{id}/assets/{asset}/parts/{part}", cloud.cloudAssetPart)
+	mux.HandleFunc("GET /api/cloud/files/{id}/versions/{revision}/assets/{asset}/parts/{part}", cloud.cloudAssetPart)
 	mux.HandleFunc("GET /api/cloud/files/{id}/video/{quality}", cloud.cloudVideo)
 	mux.HandleFunc("GET /api/cloud/files/{id}/video/{quality}/init", cloud.cloudVideoPart)
 	mux.HandleFunc("GET /api/cloud/files/{id}/video/{quality}/segments/{segment}", cloud.cloudVideoPart)
 	mux.HandleFunc("GET /api/cloud/files/{id}/versions", cloud.versions)
 	mux.HandleFunc("GET /api/cloud/files/{id}/versions/{revision}/file", cloud.download)
 	mux.HandleFunc("POST /api/cloud/resources/{id}/upload", cloud.upload)
+	mux.HandleFunc("POST /api/cloud/files/{fileId}/original", cloud.uploadOriginal)
+	mux.HandleFunc("PUT /api/cloud/files/{fileId}/original/chunk", cloud.uploadOriginalChunk)
+	mux.HandleFunc("GET /api/cloud/transfers", cloud.transferTasksAPI)
+	mux.HandleFunc("GET /api/cloud/transfers/{taskId}", cloud.transferTaskAPI)
 	mux.HandleFunc("GET /api/cloud/recovery", cloud.recovery)
 	mux.HandleFunc("POST /api/cloud/recovery", cloud.recovery)
+	mux.HandleFunc("POST /api/cloud/recovery/self-attest", cloud.selfAttestRecovery)
+	mux.HandleFunc("POST /api/cloud/recovery/attest", cloud.attestRecovery)
+	mux.HandleFunc("GET /api/cloud/recovery/status", cloud.recoveryStatusAPI)
 	mux.HandleFunc("GET /api/session", localSession)
 	mux.HandleFunc("GET /api/hubs", hubs.list)
 	mux.HandleFunc("POST /api/hubs", hubs.save)
@@ -422,6 +496,9 @@ CREATE TABLE IF NOT EXISTS file_asset_locations (
 	if err == nil {
 		_, err = db.Exec(`UPDATE resources SET kind='image' WHERE lower(name) LIKE '%.arw' AND kind <> 'image'`)
 	}
+	if err == nil {
+		err = migrateUnifiedLibrary(db)
+	}
 	return err
 }
 
@@ -430,12 +507,16 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) roots(w http.ResponseWriter, _ *http.Request) {
+	started := time.Now()
+	log.Printf("local API /api/roots: database query starting")
 	rows, err := s.db.Query(`SELECT r.id, r.path, r.added_at, COALESCE(r.last_scan_at, ''), r.auto_preprocess, COUNT(x.id)
 		FROM roots r LEFT JOIN resources x ON x.root_id=r.id GROUP BY r.id ORDER BY r.added_at`)
 	if err != nil {
+		log.Printf("local API /api/roots: database query failed after %s: %v", time.Since(started), err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	log.Printf("local API /api/roots: database query acquired after %s", time.Since(started))
 	defer rows.Close()
 	result := []map[string]any{}
 	for rows.Next() {
@@ -448,6 +529,7 @@ func (s *server) roots(w http.ResponseWriter, _ *http.Request) {
 		}
 		result = append(result, map[string]any{"id": id, "path": path, "addedAt": added, "lastScanAt": scanned, "autoPreprocess": autoPreprocess, "count": count})
 	}
+	log.Printf("local API /api/roots: completed in %s", time.Since(started))
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -568,6 +650,9 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 		if _, err := s.db.Exec(`UPDATE resources SET current_version_id=? WHERE id=?`, versionID, id); err != nil {
 			return err
 		}
+		if err := s.syncUnifiedResource(id); err != nil {
+			return err
+		}
 		_, err = s.db.Exec(`DELETE FROM resource_fts WHERE resource_id=?`, id)
 		if err == nil {
 			_, err = s.db.Exec(`INSERT INTO resource_fts(resource_id,name,path) VALUES(?,?,?)`, id, filepath.Base(path), path)
@@ -608,6 +693,7 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 		rows.Close()
 		for _, id := range missing {
 			_, _ = s.db.Exec(`UPDATE resources SET available=0 WHERE id=?`, id)
+			_ = s.syncUnifiedResource(id)
 			_, _ = s.db.Exec(`DELETE FROM preprocess_jobs WHERE resource_id=? AND status IN ('pending','running')`, id)
 			if s.cloud != nil {
 				s.cloud.queueLocalIndex(id)
@@ -624,6 +710,9 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) resourceWhere(r *http.Request, excludedCategory string) ([]string, []any, error) {
 	where, args, err := resourceWhereWithoutAttributeCategory(r, excludedCategory)
+	if err == nil {
+		where = append(where, `NOT EXISTS (SELECT 1 FROM library_resource_aliases a JOIN library_file_deletions d ON d.file_id=a.file_id WHERE a.resource_id=r.id) AND NOT EXISTS (SELECT 1 FROM library_resource_aliases a JOIN library_file_lifecycle l ON l.file_id=a.file_id WHERE a.resource_id=r.id AND l.state='trashed')`)
+	}
 	if err != nil || r.URL.Query().Get("reachable") != "1" {
 		return where, args, err
 	}
@@ -866,6 +955,9 @@ func findOrCreateVersion(db *sql.DB, resourceID string, size int64, modifiedAt s
 }
 
 func (s *server) getResource(w http.ResponseWriter, r *http.Request) {
+	if s.hiddenLogicalResource(w, r.PathValue("id")) {
+		return
+	}
 	var item resource
 	err := s.db.QueryRow(`SELECT r.id,r.name,r.path,r.size,r.modified_at,r.kind,r.available,r.current_version_id,COALESCE((SELECT rf.folder_id FROM resource_folders rf WHERE rf.resource_id=r.id),'') FROM resources r WHERE r.id=?`, r.PathValue("id")).Scan(
 		&item.ID, &item.Name, &item.Path, &item.Size, &item.Modified, &item.Kind, &item.Available, &item.VersionID, &item.FolderID)
@@ -936,6 +1028,9 @@ func (s *server) videoInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) serveFile(w http.ResponseWriter, r *http.Request) {
+	if s.hiddenLogicalResource(w, r.PathValue("id")) {
+		return
+	}
 	var path string
 	if err := s.db.QueryRow(`SELECT path FROM resources WHERE id=?`, r.PathValue("id")).Scan(&path); err != nil {
 		writeError(w, http.StatusNotFound, "资源不存在")
@@ -1006,6 +1101,18 @@ func (s *server) addTag(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	fileIDs, err := logicalFileIDs(tx, []string{resourceID})
+	if err == nil {
+		token := newID()
+		err = recordLibraryOperation(tx, "tag.add", map[string]any{"fileIds": fileIDs, "tag": name, "tagToken": token})
+		if err == nil {
+			_, err = tx.Exec(`INSERT INTO library_tag_add_tokens(file_id,tag_name,token,author_id,counter,created_at) VALUES(?,?,?,'',0,?) ON CONFLICT DO NOTHING`, fileIDs[0], name, token, now())
+		}
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1058,6 +1165,22 @@ func (s *server) addTagBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	fileIDs, err := logicalFileIDs(tx, input.IDs)
+	if err == nil {
+		token := newID()
+		err = recordLibraryOperation(tx, "tag.add", map[string]any{"fileIds": fileIDs, "tag": name, "tagToken": token})
+		if err == nil {
+			for _, fileID := range fileIDs {
+				if _, err = tx.Exec(`INSERT INTO library_tag_add_tokens(file_id,tag_name,token,author_id,counter,created_at) VALUES(?,?,?,'',0,?) ON CONFLICT DO NOTHING`, fileID, name, token, now()); err != nil {
+					break
+				}
+			}
+		}
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1072,8 +1195,39 @@ func (s *server) addTagBatch(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) removeTag(w http.ResponseWriter, r *http.Request) {
 	resourceID := r.PathValue("id")
-	_, err := s.db.Exec(`DELETE FROM resource_tags WHERE resource_id=? AND tag_id=?`, resourceID, r.PathValue("tagID"))
+	tx, err := s.db.Begin()
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer tx.Rollback()
+	var name string
+	_ = tx.QueryRow(`SELECT name FROM tags WHERE id=?`, r.PathValue("tagID")).Scan(&name)
+	_, err = tx.Exec(`DELETE FROM resource_tags WHERE resource_id=? AND tag_id=?`, resourceID, r.PathValue("tagID"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	fileIDs, err := logicalFileIDs(tx, []string{resourceID})
+	if err == nil {
+		var tokens []string
+		tokens, err = observedTagTokens(tx, fileIDs, name)
+		if err == nil {
+			err = recordLibraryOperation(tx, "tag.remove", map[string]any{"fileIds": fileIDs, "tag": name, "removeTokens": tokens})
+			if err == nil {
+				for _, token := range tokens {
+					if _, err = tx.Exec(`INSERT INTO library_tag_remove_tokens(file_id,tag_name,token,removed_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING`, fileIDs[0], name, token, now()); err != nil {
+						break
+					}
+				}
+			}
+		}
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err = tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

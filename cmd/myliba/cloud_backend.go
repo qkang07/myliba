@@ -141,6 +141,34 @@ func (b *webDAVBackend) Get(kind, id string) ([]byte, error) {
 	return data, nil
 }
 
+func (b *webDAVBackend) Delete(kind, id string) error {
+	response, err := b.request(http.MethodDelete, kind+"/"+id, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 && response.StatusCode != 204 && response.StatusCode != 404 {
+		return fmt.Errorf("WebDAV DELETE: HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+func (b *webDAVBackend) Stat(kind, id string) (time.Time, int64, error) {
+	response, err := b.request(http.MethodHead, kind+"/"+id, nil, nil)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return time.Time{}, 0, fmt.Errorf("WebDAV HEAD: HTTP %d", response.StatusCode)
+	}
+	modified, err := http.ParseTime(response.Header.Get("Last-Modified"))
+	if err != nil || response.ContentLength < 0 {
+		return time.Time{}, 0, errors.New("WebDAV object age unavailable")
+	}
+	return modified, response.ContentLength, nil
+}
+
 func (b *webDAVBackend) List(kind string) ([]string, error) {
 	response, err := b.request("PROPFIND", kind+"/", []byte(`<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>`), map[string]string{"Depth": "1", "Content-Type": "application/xml"})
 	if err != nil {

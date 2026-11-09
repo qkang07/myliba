@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { createThumbnailVariant, createVideoVariant, fileURL, getResourceThumbnailVariant, getCloudVideoPart, getCloudVideoVariant, getVideoPart, getVideoVariant, type Resource, type VideoManifest, type VideoQuality } from "./api";
+import { createThumbnailVariant, createVideoVariant, fileURL, getResourceThumbnailVariant, getCloudVideoPart, getCloudVideoVariant, getVideoPart, getVideoVariant, openLibraryStreamSession, resolveLibraryFile, type Resource, type VideoManifest, type VideoQuality } from "./api";
 import { webRTCConnected, webRTCFetch } from "./webrtc";
 import { readBlobWithProgress } from "./transferProgress";
 import { openVirtualMedia } from "./virtualMedia";
 
-const props = defineProps<{ id: string; name: string; remote: boolean; phoneNode?: boolean; shareKey?: string; cloud?: boolean; qualities?: VideoQuality[]; resource?: Pick<Resource, "id" | "size" | "modified">; poster?: string; fileSize?: number }>();
+const props = defineProps<{ id: string; name: string; remote: boolean; phoneNode?: boolean; shareKey?: string; cloud?: boolean; qualities?: VideoQuality[]; resource?: Pick<Resource, "id" | "size" | "modified">; poster?: string; fileSize?: number; fileId?: string; revisionId?: string }>();
 const emit = defineEmits<{ metadata: [duration: number] }>();
 type Selection = VideoQuality | "original";
 type NetworkInfo = { downlink?: number; effectiveType?: string };
@@ -36,6 +36,24 @@ let closeVirtualMedia: (() => void) | undefined;
 let sessionAbort: AbortController | undefined;
 let segmentAbort: AbortController | undefined;
 let seekEpoch = 0;
+let streamToken = "";
+
+// acquireStreamToken exchanges a version-pinned resolve read ticket for a
+// short-lived HttpOnly stream session so a long cloud video outlives the
+// two-minute ticket. Only a cloud candidate matching the streamed object is
+// accepted; any failure falls back to the existing authenticated stream.
+async function acquireStreamToken(): Promise<string> {
+  if (!props.cloud || !props.fileId) return "";
+  try {
+    const resolved = await resolveLibraryFile(props.fileId, props.revisionId || "", "original");
+    const candidate = resolved.candidates.find((item) => item.kind === "cloud" && item.objectId === props.id && item.readTicket && item.readPath);
+    if (!candidate) return "";
+    const session = await openLibraryStreamSession(props.fileId, candidate, "original");
+    return session.token || "";
+  } catch {
+    return "";
+  }
+}
 
 async function loadPoster() {
   if (!props.resource) return;
@@ -68,7 +86,7 @@ function playOriginal() {
 }
 
 async function variant(quality: VideoQuality, create = false, onDemand = false, signal?: AbortSignal): Promise<VideoManifest> {
-  if (props.cloud) return getCloudVideoVariant(props.id, quality, onDemand, signal);
+  if (props.cloud) return getCloudVideoVariant(props.id, quality, onDemand, signal, streamToken);
   if (!props.shareKey) return create ? createVideoVariant(props.id, quality) : getVideoVariant(props.id, quality, onDemand, signal);
   const response = await webRTCFetch(`/api/shares/${encodeURIComponent(props.id)}/video/${quality}${onDemand ? "?mode=ondemand" : ""}`, {
     method: create ? "POST" : "GET", headers: { "X-Myliba-Share-Key": props.shareKey }, signal,
@@ -79,7 +97,7 @@ async function variant(quality: VideoQuality, create = false, onDemand = false, 
 }
 
 function part(quality: VideoQuality, segment: "init" | number, onDemand = false, signal?: AbortSignal) {
-  if (props.cloud) return getCloudVideoPart(props.id, quality, segment, onDemand, signal);
+  if (props.cloud) return getCloudVideoPart(props.id, quality, segment, onDemand, signal, streamToken);
   if (!props.shareKey) return getVideoPart(props.id, quality, segment, onDemand, signal);
   const suffix = segment === "init" ? "init" : `segments/${segment}`;
   return webRTCFetch(`/api/shares/${encodeURIComponent(props.id)}/video/${quality}/${suffix}${onDemand ? "?mode=ondemand" : ""}`, { headers: { "X-Myliba-Share-Key": props.shareKey }, signal });
@@ -87,6 +105,7 @@ function part(quality: VideoQuality, segment: "init" | number, onDemand = false,
 
 function dispose() {
   generation++;
+  streamToken = "";
   sessionAbort?.abort(); sessionAbort = undefined;
   segmentAbort?.abort(); segmentAbort = undefined;
   seekEpoch++;
@@ -121,6 +140,8 @@ async function start() {
   progress.value = null;
   transferLabel.value = "";
   if (!currentVideo) return;
+  streamToken = await acquireStreamToken();
+  if (current !== generation) return;
   if (selected.value === "original") {
     if (!props.remote && !props.cloud && !props.shareKey) {
       currentVideo.src = fileURL(props.id);
@@ -131,7 +152,7 @@ async function start() {
     loading.value = true;
     message.value = "正在准备视频流…";
     try {
-      const source = await openVirtualMedia(props.id, { cloud: props.cloud, shareKey: props.shareKey });
+      const source = await openVirtualMedia(props.id, { cloud: props.cloud, shareKey: props.shareKey, streamToken });
       if (current !== generation) { source.close(); return; }
       closeVirtualMedia = source.close;
       currentVideo.src = source.url;

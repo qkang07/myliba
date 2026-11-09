@@ -115,6 +115,7 @@ async function transfer() {
         const target = await ensureConnection("target", targetNodeId.value);
         if (file.size === 0) {
           const query = new URLSearchParams({ path: targetPath, id, offset: "0", total: "0", final: "1" });
+		  appendIdentity(query, file);
           const response = await target.fetch(`/api/transfers/file?${query}`, { method: "PUT", body: new Blob([]), signal: signalController.signal, headers: { "Content-Type": "application/octet-stream" } });
           if (!response.ok) throw await responseError(response);
         }
@@ -125,7 +126,7 @@ async function transfer() {
           if (!response.ok) throw await responseError(response);
           const chunk = await response.blob();
           const targetQuery = new URLSearchParams({ path: targetPath, id, offset: String(offset), total: String(file.size) });
-          if (offset + length === file.size) targetQuery.set("final", "1");
+		  if (offset + length === file.size) { targetQuery.set("final", "1"); appendIdentity(targetQuery, file); }
           const written = await target.fetch(`/api/transfers/file?${targetQuery}`, { method: "PUT", body: chunk, signal: signalController.signal, headers: { "Content-Type": "application/octet-stream" } });
           if (!written.ok) throw await responseError(written);
           offset += length;
@@ -147,6 +148,14 @@ async function transfer() {
     busy.value = false;
     if (disposed) { sourceConnection.value?.close(); targetConnection.value?.close(); }
   }
+}
+
+function appendIdentity(query: URLSearchParams, file: TransferEntry) {
+	if (!file.fileId || !file.revisionId) return;
+	query.set("fileId", file.fileId);
+	query.set("revisionId", file.revisionId);
+	if (file.folderName) query.set("folderName", file.folderName);
+	for (const tag of file.tags || []) query.append("tag", tag);
 }
 
 function directoryTitle(dir: TransferDirectory) {
@@ -180,7 +189,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="node-transfer-page">
     <header class="transfer-heading">
-      <div><span class="transfer-eyebrow">NODE TO NODE</span><h1>节点间文件传输</h1><p>支持在线桌面与手机资源节点互传。浏览器用 WebRTC 分块转发，Hub 只负责连接信令；目标文件不会加入索引。</p></div>
+      <div><span class="transfer-eyebrow">NODE TO NODE</span><h1>节点间文件传输</h1><p>支持在线桌面与手机资源节点互传。浏览器用 WebRTC 分块转发，Hub 只负责连接信令；已索引文件会携带逻辑身份和初始分类。</p></div>
       <button type="button" class="transfer-close" @click="emit('close')"><X :size="16" />返回资源空间</button>
     </header>
 
@@ -223,7 +232,7 @@ onBeforeUnmount(() => {
         <button v-if="busy" type="button" class="button button-secondary" @click="controller?.abort()"><X :size="15" />取消传输</button>
         <button v-else type="button" class="transfer-start" :disabled="!selectedFiles.length || !targetDir.current || sourceNodeId === targetNodeId || listing" @click="transfer"><LoaderCircle v-if="listing" :size="16" class="transfer-spin" /><Check v-else :size="16" />传输 {{ selectedFiles.length }} 个文件</button>
       </div>
-      <p class="transfer-footnote"><File :size="13" />仅复制原文件内容。目标文件不会加入资源索引，也不会触发缩略图或媒体处理。</p>
+      <p class="transfer-footnote"><File :size="13" />已索引的桌面目标会把复制件登记为同一逻辑文件的新位置；未索引文件及暂不支持该协议的旧节点仍只复制原文件内容。</p>
     </template>
   </section>
 </template>

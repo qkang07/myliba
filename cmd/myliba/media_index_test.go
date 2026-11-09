@@ -160,6 +160,42 @@ func TestMultipleMediaStoresUnifiedIndexAndCloudAssets(t *testing.T) {
 	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), thumbnail) {
 		t.Fatalf("thumbnail cloud fallback: %d %q", response.Code, response.Body.String())
 	}
+	versionRequest := httptest.NewRequest(http.MethodGet, "/api/cloud/files/clip/versions/"+record.RevisionID+"/assets/"+manifest.Assets[0].ID+"/parts/thumbnail.jpg", nil)
+	versionRequest.SetPathValue("id", "clip")
+	versionRequest.SetPathValue("revision", record.RevisionID)
+	versionRequest.SetPathValue("asset", manifest.Assets[0].ID)
+	versionRequest.SetPathValue("part", "thumbnail.jpg")
+	versionResponse := httptest.NewRecorder()
+	client.cloudAssetPart(versionResponse, versionRequest)
+	if versionResponse.Code != http.StatusOK || !bytes.Equal(versionResponse.Body.Bytes(), thumbnail) {
+		t.Fatalf("revision-pinned thumbnail: %d %q", versionResponse.Code, versionResponse.Body.String())
+	}
+	logicalID := manifest.FileID
+	if logicalID == "" {
+		logicalID = record.ObjectID
+	}
+	resolveRequest := httptest.NewRequest(http.MethodPost, "/api/library/files/"+logicalID+"/resolve", strings.NewReader(`{"revisionId":"`+record.RevisionID+`","purpose":"thumbnail"}`))
+	resolveRequest.SetPathValue("fileId", logicalID)
+	resolveResponse := httptest.NewRecorder()
+	client.resolveLibraryFile(resolveResponse, resolveRequest)
+	var thumbnailCandidates struct {
+		Candidates []struct {
+			Kind     string `json:"kind"`
+			ReadPath string `json:"readPath"`
+		} `json:"candidates"`
+	}
+	if resolveResponse.Code != http.StatusOK || json.Unmarshal(resolveResponse.Body.Bytes(), &thumbnailCandidates) != nil {
+		t.Fatalf("thumbnail candidates: %d %s", resolveResponse.Code, resolveResponse.Body.String())
+	}
+	foundThumbnail := false
+	for _, candidate := range thumbnailCandidates.Candidates {
+		if candidate.Kind == "cloud" && strings.Contains(candidate.ReadPath, "/versions/"+record.RevisionID+"/assets/") {
+			foundThumbnail = true
+		}
+	}
+	if !foundThumbnail {
+		t.Fatalf("missing version-pinned thumbnail candidate: %+v", thumbnailCandidates.Candidates)
+	}
 	videoDir := filepath.Join(secondStore, "videos", cloudHash([]byte("360p variant")))
 	if err := os.MkdirAll(videoDir, 0700); err != nil {
 		t.Fatal(err)

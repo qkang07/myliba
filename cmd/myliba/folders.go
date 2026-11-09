@@ -109,8 +109,22 @@ func (s *server) createFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	item := virtualFolder{ID: newID(), Name: name, CreatedAt: now()}
-	if _, err := s.db.Exec(`INSERT INTO folders(id,name,created_at,password_hash) VALUES(?,?,?,'')`, item.ID, item.Name, item.CreatedAt); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法保存文件夹")
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO folders(id,name,created_at,password_hash) VALUES(?,?,?,'')`, item.ID, item.Name, item.CreatedAt); err != nil {
 		writeFolderError(w, err)
+		return
+	}
+	if err := recordLibraryOperation(tx, "folder.create", map[string]any{"folderName": item.Name}); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法记录整理操作")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法保存文件夹")
 		return
 	}
 	writeJSON(w, http.StatusCreated, item)
@@ -121,7 +135,22 @@ func (s *server) renameFolder(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.db.Exec(`UPDATE folders SET name=? WHERE id=?`, name, r.PathValue("id"))
+	tx, err := s.db.Begin()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法保存文件夹")
+		return
+	}
+	defer tx.Rollback()
+	var previous string
+	if err := tx.QueryRow(`SELECT name FROM folders WHERE id=?`, r.PathValue("id")).Scan(&previous); err != nil {
+		writeError(w, http.StatusNotFound, "文件夹不存在")
+		return
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO library_classification_authoritative(file_id) SELECT file_id FROM library_file_folders WHERE folder_id=?`, r.PathValue("id")); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法保存文件夹")
+		return
+	}
+	result, err := tx.Exec(`UPDATE folders SET name=? WHERE id=?`, name, r.PathValue("id"))
 	if err != nil {
 		writeFolderError(w, err)
 		return
@@ -129,6 +158,14 @@ func (s *server) renameFolder(w http.ResponseWriter, r *http.Request) {
 	count, err := result.RowsAffected()
 	if err != nil || count == 0 {
 		writeError(w, http.StatusNotFound, "文件夹不存在")
+		return
+	}
+	if err := recordLibraryOperation(tx, "folder.rename", map[string]any{"folderName": name, "previousName": previous}); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法记录整理操作")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法保存文件夹")
 		return
 	}
 	var item virtualFolder
@@ -149,6 +186,11 @@ func (s *server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	var folderName string
+	if err := tx.QueryRow(`SELECT name FROM folders WHERE id=?`, r.PathValue("id")).Scan(&folderName); err != nil {
+		writeError(w, http.StatusNotFound, "文件夹不存在")
+		return
+	}
 	// Keep saved collections usable after their folder is removed.
 	rows, err := tx.Query(`SELECT id,filters_json FROM smart_collections`)
 	if err != nil {
@@ -182,6 +224,10 @@ func (s *server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO library_classification_authoritative(file_id) SELECT file_id FROM library_file_folders WHERE folder_id=?`, r.PathValue("id")); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法删除文件夹")
+		return
+	}
 	result, err := tx.Exec(`DELETE FROM folders WHERE id=?`, r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "无法删除文件夹")
@@ -190,6 +236,10 @@ func (s *server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 	count, err := result.RowsAffected()
 	if err != nil || count == 0 {
 		writeError(w, http.StatusNotFound, "文件夹不存在")
+		return
+	}
+	if err := recordLibraryOperation(tx, "folder.delete", map[string]any{"folderName": folderName}); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法记录整理操作")
 		return
 	}
 	if err := tx.Commit(); err != nil {
@@ -274,6 +324,20 @@ func (s *server) moveResourcesToFolder(w http.ResponseWriter, r *http.Request) {
 	}
 	if count == 0 {
 		writeError(w, http.StatusBadRequest, "请选择资源")
+		return
+	}
+	fileIDs, err := logicalFileIDs(tx, input.IDs)
+	if err == nil {
+		folderName := ""
+		if input.FolderID != "" {
+			err = tx.QueryRow(`SELECT name FROM folders WHERE id=?`, input.FolderID).Scan(&folderName)
+		}
+		if err == nil {
+			err = recordLibraryOperation(tx, "folder.move", map[string]any{"fileIds": fileIDs, "folderId": input.FolderID, "folderName": folderName})
+		}
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "无法记录整理操作")
 		return
 	}
 	if err := tx.Commit(); err != nil {

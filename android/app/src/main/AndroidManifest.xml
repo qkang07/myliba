@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
@@ -20,11 +21,15 @@
         <service android:name=".ResourceNodeService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User started private library resource node" />
         </service>
+        <service android:name=".LocalIndexJobService" android:permission="android.permission.BIND_JOB_SERVICE" android:exported="true" />
         <service android:name=".ResourceTransferService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User started direct resource transfer" />
         </service>
         <service android:name=".LocalThumbnailTaskService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="本机文件缩略图后台处理" />
+        </service>
+        <service android:name=".OriginalUploadService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User started phone original cloud upload and safe release" />
         </service>
         <provider android:name=".ResourceDownloadProvider" android:authorities="com.myliba.android.downloads" android:exported="false" android:grantUriPermissions="true" />
         <activity

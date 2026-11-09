@@ -40,8 +40,10 @@ func (c *cloudClient) publishLocalIndex(objectID string) error {
 	if revision == "" {
 		revision = newID()
 	}
-	record := cloudRecord{Format: 3, LibraryID: c.libraryID(), ObjectID: objectID,
-		RevisionID: revision, AuthorID: c.runtime.id, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), BlockIDs: []string{}}
+	// ObjectID remains the old resource lookup key; FileID inside the encrypted
+	// index is the stable logical identity introduced by P2.
+	record := cloudRecord{Format: 4, LibraryID: c.libraryID(), ObjectID: objectID,
+		RevisionID: revision, AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), BlockIDs: []string{}}
 	record, err = c.sealManifest(record, cloudManifest{IndexOnly: true, LocalIndex: &index})
 	if err != nil {
 		return err
@@ -100,11 +102,14 @@ func (s *server) queueAllLocalIndexes() {
 	if s.cloud == nil {
 		return
 	}
+	started := time.Now()
+	log.Printf("local index startup: resource scan starting")
 	rows, err := s.db.Query(`SELECT id FROM resources`)
 	if err != nil {
-		log.Printf("local index scan: %v", err)
+		log.Printf("local index startup: resource scan failed after %s: %v", time.Since(started), err)
 		return
 	}
+	log.Printf("local index startup: resource scan acquired after %s", time.Since(started))
 	var ids []string
 	for rows.Next() {
 		var id string
@@ -116,6 +121,7 @@ func (s *server) queueAllLocalIndexes() {
 	for _, id := range ids {
 		s.cloud.queueLocalIndex(id)
 	}
+	log.Printf("local index startup: queued %d resources in %s", len(ids), time.Since(started))
 }
 
 func (c *cloudClient) localIndexes(objectID string) ([]fileIndexView, error) {

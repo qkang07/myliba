@@ -50,52 +50,69 @@ type cloudAsset struct {
 }
 
 type cloudManifest struct {
-	Protected   bool              `json:"protected,omitempty"`
-	Name        string            `json:"name"`
-	Size        int64             `json:"size"`
-	Modified    string            `json:"modified"`
-	History     bool              `json:"history"`
-	SourceID    string            `json:"sourceId,omitempty"`
-	PlainHash   string            `json:"plainHash"`
-	DataKey     string            `json:"dataKey"`
-	Chunks      []cloudChunk      `json:"chunks"`
-	Kind        string            `json:"kind,omitempty"`
-	Tags        []string          `json:"tags,omitempty"`
-	FolderID    string            `json:"folderId,omitempty"`
-	FolderName  string            `json:"folderName,omitempty"`
-	Local       []indexedLocation `json:"local,omitempty"`
-	Assets      []cloudAsset      `json:"assets,omitempty"`
-	ContentSize int64             `json:"contentSize,omitempty"`
-	IndexOnly   bool              `json:"indexOnly,omitempty"`
-	LocalIndex  *fileIndexView    `json:"localIndex,omitempty"`
+	// FileID is the stable logical identity. SourceID and record.ObjectID stay
+	// as compatibility handles for pre-P2 resource APIs.
+	FileID      string                    `json:"fileId,omitempty"`
+	Protected   bool                      `json:"protected,omitempty"`
+	Name        string                    `json:"name"`
+	Size        int64                     `json:"size"`
+	Modified    string                    `json:"modified"`
+	History     bool                      `json:"history"`
+	SourceID    string                    `json:"sourceId,omitempty"`
+	PlainHash   string                    `json:"plainHash"`
+	DataKey     string                    `json:"dataKey"`
+	Chunks      []cloudChunk              `json:"chunks"`
+	Kind        string                    `json:"kind,omitempty"`
+	Tags        []string                  `json:"tags,omitempty"`
+	FolderID    string                    `json:"folderId,omitempty"`
+	FolderName  string                    `json:"folderName,omitempty"`
+	Local       []indexedLocation         `json:"local,omitempty"`
+	Assets      []cloudAsset              `json:"assets,omitempty"`
+	ContentSize int64                     `json:"contentSize,omitempty"`
+	IndexOnly   bool                      `json:"indexOnly,omitempty"`
+	LocalIndex  *fileIndexView            `json:"localIndex,omitempty"`
+	Operation   *libraryOperationEnvelope `json:"operation,omitempty"`
+	Receipt     *libraryReceiptEnvelope   `json:"receipt,omitempty"`
+	Snapshot    *librarySnapshotEnvelope  `json:"snapshot,omitempty"`
 }
 
 type cloudFileView struct {
-	Protected         bool              `json:"-"`
-	CatalogCreatedAt  string            `json:"-"`
-	LocalOnly         bool              `json:"localOnly,omitempty"`
-	Locations         []indexedLocation `json:"locations,omitempty"`
-	Tags              []string          `json:"tags,omitempty"`
-	FolderID          string            `json:"folderId,omitempty"`
-	FolderName        string            `json:"folderName,omitempty"`
-	ID                string            `json:"id"`
-	Name              string            `json:"name"`
-	Size              int64             `json:"size"`
-	OriginalSize      int64             `json:"originalSize"`
-	Modified          string            `json:"modified"`
-	History           bool              `json:"history"`
-	SourceID          string            `json:"sourceId,omitempty"`
-	Chunks            int               `json:"chunks"`
-	RevisionID        string            `json:"revisionId"`
-	Replicas          int               `json:"replicas"`
-	MinReplicas       int               `json:"minReplicas"`
-	AvailableReplicas int               `json:"availableReplicas"`
-	Variants          []string          `json:"variants"`
+	FileID              string            `json:"fileId,omitempty"`
+	Protected           bool              `json:"-"`
+	CatalogCreatedAt    string            `json:"-"`
+	CatalogFormat       int               `json:"-"`
+	LocalOnly           bool              `json:"localOnly,omitempty"`
+	Locations           []indexedLocation `json:"locations,omitempty"`
+	Tags                []string          `json:"tags,omitempty"`
+	FolderID            string            `json:"folderId,omitempty"`
+	FolderName          string            `json:"folderName,omitempty"`
+	ID                  string            `json:"id"`
+	Name                string            `json:"name"`
+	Size                int64             `json:"size"`
+	OriginalSize        int64             `json:"originalSize"`
+	Modified            string            `json:"modified"`
+	History             bool              `json:"history"`
+	SourceID            string            `json:"sourceId,omitempty"`
+	Chunks              int               `json:"chunks"`
+	RevisionID          string            `json:"revisionId"`
+	CurrentRevision     bool              `json:"currentRevision,omitempty"`
+	RevisionCount       int               `json:"revisionCount,omitempty"`
+	Replicas            int               `json:"replicas"`
+	MinReplicas         int               `json:"minReplicas"`
+	AvailableReplicas   int               `json:"availableReplicas"`
+	IndependentReplicas int               `json:"independentReplicas"`
+	FaultDomains        []string          `json:"faultDomains,omitempty"`
+	Variants            []string          `json:"variants"`
 }
 
 type cloudClient struct {
 	runtime       *cloudRuntime
 	indexer       *server
+	searchMu      sync.Mutex
+	searchStamp   string
+	searchChanges int64
+	searchReady   bool
+	searchRecords map[string]cloudRecord
 	assetMu       sync.Mutex
 	localDigestMu sync.Mutex
 	localDigests  map[string]string
@@ -144,6 +161,15 @@ func (c *cloudClient) libraryID() string {
 	c.keyMu.RLock()
 	defer c.keyMu.RUnlock()
 	return cloudHash(c.key[:])
+}
+
+func (c *cloudClient) authorEpoch() int64 {
+	if c.runtime == nil || c.runtime.db == nil {
+		return 0
+	}
+	var epoch int64
+	_ = c.runtime.db.QueryRow(`SELECT epoch FROM library_members WHERE node_id=? AND state='active'`, c.runtime.id).Scan(&epoch)
+	return epoch
 }
 
 func (c *cloudClient) recovery(w http.ResponseWriter, r *http.Request) {
@@ -305,7 +331,8 @@ func (c *cloudClient) openManifest(record cloudRecord) (cloudManifest, error) {
 		return manifest, err
 	}
 	if manifest.IndexOnly {
-		if len(record.BlockIDs) != 0 || manifest.LocalIndex == nil || manifest.LocalIndex.FileID != record.ObjectID ||
+		if len(record.BlockIDs) != 0 || manifest.LocalIndex == nil || manifest.LocalIndex.FileID == "" ||
+			(record.Format < 4 && manifest.LocalIndex.FileID != record.ObjectID) ||
 			manifest.LocalIndex.Original.Cloud != nil || manifest.LocalIndex.Original.Size < 0 ||
 			(manifest.LocalIndex.RevisionID != "" && manifest.LocalIndex.RevisionID != record.RevisionID) {
 			return manifest, errors.New("invalid local file index")
@@ -335,6 +362,31 @@ func (c *cloudClient) openManifest(record cloudRecord) (cloudManifest, error) {
 			return manifest, errors.New("invalid local file size")
 		}
 		return manifest, nil
+	}
+	if manifest.Operation != nil {
+		op := manifest.Operation
+		if len(record.BlockIDs) != 0 || op.OpID == "" || op.AuthorID == "" || op.Counter < 1 || op.Kind == "" || len(op.Payload) == 0 || len(op.Payload) > 1<<20 {
+			return manifest, errors.New("invalid library operation")
+		}
+		return manifest, nil
+	}
+	if manifest.Receipt != nil {
+		receipt := manifest.Receipt
+		if len(record.BlockIDs) != 0 || receipt.NodeID != record.AuthorID || len(receipt.Frontiers) == 0 || len(receipt.Frontiers) > 10000 {
+			return manifest, errors.New("invalid library receipt")
+		}
+		for author, counter := range receipt.Frontiers {
+			if author == "" || len(author) > 160 || counter < 1 {
+				return manifest, errors.New("invalid library receipt frontier")
+			}
+		}
+		return manifest, nil
+	}
+	if manifest.Snapshot != nil {
+		if len(record.BlockIDs) != 0 || !strings.HasPrefix(record.ObjectID, "library-snapshot/") || manifest.Snapshot.AuthorID == "" || manifest.Snapshot.Frontier < 1 {
+			return manifest, errors.New("invalid library snapshot")
+		}
+		return manifest, nil // Schema and checksum are checked before applying.
 	}
 	position := 0
 	validateChunks := func(chunks []cloudChunk, expectedSize int64) bool {
@@ -426,7 +478,41 @@ func (c *cloudClient) validRecords() ([]cloudRecord, error) {
 			valid = append(valid, record)
 		}
 	}
-	return valid, nil
+	return filterDowngradedCatalogRecords(valid), nil
+}
+
+// A format-4 record is an authenticated declaration that this author can
+// write stable file identities. Keep its earlier legacy history, but ignore
+// any later format-3 write from the same author. Other legacy authors remain
+// readable until they upgrade; their classifications are still guarded by
+// the authoritative operation projection.
+func filterDowngradedCatalogRecords(records []cloudRecord) []cloudRecord {
+	firstUpgrade := map[string]time.Time{}
+	for _, record := range records {
+		if record.Format < 4 || record.AuthorID == "" {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, record.CreatedAt)
+		if err != nil {
+			continue
+		}
+		if previous, ok := firstUpgrade[record.AuthorID]; !ok || at.Before(previous) {
+			firstUpgrade[record.AuthorID] = at
+		}
+	}
+	kept := make([]cloudRecord, 0, len(records))
+	for _, record := range records {
+		if record.Format == 3 {
+			if upgrade, ok := firstUpgrade[record.AuthorID]; ok {
+				at, err := time.Parse(time.RFC3339Nano, record.CreatedAt)
+				if err != nil || !at.Before(upgrade) {
+					continue
+				}
+			}
+		}
+		kept = append(kept, record)
+	}
+	return kept
 }
 
 func latestCloudRecords(records []cloudRecord) []cloudRecord {
@@ -454,18 +540,20 @@ func (c *cloudClient) contentRecords() ([]cloudRecord, error) {
 	result := make([]cloudRecord, 0, len(records))
 	for _, record := range records {
 		manifest, err := c.openManifest(record)
-		if err == nil && !manifest.IndexOnly {
+		if err == nil && !manifest.IndexOnly && manifest.Operation == nil && manifest.Receipt == nil && manifest.Snapshot == nil {
 			result = append(result, record)
 		}
 	}
 	return result, nil
 }
 
-func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
+// libraryFiles is the shared logical-file projection for the legacy cloud
+// listing and the paginated library-search endpoint. It deliberately merges
+// cloud objects and device indexes before any query filters are applied.
+func (c *cloudClient) buildLibraryFiles(includeLocal bool) ([]cloudFileView, error) {
 	records, err := c.contentRecords()
 	if err != nil {
-		writeError(w, 500, "无法读取云层索引")
-		return
+		return nil, err
 	}
 	items := []cloudFileView{}
 	for _, record := range latestCloudRecords(records) {
@@ -473,7 +561,12 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		fileID := manifest.FileID
+		if fileID == "" { // Format 3 compatibility: object ID was the file identity.
+			fileID = record.ObjectID
+		}
 		minReplicas, availableReplicas := c.replicaCounts(record)
+		faultDomains, _ := c.replicaDomains(record)
 		variants := []string{}
 		for _, asset := range manifest.Assets {
 			if asset.Kind == "video" {
@@ -482,21 +575,44 @@ func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(variants)
 		items = append(items, cloudFileView{
+			FileID:           fileID,
 			Protected:        manifest.Protected,
 			CatalogCreatedAt: record.CreatedAt,
+			CatalogFormat:    record.Format,
 			Tags:             manifest.Tags, FolderID: manifest.FolderID, FolderName: manifest.FolderName,
 			ID: record.ObjectID, Name: manifest.Name, Size: manifest.ContentSize, OriginalSize: manifest.Size,
 			Modified: manifest.Modified, History: manifest.History,
 			SourceID: manifest.SourceID, Chunks: len(record.BlockIDs),
 			RevisionID: record.RevisionID, Replicas: minReplicas, MinReplicas: minReplicas, AvailableReplicas: availableReplicas,
+			IndependentReplicas: len(faultDomains), FaultDomains: faultDomains,
 			Variants: variants,
 		})
 	}
-	items, err = c.mergeCatalogSearch(items, r.URL.Query().Get("scope") == "all")
+	items, err = c.mergeCatalogSearch(items, includeLocal)
 	if err != nil {
-		writeError(w, 500, "无法读取跨设备索引")
+		return nil, err
+	}
+	return items, nil
+}
+
+func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
+	items, err := c.libraryFiles(r.URL.Query().Get("scope") == "all")
+	if err != nil {
+		writeError(w, 500, "无法读取云层索引")
 		return
 	}
+	states, err := c.libraryLifecycleStates()
+	if err != nil {
+		writeError(w, 500, "无法读取文件回收状态")
+		return
+	}
+	visible := make([]cloudFileView, 0, len(items))
+	for _, item := range items {
+		if states[item.FileID] != "trashed" && states[item.FileID] != "deleted" {
+			visible = append(visible, item)
+		}
+	}
+	items = visible
 	c.jobsMu.Lock()
 	jobs := make(map[string]string, len(c.jobs))
 	for id, status := range c.jobs {
@@ -543,30 +659,7 @@ func (c *cloudClient) recordReachable(record cloudRecord) bool {
 // replicaCounts reports complete file copies (every encrypted block is present
 // on the same node) and the subset whose node endpoint was recently reachable.
 func (c *cloudClient) replicaCounts(record cloudRecord) (int, int) {
-	if len(record.BlockIDs) == 0 {
-		return 1, 1
-	}
-	complete := map[string]bool(nil)
-	for _, blockID := range record.BlockIDs {
-		locations := map[string]bool{}
-		for _, node := range c.runtime.blockLocations(blockID) {
-			if node.ID != "" {
-				locations[node.ID] = true
-			}
-		}
-		if c.runtime.disk.has("blocks", blockID) {
-			locations[c.runtime.id] = true
-		}
-		if complete == nil {
-			complete = locations
-			continue
-		}
-		for nodeID := range complete {
-			if !locations[nodeID] {
-				delete(complete, nodeID)
-			}
-		}
-	}
+	complete := c.completeCopyNodes(record)
 	available := 0
 	statuses := c.runtime.peerStatuses()
 	now := time.Now()
@@ -630,7 +723,7 @@ func (c *cloudClient) upload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "上传中"})
 }
 
-func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, history bool) error {
+func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, history bool) (err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -640,6 +733,16 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 	if err != nil || !initial.Mode().IsRegular() {
 		return errors.New("文件不可用")
 	}
+	var taskID string
+	committed := false
+	defer func() {
+		if !committed && taskID != "" {
+			state := transferRetryableFailed
+			if err != nil {
+				c.setTransferState(taskID, state, err.Error())
+			}
+		}
+	}()
 	var dataKey [32]byte
 	if _, err := rand.Read(dataKey[:]); err != nil {
 		return err
@@ -652,13 +755,30 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 	if err != nil {
 		return err
 	}
+	fileID, revisionID := objectID, newID()
+	var localIndex fileIndexView
+	if c.indexer != nil {
+		var indexErr error
+		localIndex, indexErr = c.indexer.buildFileIndex(objectID, false)
+		if indexErr != nil {
+			return indexErr
+		}
+		if localIndex.FileID != "" {
+			fileID = localIndex.FileID
+		}
+		if localIndex.RevisionID != "" {
+			revisionID = localIndex.RevisionID
+		}
+	}
+	taskID = c.createTransferTask("upload", fileID, revisionID, objectID, "", initial.Size())
+	c.setTransferState(taskID, transferReading, "")
 	record := cloudRecord{
-		Format: 3, KeepHistory: history, LibraryID: c.libraryID(), ObjectID: objectID, RevisionID: newID(),
-		AuthorID: c.runtime.id, CreatedAt: now(), BlockIDs: []string{},
+		Format: 4, KeepHistory: history, LibraryID: c.libraryID(), ObjectID: objectID, RevisionID: revisionID,
+		AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{},
 	}
 	manifest := cloudManifest{
 		Name: initial.Name(), Size: initial.Size(), Modified: initial.ModTime().UTC().Format(time.RFC3339Nano),
-		SourceID: objectID, DataKey: hex.EncodeToString(dataKey[:]), Chunks: []cloudChunk{}, History: history,
+		FileID: fileID, SourceID: objectID, DataKey: hex.EncodeToString(dataKey[:]), Chunks: []cloudChunk{}, History: history,
 		Kind: fileKind(path), ContentSize: initial.Size(),
 	}
 	if c.runtime.db != nil {
@@ -680,40 +800,46 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 		}
 	}
 	if c.indexer != nil {
-		index, err := c.indexer.buildFileIndex(objectID, false)
-		if err != nil {
-			return err
-		}
-		manifest.Tags = append([]string{}, index.Tags...)
-		manifest.FolderID, manifest.FolderName, manifest.Protected = index.FolderID, index.FolderName, index.Protected
+		manifest.Tags = append([]string{}, localIndex.Tags...)
+		manifest.FolderID, manifest.FolderName, manifest.Protected = localIndex.FolderID, localIndex.FolderName, localIndex.Protected
 	}
-	plainHash := sha256.New()
-	buffer := make([]byte, cloudChunkSize)
-	for index := 0; ; index++ {
-		n, readErr := io.ReadFull(file, buffer)
-		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
-			return readErr
-		}
-		if n == 0 {
-			break
-		}
-		plainHash.Write(buffer[:n])
-		ciphertext := aead.Seal(nil, cloudNonce(index), buffer[:n], cloudAAD(record, index, n))
-		id := cloudHash(ciphertext)
-		if err := c.runtime.disk.put("blocks", id, bytes.NewReader(ciphertext), cloudMaxBlobSize); err != nil {
-			return err
-		}
-		manifest.Chunks = append(manifest.Chunks, cloudChunk{ID: id, Size: n})
-		record.BlockIDs = append(record.BlockIDs, id)
-		if readErr != nil {
-			break
-		}
+	c.setTransferState(taskID, transferUploading, "")
+	plainHash, err := c.encryptBlocks(&record, &manifest, file, aead)
+	if err != nil {
+		return err
 	}
 	final, err := os.Stat(path)
 	if err != nil || final.Size() != initial.Size() || !final.ModTime().Equal(initial.ModTime()) {
 		return errors.New("上传期间文件发生变化，请重试")
 	}
-	manifest.PlainHash = hex.EncodeToString(plainHash.Sum(nil))
+	manifest.PlainHash = plainHash
+	c.setTransferHash(taskID, plainHash)
+	c.setTransferState(taskID, transferVerifying, "")
+	if err := c.verifyStoredBlocks(record, manifest, aead); err != nil {
+		return err
+	}
+	// Size and modification time discover a candidate revision; a completed
+	// upload is the first place we have the complete byte stream to verify it.
+	// Persist that fact only after the post-read stat above confirmed the source
+	// did not change during hashing.
+	if c.runtime.db != nil && c.indexer != nil {
+		if _, err := c.runtime.db.Exec(`UPDATE versions SET content_id=? WHERE id=? AND resource_id=?`, manifest.PlainHash, record.RevisionID, objectID); err != nil {
+			return err
+		}
+		// Materialize the logical file/revision rows before recording verified
+		// content so the foreign key holds even when the scan projection has not
+		// caught up to this upload. Both are no-ops when the rows already exist.
+		if _, err := c.runtime.db.Exec(`INSERT INTO library_files(file_id,created_at,updated_at) VALUES(?,?,?) ON CONFLICT(file_id) DO NOTHING`, fileID, now(), now()); err != nil {
+			return err
+		}
+		if _, err := c.runtime.db.Exec(`INSERT INTO library_revisions(revision_id,file_id,size,modified_at,created_at) VALUES(?,?,?,?,?) ON CONFLICT(revision_id) DO NOTHING`, record.RevisionID, fileID, manifest.Size, manifest.Modified, now()); err != nil {
+			return err
+		}
+		if _, err := c.runtime.db.Exec(`INSERT INTO library_verified_content(revision_id,plain_hash,verified_at) VALUES(?,?,?)
+			ON CONFLICT(revision_id) DO UPDATE SET plain_hash=excluded.plain_hash,verified_at=excluded.verified_at`, record.RevisionID, manifest.PlainHash, now()); err != nil {
+			return err
+		}
+	}
 	if err := c.appendGeneratedAssets(ctx, &record, &manifest, preprocessVersion(initial)); err != nil {
 		return err
 	}
@@ -731,12 +857,14 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 	if err := c.runtime.disk.put("catalog", cloudHash(raw), bytes.NewReader(raw), cloudMaxRecordSize); err != nil {
 		return err
 	}
+	committed = true
+	c.setTransferState(taskID, transferCommitted, "")
 	// The local write commits immediately. Unreachable peers remain background
 	// replication work and never prevent the user from using the file.
 	c.replicateRecord(ctx, record)
-	if err := c.syncNewAssets(ctx, objectID); err != nil {
-		return err
-	}
+	// Preview asset propagation is independent of the original: a failure here
+	// must not report the verified original upload as failed (§9).
+	_ = c.syncNewAssets(ctx, objectID)
 	return nil
 }
 
@@ -789,6 +917,9 @@ func (c *cloudClient) findRecord(objectID string) (cloudRecord, cloudManifest, e
 
 func (c *cloudClient) versions(w http.ResponseWriter, r *http.Request) {
 	objectID := r.PathValue("id")
+	if c.hiddenCloudObject(w, objectID) {
+		return
+	}
 	records, err := c.historyRecords(objectID)
 	if err != nil {
 		writeError(w, 404, "云层文件不存在")
@@ -801,15 +932,24 @@ func (c *cloudClient) versions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		replicas, availableReplicas := c.replicaCounts(record)
-		items = append(items, cloudFileView{ID: objectID, Name: manifest.Name, Size: manifest.ContentSize,
+		faultDomains, _ := c.replicaDomains(record)
+		fileID := manifest.FileID
+		if fileID == "" {
+			fileID = objectID
+		}
+		items = append(items, cloudFileView{FileID: fileID, ID: objectID, Name: manifest.Name, Size: manifest.ContentSize,
 			OriginalSize: manifest.Size, Modified: manifest.Modified, History: true,
-			Chunks: len(record.BlockIDs), RevisionID: record.RevisionID, Replicas: replicas, MinReplicas: replicas, AvailableReplicas: availableReplicas})
+			Chunks: len(record.BlockIDs), RevisionID: record.RevisionID, Replicas: replicas, MinReplicas: replicas, AvailableReplicas: availableReplicas,
+			IndependentReplicas: len(faultDomains), FaultDomains: faultDomains})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Modified > items[j].Modified })
 	writeJSON(w, 200, items)
 }
 
 func (c *cloudClient) versionRecord(objectID, revisionID string) (cloudRecord, cloudManifest, error) {
+	if current, manifest, err := c.findRecord(objectID); err == nil && current.RevisionID == revisionID {
+		return current, manifest, nil
+	}
 	records, err := c.historyRecords(objectID)
 	if err != nil {
 		return cloudRecord{}, cloudManifest{}, err
@@ -939,6 +1079,9 @@ func (c *cloudClient) localOriginal(record cloudRecord, manifest cloudManifest) 
 }
 
 func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
+	if c.hiddenCloudObject(w, r.PathValue("id")) {
+		return
+	}
 	var record cloudRecord
 	var manifest cloudManifest
 	var err error
@@ -949,6 +1092,17 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, 404, "云层文件不存在")
+		return
+	}
+	streamFileID := manifest.FileID
+	if streamFileID == "" {
+		streamFileID = record.ObjectID
+	}
+	if handled, ok := c.authorizeLibraryStreamCredential(w, r, streamFileID, record.RevisionID, record.ObjectID, "original"); handled {
+		if !ok {
+			return
+		}
+	} else if !c.authorizeCloudLibraryRead(w, r, record, manifest, "original") {
 		return
 	}
 	name := manifest.Name
@@ -1077,4 +1231,32 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	if !written {
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+func (c *cloudClient) hiddenCloudObject(w http.ResponseWriter, objectID string) bool {
+	if c.runtime.db == nil {
+		return false
+	}
+	_, manifest, err := c.findRecord(objectID)
+	if err != nil {
+		return false
+	}
+	fileID := manifest.FileID
+	if fileID == "" {
+		fileID = objectID
+	}
+	states, err := c.libraryLifecycleStates()
+	if err != nil {
+		writeError(w, 500, "无法读取文件状态")
+		return true
+	}
+	if states[fileID] == "deleted" {
+		writeError(w, http.StatusGone, "文件条目已永久删除")
+		return true
+	}
+	if states[fileID] == "trashed" {
+		writeError(w, http.StatusNotFound, "文件已移入回收站")
+		return true
+	}
+	return false
 }

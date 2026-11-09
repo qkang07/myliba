@@ -11,6 +11,7 @@ type cloudRecord struct {
 	ObjectID    string   `json:"objectId"`
 	RevisionID  string   `json:"revisionId"`
 	AuthorID    string   `json:"authorId"`
+	AuthorEpoch int64    `json:"authorEpoch,omitempty"`
 	CreatedAt   string   `json:"createdAt"`
 	Nonce       string   `json:"nonce"`
 	Sealed      string   `json:"sealed"`

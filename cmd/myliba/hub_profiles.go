@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 type hubProfile struct {
@@ -187,12 +189,17 @@ func (h *hubProfiles) activate(id string) error {
 }
 
 func (h *hubProfiles) view() (hubProfilesView, error) {
+	started := time.Now()
+	log.Printf("local API /api/hubs: waiting for profile lock")
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	log.Printf("local API /api/hubs: profile lock acquired after %s; database query starting", time.Since(started))
 	rows, err := h.db.Query(`SELECT id,name,url FROM hub_profiles ORDER BY rowid`)
 	if err != nil {
+		log.Printf("local API /api/hubs: database query failed after %s: %v", time.Since(started), err)
 		return hubProfilesView{}, err
 	}
+	log.Printf("local API /api/hubs: database query acquired after %s", time.Since(started))
 	defer rows.Close()
 	view := hubProfilesView{Profiles: []hubProfile{}, ActiveID: h.activeID, Status: h.status}
 	for rows.Next() {
@@ -203,7 +210,13 @@ func (h *hubProfiles) view() (hubProfilesView, error) {
 		p.HasToken = true
 		view.Profiles = append(view.Profiles, p)
 	}
-	return view, rows.Err()
+	err = rows.Err()
+	if err != nil {
+		log.Printf("local API /api/hubs: row iteration failed after %s: %v", time.Since(started), err)
+	} else {
+		log.Printf("local API /api/hubs: completed in %s", time.Since(started))
+	}
+	return view, err
 }
 
 func localHubMutation(w http.ResponseWriter, r *http.Request) bool {

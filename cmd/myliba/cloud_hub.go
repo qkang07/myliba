@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -15,19 +17,25 @@ import (
 )
 
 type cloudNode struct {
-	ID       string                     `json:"id"`
-	Endpoint string                     `json:"endpoint"`
-	LAN      []string                   `json:"lan,omitempty"`
-	LANKey   string                     `json:"lanKey,omitempty"`
-	Links    map[string]cloudPeerStatus `json:"links,omitempty"`
-	Relayed  bool                       `json:"relayed,omitempty"`
-	Role     string                     `json:"role"`
-	SeenAt   time.Time                  `json:"seenAt"`
+	ID          string                     `json:"id"`
+	Endpoint    string                     `json:"endpoint"`
+	LAN         []string                   `json:"lan,omitempty"`
+	LANKey      string                     `json:"lanKey,omitempty"`
+	Links       map[string]cloudPeerStatus `json:"links,omitempty"`
+	Relayed     bool                       `json:"relayed,omitempty"`
+	Role        string                     `json:"role"`
+	FaultDomain string                     `json:"faultDomain,omitempty"`
+	SeenAt      time.Time                  `json:"seenAt"`
 	cloudStorageStats
 }
 
 type cloudHub struct {
 	mu            sync.Mutex
+	pruneMu       sync.Mutex
+	pruned        map[string]bool
+	prunePath     string
+	lease         *cleanupLease
+	writers       *catalogWriterRegistry
 	nodes         map[string]cloudNode
 	heartbeatSeen map[string]bool
 	signals       map[string][]cloudPeerSignal
@@ -49,7 +57,26 @@ func newCloudHub() (*cloudHub, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &cloudHub{nodes: map[string]cloudNode{}, heartbeatSeen: map[string]bool{}, signals: map[string][]cloudPeerSignal{}, signalWake: map[string]chan struct{}{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json")}
+	c := &cloudHub{nodes: map[string]cloudNode{}, heartbeatSeen: map[string]bool{}, signals: map[string][]cloudPeerSignal{}, signalWake: map[string]chan struct{}{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json"), prunePath: filepath.Join(dir, "pruned-catalog.json"), pruned: map[string]bool{}}
+	writers, err := newCatalogWriterRegistry(dir)
+	if err != nil {
+		return nil, err
+	}
+	c.writers = writers
+	if data, readErr := os.ReadFile(c.prunePath); readErr == nil {
+		var ids []string
+		if json.Unmarshal(data, &ids) != nil {
+			return nil, errors.New("invalid Hub catalog prune registry")
+		}
+		for _, id := range ids {
+			if !validCloudHash(id) {
+				return nil, errors.New("invalid Hub catalog prune ID")
+			}
+			c.pruned[id] = true
+		}
+	} else if !os.IsNotExist(readErr) {
+		return nil, readErr
+	}
 	if data, err := os.ReadFile(c.registryPath); err == nil {
 		var saved []cloudNode
 		if err := json.Unmarshal(data, &saved); err != nil {
@@ -63,6 +90,14 @@ func newCloudHub() (*cloudHub, error) {
 		}
 	} else if !os.IsNotExist(err) {
 		log.Printf("Cloud node registry unavailable: %v", err)
+	}
+	if err := c.finishPrunedOnStartup(); err != nil {
+		return nil, err
+	}
+	if len(c.writers.writers) == 0 {
+		if err := c.writers.rebuildFromCatalog(disk); err != nil {
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -92,6 +127,7 @@ func validCloudNode(node cloudNode) bool {
 	}
 	return node.ID != "" && len(node.ID) <= 128 && validCloudEndpoint(node.Endpoint) &&
 		(node.Role == "client" || node.Role == "storage") &&
+		(node.FaultDomain == "" || validCloudFaultDomain(node.FaultDomain)) &&
 		(node.Backend == "" || node.Backend == "disk" || node.Backend == "s3" || node.Backend == "webdav" || node.Backend == "openlist") &&
 		node.BlockCount >= 0 && node.CatalogCount >= 0 &&
 		(node.BlockBytes == nil || *node.BlockBytes >= 0) &&
@@ -349,6 +385,10 @@ func (c *cloudHub) routes(mux *http.ServeMux, token string) {
 }
 
 func (c *cloudHub) routesWithAuth(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
+	c.pruneRoutes(mux, authorize)
+	c.writerRoutes(mux, authorize)
+	c.cleanupLeaseRoutes(mux, authorize)
+	mux.Handle("GET /cloud/capabilities", authorize(http.HandlerFunc(c.hubCatalogCapabilities)))
 	c.signalRoutes(mux, authorize)
 	mux.Handle("POST /cloud/nodes/heartbeat", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var node cloudNode
@@ -386,12 +426,20 @@ func (c *cloudHub) routesWithAuth(mux *http.ServeMux, authorize func(http.Handle
 	})))
 	// The Hub keeps only opaque encrypted catalog records. It never stores blocks.
 	mux.Handle("GET /cloud/catalog", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.pruneMu.Lock()
+		defer c.pruneMu.Unlock()
 		ids, err := c.disk.list("catalog")
 		if err != nil {
 			http.Error(w, "catalog unavailable", 500)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"records": ids})
+		visible := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if !c.pruned[id] {
+				visible = append(visible, id)
+			}
+		}
+		writeJSON(w, 200, map[string]any{"records": visible})
 	})))
 	for _, method := range []string{http.MethodGet, http.MethodPut} {
 		method := method
@@ -402,11 +450,55 @@ func (c *cloudHub) routesWithAuth(mux *http.ServeMux, authorize func(http.Handle
 				return
 			}
 			if method == http.MethodPut {
-				if err := c.disk.put("catalog", id, r.Body, cloudMaxRecordSize); err != nil {
+				c.pruneMu.Lock()
+				defer c.pruneMu.Unlock()
+				if c.pruned[id] {
+					http.Error(w, "catalog record was pruned", http.StatusGone)
+					return
+				}
+				if c.leaseActiveLocked() {
+					http.Error(w, "cleanup in progress", http.StatusLocked)
+					return
+				}
+				data, err := io.ReadAll(io.LimitReader(r.Body, cloudMaxRecordSize+1))
+				if err != nil || len(data) == 0 || int64(len(data)) > cloudMaxRecordSize {
 					http.Error(w, "invalid catalog record", 400)
 					return
 				}
+				var record cloudRecord
+				if err := json.Unmarshal(data, &record); err != nil || validateCloudRecord(data) != nil {
+					http.Error(w, "invalid catalog record", 400)
+					return
+				}
+				if cloudHash(data) != id {
+					http.Error(w, "invalid catalog record", 400)
+					return
+				}
+				if err := c.writers.admit(record); err != nil {
+					status := http.StatusForbidden
+					if errors.Is(err, errWriterEpochStale) {
+						status = http.StatusConflict
+					}
+					http.Error(w, err.Error(), status)
+					return
+				}
+				if err := c.disk.put("catalog", id, bytes.NewReader(data), cloudMaxRecordSize); err != nil {
+					http.Error(w, "invalid catalog record", 400)
+					return
+				}
+				if c.writers.recordAccepted(record) {
+					if err := c.writers.saveLocked(); err != nil {
+						log.Printf("Hub writer registry save failed: %v", err)
+					}
+				}
 				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			c.pruneMu.Lock()
+			pruned := c.pruned[id]
+			c.pruneMu.Unlock()
+			if pruned {
+				http.Error(w, "catalog record was pruned", http.StatusGone)
 				return
 			}
 			file, err := c.disk.get("catalog", id)
@@ -446,4 +538,26 @@ func hubHTTPURL(wsURL string) (string, error) {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func (c *cloudHub) hubCatalogCapabilities(w http.ResponseWriter, r *http.Request) {
+	libraryID, authorID := r.URL.Query().Get("libraryId"), r.URL.Query().Get("authorId")
+	if (libraryID == "") != (authorID == "") || libraryID != "" && (!validCloudHash(libraryID) || authorID == "" || len(authorID) > 128) {
+		http.Error(w, "invalid writer identity", http.StatusBadRequest)
+		return
+	}
+	minimum := 3
+	var epoch int64
+	retired := false
+	if libraryID != "" {
+		c.pruneMu.Lock()
+		state, exists := c.writers.writerState(libraryID, authorID)
+		c.pruneMu.Unlock()
+		if exists {
+			minimum = state.MinFormat
+			epoch = state.Epoch
+			retired = state.Retired
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"maxCatalogFormat": 4, "minWriterFormat": minimum, "logicalFileIdentity": true, "writerEpoch": epoch, "writerRetired": retired, "hubWriterGate": true})
 }

@@ -26,6 +26,8 @@ func TestCloudDownloadPrefersMatchingLocalOriginalAndFallsBackForChangedFile(t *
 		CREATE TABLE resource_folders (resource_id TEXT, folder_id TEXT);
 		CREATE TABLE tags (id TEXT, name TEXT);
 		CREATE TABLE resource_tags (resource_id TEXT, tag_id TEXT);
+		CREATE TABLE library_file_lifecycle (file_id TEXT PRIMARY KEY, state TEXT);
+		CREATE TABLE library_file_deletions (file_id TEXT PRIMARY KEY);
 		INSERT INTO folders VALUES ('travel','旅行');
 		INSERT INTO resource_folders VALUES ('clip','travel');
 		INSERT INTO tags VALUES ('tag','家庭');

@@ -37,11 +37,12 @@ public final class ResourceNodeService extends Service {
         if(!hub.equals(previous.getString("hub","")))previous.edit().remove("index_key").putBoolean("index_enabled",false).commit();
         context.getSharedPreferences(PREFS,MODE_PRIVATE).edit().putString("hub",hub).putString("id",id)
             .putString("token",CloudSecretStore.protect(token)).putBoolean("paired",true).apply();
+        LocalIndexJobService.schedule(context,true);
     }
 
     static boolean clearPaired(Context context,String hub){
         SharedPreferences p=context.getSharedPreferences(PREFS,MODE_PRIVATE);
-        if(p.getBoolean("paired",false)&&hub.equals(p.getString("hub",""))){p.edit().remove("token").remove("paired").apply();return true;}
+        if(p.getBoolean("paired",false)&&hub.equals(p.getString("hub",""))){p.edit().remove("token").remove("paired").apply();LocalIndexJobService.schedule(context,false);return true;}
         return false;
     }
 
@@ -62,14 +63,7 @@ public final class ResourceNodeService extends Service {
         AppLog.info("Resource node starting");
         try{rtc=new ResourceNodeRTC(this,api,workers);}catch(Exception ex){AppLog.error("Resource node WebRTC startup failed",ex);status="WebRTC 启动失败："+ex.getMessage();running=false;api.close();stopSelf();return START_NOT_STICKY;}
         workers.execute(this::run);
-        workers.execute(()->{
-            LocalIndexPublisher publisher=new LocalIndexPublisher(this);
-            while(!stopped){
-                try{publisher.sync(hub,token,id);}catch(InterruptedException ex){Thread.currentThread().interrupt();break;}
-                catch(Exception ex){LocalIndexPublisher.status="索引同步失败，将重试："+ex.getMessage();AppLog.error("Local index publish failed",ex);}
-                try{Thread.sleep(20000);}catch(InterruptedException ex){Thread.currentThread().interrupt();break;}
-            }
-        });
+        LocalIndexJobService.schedule(this,true);
         return START_STICKY;
     }
 

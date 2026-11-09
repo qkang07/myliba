@@ -854,11 +854,14 @@ func copyMediaFile(source, target string) error {
 }
 
 func (s *server) backfillMediaAssets() {
+	started := time.Now()
+	log.Printf("media index startup: backfill query starting")
 	rows, err := s.db.Query(`SELECT id,path,kind,size,modified_at FROM resources WHERE available=1 AND kind IN ('image','video')`)
 	if err != nil {
-		log.Printf("media index backfill: %v", err)
+		log.Printf("media index startup: backfill query failed after %s: %v", time.Since(started), err)
 		return
 	}
+	log.Printf("media index startup: backfill query acquired after %s", time.Since(started))
 	type source struct {
 		id, path, kind, modified string
 		size                     int64
@@ -905,6 +908,7 @@ func (s *server) backfillMediaAssets() {
 			}
 		}
 	}
+	log.Printf("media index startup: backfill completed for %d resources in %s", len(sources), time.Since(started))
 }
 
 type indexedLocation struct {
@@ -984,6 +988,11 @@ func (s *server) fileIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) buildFileIndex(id string, includeCloud bool) (fileIndexView, error) {
 	index := fileIndexView{FileID: id, Tags: []string{}, Original: indexedContent{Local: []indexedLocation{}}, Assets: []indexedAsset{}}
+	if fileID, err := s.unifiedFileID(id); err != nil {
+		return index, err
+	} else {
+		index.FileID = fileID
+	}
 	var path, rootID string
 	var available bool
 	localErr := s.db.QueryRow(`SELECT current_version_id,name,kind,modified_at,size,path,root_id,available
@@ -993,8 +1002,9 @@ func (s *server) buildFileIndex(id string, includeCloud bool) (fileIndexView, er
 		return index, localErr
 	}
 	if localErr == nil {
+		_ = s.db.QueryRow(`SELECT current_name FROM library_file_name_state WHERE file_id=?`, index.FileID).Scan(&index.Name)
 		index.OrganizationKnown = true
-		err := s.db.QueryRow(`SELECT f.id,f.name,f.password_hash<>'' FROM resource_folders rf JOIN folders f ON f.id=rf.folder_id WHERE rf.resource_id=?`, id).Scan(&index.FolderID, &index.FolderName, &index.Protected)
+		err := s.db.QueryRow(`SELECT f.id,f.name,f.password_hash<>'' FROM library_file_folders lf JOIN folders f ON f.id=lf.folder_id WHERE lf.file_id=?`, index.FileID).Scan(&index.FolderID, &index.FolderName, &index.Protected)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return index, err
 		}
@@ -1006,7 +1016,7 @@ func (s *server) buildFileIndex(id string, includeCloud bool) (fileIndexView, er
 			index.Original.Local = append(index.Original.Local, indexedLocation{NodeID: nodeID, StorageID: rootID, Path: path})
 		}
 		index.ContentSize = s.mediaContentSize(id, index.Original.Size, index.Modified)
-		rows, err := s.db.Query(`SELECT t.name FROM tags t JOIN resource_tags rt ON rt.tag_id=t.id WHERE rt.resource_id=? ORDER BY t.name`, id)
+		rows, err := s.db.Query(`SELECT t.name FROM tags t JOIN library_file_tags lt ON lt.tag_id=t.id WHERE lt.file_id=? ORDER BY t.name`, index.FileID)
 		if err != nil {
 			return index, err
 		}

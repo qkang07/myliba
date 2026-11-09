@@ -354,6 +354,130 @@ func TestCloudOpaqueCatalogAndRelayBoundary(t *testing.T) {
 	}
 }
 
+func TestCloudStoreRejectsSameAuthorFormatDowngrade(t *testing.T) {
+	disk, err := newCloudDisk(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(format int, author, at string) error {
+		record := cloudRecord{Format: format, LibraryID: cloudHash([]byte("library")), ObjectID: "file-1", RevisionID: at,
+			AuthorID: author, CreatedAt: at, Nonce: strings.Repeat("0", 24), Sealed: strings.Repeat("a", 32), BlockIDs: []string{}}
+		data, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return disk.put("catalog", cloudHash(data), bytes.NewReader(data), cloudMaxRecordSize)
+	}
+	if err := put(4, "writer", "2026-11-02T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := put(3, "writer", "2026-11-01T00:00:00Z"); err != nil {
+		t.Fatalf("older history must remain importable: %v", err)
+	}
+	if err := put(3, "writer", "2026-11-03T00:00:00Z"); err == nil {
+		t.Fatal("upgraded writer accepted a new format-3 record")
+	}
+	if err := put(3, "other-writer", "2026-11-03T00:00:00Z"); err != nil {
+		t.Fatalf("unupgraded writer must remain readable: %v", err)
+	}
+	disk, err = newCloudDisk(disk.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := put(3, "writer", "2026-11-04T00:00:00Z"); err == nil {
+		t.Fatal("restart lost the catalog writer upgrade boundary")
+	}
+	request := httptest.NewRequest(http.MethodGet, "/cloud/capabilities?libraryId="+cloudHash([]byte("library"))+"&authorId=writer", nil)
+	response := httptest.NewRecorder()
+	disk.catalogCapabilities(response, request)
+	var capabilities struct {
+		MaxCatalogFormat int `json:"maxCatalogFormat"`
+		MinWriterFormat  int `json:"minWriterFormat"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &capabilities) != nil || capabilities.MaxCatalogFormat != 4 || capabilities.MinWriterFormat != 4 {
+		t.Fatalf("upgraded writer capabilities: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestStorageCatalogRequiresHubCommit(t *testing.T) {
+	token := "0123456789abcdef0123456789abcdef"
+	t.Setenv("MYLIBA_HUB_DATA_DIR", t.TempDir())
+	hub, err := newCloudHub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hubMux := http.NewServeMux()
+	hub.routes(hubMux, token)
+	hubServer := httptest.NewServer(hubMux)
+	defer hubServer.Close()
+	storage := testCloudRuntime(t, t.TempDir(), token)
+	storage.hubURL = "ws" + strings.TrimPrefix(hubServer.URL, "http") + "/node"
+	storage.disk.catalogAdmission = storage.catalogCommittedByHub
+	storageMux := http.NewServeMux()
+	storage.disk.routes(storageMux, token)
+	writer := func(format int, at string) ([]byte, string) {
+		t.Helper()
+		raw, err := json.Marshal(cloudRecord{Format: format, LibraryID: cloudHash([]byte("library")), ObjectID: "file-1", RevisionID: at,
+			AuthorID: "writer", CreatedAt: at, Nonce: strings.Repeat("0", 24), Sealed: strings.Repeat("a", 32), BlockIDs: []string{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw, cloudHash(raw)
+	}
+	put := func(mux *http.ServeMux, raw []byte, id string) int {
+		req := httptest.NewRequest(http.MethodPut, "/cloud/catalog/"+id, bytes.NewReader(raw))
+		req.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, req)
+		return response.Code
+	}
+	old, oldID := writer(3, "2026-11-03T00:00:00Z")
+	if code := put(storageMux, old, oldID); code != http.StatusServiceUnavailable {
+		t.Fatalf("storage accepted uncommitted record: %d", code)
+	}
+	upgraded, upgradedID := writer(4, "2026-11-02T00:00:00Z")
+	if code := put(hubMux, upgraded, upgradedID); code != http.StatusNoContent {
+		t.Fatalf("Hub rejected upgrade: %d", code)
+	}
+	if code := put(storageMux, upgraded, upgradedID); code != http.StatusNoContent {
+		t.Fatalf("storage rejected committed record: %d", code)
+	}
+	if code := put(hubMux, old, oldID); code == http.StatusNoContent {
+		t.Fatal("Hub accepted downgraded writer")
+	}
+	if code := put(storageMux, old, oldID); code != http.StatusServiceUnavailable {
+		t.Fatalf("storage accepted downgraded uncommitted record: %d", code)
+	}
+}
+
+func TestCatalogSyncSkipsDowngradedPeerRecord(t *testing.T) {
+	newer := testCloudRuntime(t, t.TempDir(), "")
+	older := testCloudRuntime(t, t.TempDir(), "")
+	put := func(runtime *cloudRuntime, format int, at string) {
+		t.Helper()
+		record := cloudRecord{Format: format, LibraryID: cloudHash([]byte("library")), ObjectID: "file-1", RevisionID: at,
+			AuthorID: "writer", CreatedAt: at, Nonce: strings.Repeat("0", 24), Sealed: strings.Repeat("a", 32), BlockIDs: []string{}}
+		data, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.disk.put("catalog", cloudHash(data), bytes.NewReader(data), cloudMaxRecordSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(newer, 4, "2026-11-02T00:00:00Z")
+	put(older, 3, "2026-11-03T00:00:00Z")
+	token := "catalog-sync-downgrade-0123456789"
+	oldPeer := serveCloudTestNode(t, older, token)
+	if err := newer.syncCatalog(context.Background(), oldPeer.URL, token); err != nil {
+		t.Fatalf("newer node sync blocked by downgraded record: %v", err)
+	}
+	newPeer := serveCloudTestNode(t, newer, token)
+	if err := older.syncCatalog(context.Background(), newPeer.URL, token); err != nil {
+		t.Fatalf("older node sync blocked by downgraded record: %v", err)
+	}
+}
+
 func TestCloudInventoryPaginationAndHashValidation(t *testing.T) {
 	disk, err := newCloudDisk(t.TempDir())
 	if err != nil {
@@ -473,8 +597,10 @@ func TestCloudHubDiscoveryIndexSyncAndRepair(t *testing.T) {
 		t.Fatal("storage failed to obtain direct block copy")
 	}
 	recovered := testCloudRuntime(t, t.TempDir(), token)
+	serveCloudTestNode(t, recovered, token)
 	recovered.bootstrap = []cloudNode{{ID: storage.id, Endpoint: storageServer.URL, Role: "storage"}}
 	recovered.peers = recovered.bootstrap
+	recovered.hubURL = source.hubURL // Catalog recovery now requires Hub admission.
 	if err := os.WriteFile(filepath.Join(recovered.disk.dir, "recovery.key"), client.key[:], 0600); err != nil {
 		t.Fatal(err)
 	}

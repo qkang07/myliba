@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -24,14 +25,21 @@ const (
 	cloudMaxRecordSize = 1 << 20
 )
 
+var errCatalogWriterDowngrade = errors.New("catalog writer has upgraded to format 4")
+
 // cloudDisk stores immutable encrypted blocks and catalog records. The catalog
 // is opaque to storage peers and survives loss of the originating client.
 type cloudDisk struct {
-	dir     string
-	backend cloudObjectBackend
-	db      *sql.DB
-	mu      sync.RWMutex
-	roots   []cloudDiskRoot
+	dir       string
+	backend   cloudObjectBackend
+	db        *sql.DB
+	mu        sync.RWMutex
+	catalogMu sync.Mutex
+	upgrades  map[string]time.Time
+	// A storage node admits catalog writes only after the Hub has committed
+	// the identical immutable record. Local clients and the Hub leave this nil.
+	catalogAdmission func(context.Context, string) error
+	roots            []cloudDiskRoot
 }
 
 type cloudDiskRoot struct {
@@ -190,6 +198,84 @@ func (d *cloudDisk) has(kind, id string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// remove deletes an immutable object from every local root. Catalog callers
+// hold their authority's prune lock and persist a tombstone first.
+func (d *cloudDisk) remove(kind, id string) error {
+	if _, err := d.path(kind, id); err != nil {
+		return err
+	}
+	if d.backend != nil {
+		deleter, ok := d.backend.(interface{ Delete(string, string) error })
+		if !ok {
+			return errors.New("cloud backend does not support deletion")
+		}
+		return deleter.Delete(kind, id)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for at := range d.roots {
+		path := filepath.Join(d.roots[at].cloudDir, kind, id[:2], id)
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return errors.New("cloud object is not a regular file")
+		}
+		if err = os.Remove(path); err != nil {
+			return err
+		}
+		d.roots[at].usedBytes = max(int64(0), d.roots[at].usedBytes-info.Size())
+	}
+	return nil
+}
+
+func (d *cloudDisk) objectStat(kind, id string) (time.Time, int64, error) {
+	if _, err := d.path(kind, id); err != nil {
+		return time.Time{}, 0, err
+	}
+	if d.backend != nil {
+		stat, ok := d.backend.(interface {
+			Stat(string, string) (time.Time, int64, error)
+		})
+		if !ok {
+			return time.Time{}, 0, errors.New("cloud backend object age unavailable")
+		}
+		return stat.Stat(kind, id)
+	}
+	d.mu.RLock()
+	roots := append([]cloudDiskRoot(nil), d.roots...)
+	d.mu.RUnlock()
+	var newest time.Time
+	var bytes int64
+	found := false
+	for _, root := range roots {
+		path := filepath.Join(root.cloudDir, kind, id[:2], id)
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return time.Time{}, 0, err
+		}
+		if !info.Mode().IsRegular() {
+			return time.Time{}, 0, errors.New("cloud object is not a regular file")
+		}
+		found = true
+		bytes += info.Size()
+		if info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	if !found {
+		return time.Time{}, 0, os.ErrNotExist
+	}
+	return newest, bytes, nil
+}
+
 func (d *cloudDisk) valid(kind, id string) bool {
 	file, err := d.get(kind, id)
 	if err != nil {
@@ -214,15 +300,36 @@ func (d *cloudDisk) put(kind, id string, body io.Reader, limit int64) error {
 	if len(data) == 0 || int64(len(data)) > limit || cloudHash(data) != id {
 		return errors.New("invalid cloud object")
 	}
+	var catalog cloudRecord
+	persisted := false
 	if kind == "catalog" {
 		if err := validateCloudRecord(data); err != nil {
 			return err
 		}
+		if err := json.Unmarshal(data, &catalog); err != nil {
+			return err
+		}
+		// Serialize the upgrade check with catalog writes on this storage node.
+		// Older history may arrive late, but a writer that has already emitted a
+		// format-4 record cannot publish a newer format-3 record here.
+		d.catalogMu.Lock()
+		defer d.catalogMu.Unlock()
+		if err := d.rejectCatalogDowngradeLocked(catalog); err != nil {
+			return err
+		}
+		defer func() {
+			if persisted && catalog.Format >= 4 {
+				d.recordUpgradeLocked(catalog)
+			}
+		}()
 	}
 	if d.backend != nil {
-		return d.backend.Put(kind, id, data)
+		err := d.backend.Put(kind, id, data)
+		persisted = err == nil
+		return err
 	}
 	if d.valid(kind, id) {
+		persisted = true
 		return nil
 	}
 	d.mu.Lock()
@@ -239,6 +346,7 @@ func (d *cloudDisk) put(kind, id string, body io.Reader, limit int64) error {
 		}
 		existing := filepath.Join(root.cloudDir, kind, id[:2], id)
 		if existingData, e := os.ReadFile(existing); e == nil && cloudHash(existingData) == id {
+			persisted = true
 			return nil
 		} else if e == nil {
 			_ = os.Remove(existing)
@@ -273,9 +381,86 @@ func (d *cloudDisk) put(kind, id string, body io.Reader, limit int64) error {
 			continue
 		}
 		d.roots[i].usedBytes = used + int64(len(data))
+		persisted = true
 		return nil
 	}
 	return errors.New("所有本机存储目录均已达到容量上限或不可写")
+}
+
+func (d *cloudDisk) rejectCatalogDowngrade(data []byte) error {
+	var incoming cloudRecord
+	if err := json.Unmarshal(data, &incoming); err != nil {
+		return err
+	}
+	d.catalogMu.Lock()
+	defer d.catalogMu.Unlock()
+	return d.rejectCatalogDowngradeLocked(incoming)
+}
+
+func (d *cloudDisk) catalogCapabilities(w http.ResponseWriter, r *http.Request) {
+	libraryID, authorID := r.URL.Query().Get("libraryId"), r.URL.Query().Get("authorId")
+	if (libraryID == "") != (authorID == "") || libraryID != "" && (!validCloudHash(libraryID) || authorID == "" || len(authorID) > 128) {
+		http.Error(w, "invalid writer identity", http.StatusBadRequest)
+		return
+	}
+	minimum := 3
+	if libraryID != "" {
+		d.catalogMu.Lock()
+		err := d.rejectCatalogDowngradeLocked(cloudRecord{Format: 3, LibraryID: libraryID, AuthorID: authorID, CreatedAt: "9999-12-31T23:59:59Z"})
+		d.catalogMu.Unlock()
+		if errors.Is(err, errCatalogWriterDowngrade) {
+			minimum = 4
+		} else if err != nil {
+			http.Error(w, "catalog capabilities unavailable", http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"maxCatalogFormat": 4, "minWriterFormat": minimum, "logicalFileIdentity": true})
+}
+
+func (d *cloudDisk) recordUpgradeLocked(record cloudRecord) {
+	at, err := time.Parse(time.RFC3339Nano, record.CreatedAt)
+	if err != nil {
+		return
+	}
+	key := record.LibraryID + "\x00" + record.AuthorID
+	if previous, ok := d.upgrades[key]; !ok || at.Before(previous) {
+		d.upgrades[key] = at
+	}
+}
+
+func (d *cloudDisk) rejectCatalogDowngradeLocked(incoming cloudRecord) error {
+	if d.upgrades == nil {
+		d.upgrades = map[string]time.Time{}
+		ids, err := d.list("catalog")
+		if err != nil {
+			d.upgrades = nil
+			return err
+		}
+		for _, id := range ids {
+			file, openErr := d.get("catalog", id)
+			if openErr != nil {
+				d.upgrades = nil
+				return openErr
+			}
+			var stored cloudRecord
+			decodeErr := json.NewDecoder(io.LimitReader(file, cloudMaxRecordSize)).Decode(&stored)
+			file.Close()
+			if decodeErr == nil && stored.Format >= 4 {
+				d.recordUpgradeLocked(stored)
+			}
+		}
+	}
+	if incoming.Format != 3 {
+		return nil
+	}
+	if upgradedAt, ok := d.upgrades[incoming.LibraryID+"\x00"+incoming.AuthorID]; ok {
+		incomingAt, err := time.Parse(time.RFC3339Nano, incoming.CreatedAt)
+		if err == nil && !incomingAt.Before(upgradedAt) {
+			return errCatalogWriterDowngrade
+		}
+	}
+	return nil
 }
 
 func cloudDiskRootUsage(root string) int64 {
@@ -328,7 +513,7 @@ func validateCloudRecord(data []byte) error {
 	}
 	if !validCloudHash(record.LibraryID) || record.ObjectID == "" || len(record.ObjectID) > 128 ||
 		record.RevisionID == "" || len(record.RevisionID) > 128 || record.AuthorID == "" || len(record.AuthorID) > 128 ||
-		record.Format > 3 || record.CreatedAt == "" || len(record.BlockIDs) > 10000 {
+		record.Format > 4 || record.CreatedAt == "" || len(record.BlockIDs) > 10000 || record.AuthorEpoch < 0 || record.AuthorEpoch > 1<<40 {
 		return errors.New("invalid catalog record")
 	}
 	if _, err := time.Parse(time.RFC3339Nano, record.CreatedAt); err != nil {
@@ -434,6 +619,7 @@ func (d *cloudDisk) routes(mux *http.ServeMux, token string) {
 }
 
 func (d *cloudDisk) routesWithAuth(mux *http.ServeMux, authorize func(http.Handler) http.Handler) {
+	mux.Handle("GET /cloud/capabilities", authorize(http.HandlerFunc(d.catalogCapabilities)))
 	mux.Handle("GET /cloud/ping", authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})))
@@ -493,6 +679,12 @@ func (d *cloudDisk) routesWithAuth(mux *http.ServeMux, authorize func(http.Handl
 					return
 				}
 				if method == http.MethodPut {
+					if kind == "catalog" && d.catalogAdmission != nil {
+						if err := d.catalogAdmission(r.Context(), id); err != nil {
+							http.Error(w, "catalog record has not been committed by Hub", http.StatusServiceUnavailable)
+							return
+						}
+					}
 					limit := int64(cloudMaxBlobSize)
 					if kind == "catalog" {
 						limit = cloudMaxRecordSize

@@ -233,6 +233,23 @@ func (c *cloudClient) queueLocalIndex(objectID string) {
 	c.wakeAssetWorker()
 }
 
+func (c *cloudClient) queueLocalIndexByFileID(fileID string) {
+	if c == nil || c.runtime == nil || c.runtime.db == nil {
+		return
+	}
+	rows, err := c.runtime.db.Query(`SELECT resource_id FROM library_resource_aliases WHERE file_id=?`, fileID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var resourceID string
+		if rows.Scan(&resourceID) == nil {
+			c.queueLocalIndex(resourceID)
+		}
+	}
+}
+
 func (c *cloudClient) wakeAssetWorker() {
 	select {
 	case c.assetWake <- struct{}{}:
@@ -249,6 +266,15 @@ func (c *cloudClient) assetSyncWorker(ctx context.Context) {
 			return
 		case <-c.assetWake:
 		case <-ticker.C:
+		}
+		if err := c.applyRemoteOperations(); err != nil {
+			log.Printf("library operation bootstrap: %v", err)
+			continue
+		}
+		var retired int
+		if err := c.runtime.db.QueryRow(`SELECT COUNT(*) FROM library_members WHERE node_id=? AND state='retired'`, c.runtime.id).Scan(&retired); err != nil || retired != 0 {
+			log.Printf("library publisher paused: member retired or state unavailable: %v", err)
+			continue
 		}
 		c.queueMu.Lock()
 		pending := c.assetPending
@@ -267,6 +293,18 @@ func (c *cloudClient) assetSyncWorker(ctx context.Context) {
 				c.assetPending[objectID] = c.assetPending[objectID] || withCloudAssets
 				c.queueMu.Unlock()
 			}
+		}
+		if err := c.publishPendingOperations(); err != nil {
+			log.Printf("library operation sync: %v", err)
+		}
+		if err := c.applyRemoteOperations(); err != nil {
+			log.Printf("library operation apply: %v", err)
+		}
+		if err := c.publishOperationSnapshots(); err != nil {
+			log.Printf("library snapshot publish: %v", err)
+		}
+		if err := c.publishLibraryReceipt(); err != nil {
+			log.Printf("library receipt publish: %v", err)
 		}
 	}
 }
@@ -295,7 +333,14 @@ func cloudPartType(asset cloudAsset, part cloudAssetPart) string {
 }
 
 func (c *cloudClient) serveCloudPart(w http.ResponseWriter, r *http.Request, assetID, partName string) {
-	record, manifest, err := c.findRecord(r.PathValue("id"))
+	var record cloudRecord
+	var manifest cloudManifest
+	var err error
+	if revision := r.PathValue("revision"); revision != "" {
+		record, manifest, err = c.versionRecord(r.PathValue("id"), revision)
+	} else {
+		record, manifest, err = c.findRecord(r.PathValue("id"))
+	}
 	if err != nil {
 		writeError(w, 404, "文件不存在")
 		return
@@ -372,10 +417,26 @@ func (c *cloudClient) serveCloudPart(w http.ResponseWriter, r *http.Request, ass
 }
 
 func (c *cloudClient) cloudAssetPart(w http.ResponseWriter, r *http.Request) {
+	if c.hiddenCloudObject(w, r.PathValue("id")) {
+		return
+	}
+	if r.URL.Query().Get("libraryRead") == "1" {
+		record, manifest, err := c.versionRecord(r.PathValue("id"), r.PathValue("revision"))
+		if err != nil {
+			writeError(w, 404, "云层资产版本不存在")
+			return
+		}
+		if !c.authorizeCloudLibraryRead(w, r, record, manifest, "thumbnail") {
+			return
+		}
+	}
 	c.serveCloudPart(w, r, r.PathValue("asset"), r.PathValue("part"))
 }
 
 func (c *cloudClient) cloudVideo(w http.ResponseWriter, r *http.Request) {
+	if c.hiddenCloudObject(w, r.PathValue("id")) {
+		return
+	}
 	if r.URL.Query().Get("mode") == "ondemand" {
 		if c.indexer == nil || videoQualities[r.PathValue("quality")].width == 0 {
 			writeError(w, 503, "云视频转码不可用")
@@ -419,6 +480,23 @@ func (c *cloudClient) cloudVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *cloudClient) cloudVideoPart(w http.ResponseWriter, r *http.Request) {
+	if c.hiddenCloudObject(w, r.PathValue("id")) {
+		return
+	}
+	if libraryStreamToken(r) != "" {
+		record, manifest, err := c.findRecord(r.PathValue("id"))
+		if err != nil {
+			writeError(w, 404, "文件不存在")
+			return
+		}
+		fileID := manifest.FileID
+		if fileID == "" {
+			fileID = record.ObjectID
+		}
+		if _, ok := c.authorizeLibraryStreamCredential(w, r, fileID, record.RevisionID, record.ObjectID, "preview"); !ok {
+			return
+		}
+	}
 	if r.URL.Query().Get("mode") == "ondemand" {
 		if c.indexer == nil || videoQualities[r.PathValue("quality")].width == 0 {
 			writeError(w, 503, "云视频转码不可用")

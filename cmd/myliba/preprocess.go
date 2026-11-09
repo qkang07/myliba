@@ -106,11 +106,14 @@ func (s *server) startPreprocessing() error {
 }
 
 func (s *server) backfillPreprocessing() {
+	started := time.Now()
+	log.Printf("preprocess startup: backfill query starting")
 	rows, err := s.db.Query(`SELECT r.id,r.path,r.kind FROM resources r JOIN roots x ON x.id=r.root_id WHERE r.available=1 AND x.auto_preprocess=1`)
 	if err != nil {
-		log.Printf("preprocess backfill: %v", err)
+		log.Printf("preprocess startup: backfill query failed after %s: %v", time.Since(started), err)
 		return
 	}
+	log.Printf("preprocess startup: backfill query acquired after %s", time.Since(started))
 	type item struct{ id, path, kind string }
 	var items []item
 	for rows.Next() {
@@ -131,6 +134,7 @@ func (s *server) backfillPreprocessing() {
 			}
 		}
 	}
+	log.Printf("preprocess startup: backfill completed for %d resources in %s", len(items), time.Since(started))
 }
 
 func (s *server) claimPreprocessJob() (string, string, string, error) {

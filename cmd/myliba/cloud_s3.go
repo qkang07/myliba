@@ -155,6 +155,34 @@ func (b *s3Backend) Get(kind, id string) ([]byte, error) {
 	return data, nil
 }
 
+func (b *s3Backend) Delete(kind, id string) error {
+	response, err := b.request(http.MethodDelete, b.objectKey(kind, id), nil, nil)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 && response.StatusCode != 204 && response.StatusCode != 404 {
+		return fmt.Errorf("S3 DELETE: HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+func (b *s3Backend) Stat(kind, id string) (time.Time, int64, error) {
+	response, err := b.request(http.MethodHead, b.objectKey(kind, id), nil, nil)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return time.Time{}, 0, fmt.Errorf("S3 HEAD: HTTP %d", response.StatusCode)
+	}
+	modified, err := http.ParseTime(response.Header.Get("Last-Modified"))
+	if err != nil || response.ContentLength < 0 {
+		return time.Time{}, 0, errors.New("S3 object age unavailable")
+	}
+	return modified, response.ContentLength, nil
+}
+
 func (b *s3Backend) List(kind string) ([]string, error) {
 	prefix := b.objectKey(kind, "")
 	ids := []string{}

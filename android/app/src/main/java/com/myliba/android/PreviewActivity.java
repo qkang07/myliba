@@ -88,6 +88,8 @@ public final class PreviewActivity extends Activity {
         String value = getIntent().getStringExtra("uri");
         if (value == null) { finish(); return; }
         fileUri = Uri.parse(value);
+        String cleanup=getIntent().getStringExtra("delete_preview_path");
+        if(cleanup!=null)try{File candidate=new File(cleanup).getCanonicalFile();if(candidate.getParentFile().equals(getCacheDir().getCanonicalFile()))remoteCache=candidate;}catch(IOException ignored){}
         remote = getIntent().hasExtra("server");
         cloud = getIntent().getBooleanExtra("cloud",false);
         mime = getIntent().getStringExtra("mime");

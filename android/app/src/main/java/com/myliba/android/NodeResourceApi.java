@@ -15,6 +15,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.security.MessageDigest;
 
 /** Remote, allowlisted view of the phone's existing SAF/SQLite library. */
 final class NodeResourceApi {
@@ -43,7 +46,7 @@ final class NodeResourceApi {
     private static int integer(String raw,int fallback,int min,int max){try{int value=Integer.parseInt(raw);return Math.max(min,Math.min(max,value));}catch(Exception ex){return fallback;}}
     private static String kind(LocalLibrary.Item item){return LibraryStore.kind(item.name,item.mime);}
     private JSONObject resource(LocalLibrary.Item item)throws Exception{
-        return new JSONObject().put("id",id(item.uri)).put("fileId",item.fileId).put("resourceRef",id(item.uri)).put("name",item.name).put("path",item.path)
+        return new JSONObject().put("id",id(item.uri)).put("fileId",item.logicalFileId).put("resourceRef",id(item.uri)).put("name",item.name).put("path",item.path)
             .put("size",item.size).put("contentSize",item.size).put("modified",Instant.ofEpochMilli(item.modified).toString())
             .put("kind",kind(item)).put("available",true).put("versionId",item.revisionId).put("folderId",item.folderId==null?"":item.folderId)
             .put("tags",new JSONArray(db.tags(item.uri))).put("attributeTags",new JSONArray());
@@ -66,6 +69,7 @@ final class NodeResourceApi {
         Uri uri=Uri.parse(rawPath);String path=uri.getPath();
         if(path==null||!path.startsWith("/api/")||path.contains("..")||path.contains("\\"))return error(403,"远程接口不允许访问");
         String[] parts=path.substring(1).split("/");
+        if(parts.length==5&&"library".equals(parts[1])&&"read".equals(parts[2])&&"GET".equals(method))return libraryRead(parts,requestHeaders,path,uri);
         if(parts.length==3&&"transfers".equals(parts[1])&&"browse".equals(parts[2])&&"GET".equals(method))return transferBrowse(uri);
         if(parts.length==3&&"transfers".equals(parts[1])&&"file".equals(parts[2]))return transferFile(method,uri,requestBody);
         if(parts.length==2&&"roots".equals(parts[1])&&"GET".equals(method)){
@@ -125,6 +129,7 @@ final class NodeResourceApi {
         Uri tree=Uri.parse(folder);String documentId=DocumentsContract.getDocumentId(tree);
         Uri children=DocumentsContract.buildChildDocumentsUriUsingTree(tree,documentId);
         JSONArray entries=new JSONArray();String parent="";
+		Map<String,String> folderNames=new HashMap<>();for(LocalLibrary.Folder item:db.folders())folderNames.put(item.id,item.name);
         String rootId=DocumentsContract.getTreeDocumentId(tree);
         if(!documentId.equals(rootId)){
             int slash=documentId.lastIndexOf('/');
@@ -138,7 +143,16 @@ final class NodeResourceApi {
                 if(name==null||name.isEmpty()||name.equals(".")||name.equals(".."))continue;
                 Uri child=DocumentsContract.buildDocumentUriUsingTree(tree,childId);boolean dir=DocumentsContract.Document.MIME_TYPE_DIR.equals(mime);long size=dir||cursor.isNull(3)?0:Math.max(0,cursor.getLong(3));
                 if(dir)transferFolders.add(child.toString());else transferFiles.put(child.toString(),size);
-                entries.put(new JSONObject().put("name",name).put("path",dir?transferDir(child.toString()):transferFilePath(child.toString())).put("dir",dir).put("size",size));
+                JSONObject entry=new JSONObject().put("name",name).put("path",dir?transferDir(child.toString()):transferFilePath(child.toString())).put("dir",dir).put("size",size);
+                if(!dir){
+                    LocalLibrary.Item indexed=db.item(child.toString());
+                    if(indexed!=null){
+                        entry.put("fileId",indexed.logicalFileId).put("revisionId",indexed.revisionId);
+                        String folderName=folderNames.get(indexed.folderId);if(folderName!=null)entry.put("folderName",folderName);
+                        JSONArray tags=new JSONArray();for(String tag:db.tags(indexed.uri))tags.put(tag);if(tags.length()>0)entry.put("tags",tags);
+                    }
+                }
+                entries.put(entry);
             }
         }catch(Exception ex){return error(403,"无法读取该目录");}
         int nameStart=Math.max(documentId.lastIndexOf('/'),documentId.lastIndexOf(':'));
@@ -190,6 +204,10 @@ final class NodeResourceApi {
                 if(output==null)throw new IOException("destination unavailable");byte[] buffer=new byte[32768];int count;while((count=input.read(buffer))!=-1)output.write(buffer,0,count);output.flush();
             }catch(Exception ex){try{DocumentsContract.deleteDocument(context.getContentResolver(),created);}catch(Exception ignored){}return error(500,"无法完成目标文件写入");}
             if(!temp.delete())return error(500,"文件已写入，但临时文件清理失败");
+			String fileID=uri.getQueryParameter("fileId"),revisionID=uri.getQueryParameter("revisionId");
+			if(fileID!=null&&!fileID.isEmpty()&&revisionID!=null&&!revisionID.isEmpty()){
+				try{String root=transferRootFor(folder);if(root==null)throw new IOException("目标根目录不可识别");List<String> tags=uri.getQueryParameters("tag");db.importTransferredItem(created.toString(),root,name,"application/octet-stream",total,System.currentTimeMillis(),fileID,revisionID,uri.getQueryParameter("folderName"),tags);}catch(Exception ex){return error(500,"文件已写入，但无法登记统一索引");}
+			}
         }
         return new Result(204,"application/octet-stream",new ByteArrayInputStream(new byte[0]),0);
     }
@@ -199,6 +217,7 @@ final class NodeResourceApi {
         for(LocalLibrary.Root root:db.roots())try{Uri rootUri=Uri.parse(root.uri),candidate=Uri.parse(value);if(rootUri.getAuthority().equals(candidate.getAuthority())&&DocumentsContract.getTreeDocumentId(rootUri).equals(DocumentsContract.getTreeDocumentId(candidate)))return true;}catch(Exception ignored){}
         return false;
     }
+	private String transferRootFor(String folder){try{Uri candidate=Uri.parse(folder);for(LocalLibrary.Root root:db.roots()){Uri rootUri=Uri.parse(root.uri);if(rootUri.getAuthority().equals(candidate.getAuthority())&&DocumentsContract.getTreeDocumentId(rootUri).equals(DocumentsContract.getTreeDocumentId(candidate)))return root.uri;}}catch(Exception ignored){}return null;}
     private boolean authorizedTransferFolderForFile(String file){
         try{Uri item=Uri.parse(file);String treeId=DocumentsContract.getTreeDocumentId(item);for(LocalLibrary.Root root:db.roots()){Uri rootUri=Uri.parse(root.uri);if(rootUri.getAuthority().equals(item.getAuthority())&&treeId.equals(DocumentsContract.getTreeDocumentId(rootUri)))return true;}}catch(Exception ignored){}return false;
     }
@@ -209,6 +228,25 @@ final class NodeResourceApi {
     private static String transferFilePath(String value){return "saffile:"+token(value);}
     private static String decodeTransferDir(String value){return value.startsWith("safdir:")?decodeToken(value.substring(7)):null;}
     private static String decodeTransferFile(String value){return value.startsWith("saffile:")?decodeToken(value.substring(8)):null;}
+
+    private Result libraryRead(String[] parts,JSONObject headers,String path,Uri uri)throws Exception{
+        String asset=parts[4],ref=parts[3];
+        if(!"file".equals(asset)&&!"thumbnail".equals(asset)&&!"video-preview".equals(asset))return error(404,"读取资产不存在");
+        LocalLibrary.Item found=item(ref);if(found==null)return error(404,"资源不存在");
+        String raw=header(headers,"X-Myliba-Library-Read"),keyText=CloudSecretStore.read(context.getSharedPreferences(ResourceNodeService.PREFS,Context.MODE_PRIVATE),"index_key");
+        if(raw.length()>4096||keyText.isEmpty())return error(403,"读取凭据无效");
+        String[] sections=raw.split("\\.",-1);if(sections.length!=2)return error(403,"读取凭据无效");
+        byte[] payload,signature;try{payload=Base64.decode(sections[0],Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING);signature=Base64.decode(sections[1],Base64.URL_SAFE|Base64.NO_WRAP|Base64.NO_PADDING);}catch(Exception ex){return error(403,"读取凭据无效");}
+        byte[] key=LocalIndexCrypto.key(keyText);Mac mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(key,"HmacSHA256"));
+        if(!MessageDigest.isEqual(signature,mac.doFinal(payload)))return error(403,"读取凭据无效");
+        JSONObject ticket;try{ticket=new JSONObject(new String(payload,StandardCharsets.UTF_8));}catch(Exception ex){return error(403,"读取凭据无效");}
+        String purpose="file".equals(asset)?"original":"video-preview".equals(asset)?"preview":"thumbnail";
+        long expires=ticket.optLong("e",0),now=System.currentTimeMillis()/1000;
+        if(!ticket.optString("l").equals(LocalIndexCrypto.hash(key))||!ticket.optString("u").equals(path)||!ticket.optString("n").equals(ResourceNodeService.ensureID(context))||!ticket.optString("r").equals(ref)||!ticket.optString("f").equals(found.logicalFileId)||!ticket.optString("v").equals(found.revisionId)||!(purpose.equals(ticket.optString("p"))||"thumbnail".equals(asset)&&"preview".equals(ticket.optString("p")))||expires<=now||expires>now+120)return error(403,"读取凭据无效或来源版本已变化");
+        if("file".equals(asset))return file(found,headers,uri);
+        if("thumbnail".equals(asset))return thumbnail(found,false);
+        return error(404,"暂无视频预览资产");
+    }
 
     private Result page(Uri uri,boolean selection)throws Exception{
         int limit=integer(uri.getQueryParameter("limit"),48,1,1000),offset=integer(uri.getQueryParameter("offset"),0,0,Integer.MAX_VALUE);
