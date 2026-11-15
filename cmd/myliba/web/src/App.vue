@@ -7,6 +7,8 @@ import ImagePreview from "./ImagePreview.vue";
 import StreamingVideo from "./StreamingVideo.vue";
 import HubSettings from "./HubSettings.vue";
 import CloudPanel from "./CloudPanel.vue";
+import LibrarySearch from "./LibrarySearch.vue";
+import CloudFileDetail from "./CloudFileDetail.vue";
 import HubCloudDashboard from "./HubCloudDashboard.vue";
 import DeviceManager from "./DeviceManager.vue";
 import NodeTransfer from "./NodeTransfer.vue";
@@ -67,7 +69,6 @@ import {
   retryFailedPreprocessJobs,
   type PreprocessQueue,
   getBatchTagSuggestions,
-  getResources,
   getResourceSelection,
   getCollections,
   getFolders,
@@ -98,7 +99,9 @@ import {
   updateCollection,
   type DirectoryListing,
   type BatchTagSuggestion,
+  type CloudFile,
   type CollectionFilters,
+  type LibrarySearchPage,
   type SmartCollection,
   type ResourceSort,
   type Resource,
@@ -111,6 +114,8 @@ import {
   type TrafficRate,
   type HubResourceNode,
 } from "./api";
+import { loadLibraryPage, type CloudFilters, type LibraryItem, type LibraryScope } from "./libraryScope";
+import { lockedOfflineIndex, offlineIndexStatus, saveOfflineIndex, unlockOfflineIndex } from "./libraryOffline";
 
 const remoteMode = ref(false);
 const authenticated = ref(true);
@@ -120,7 +125,7 @@ const resourceNodes = ref<HubResourceNode[]>([]);
 const selectedResourceNodeID = ref("");
 const resourceIceServers = ref<RTCIceServer[]>([]);
 const transferOpen = ref(false);
-const cloudPanelRef = ref<InstanceType<typeof CloudPanel> | null>(null);
+const librarySearchRef = ref<InstanceType<typeof LibrarySearch> | null>(null);
 const selectedResourceNodeKind = computed(() => resourceNodes.value.find((node) => node.id === selectedResourceNodeID.value)?.kind);
 const nodeTransport = ref<"connecting" | "webrtc" | "turn" | "relay">("relay");
 const nodePathSummary = ref("");
@@ -130,6 +135,18 @@ const loading = ref(false);
 const initialized = ref(false);
 const errorMessage = ref("");
 const resources = ref<Resource[]>([]);
+const scope = ref<LibraryScope>("node");
+const libraryItems = ref<LibraryItem[]>([]);
+const libraryCursor = ref("");
+const libraryNodeId = ref("");
+const libraryDetailFile = ref<CloudFile | null>(null);
+const cloudLifecycle = ref<"active" | "trashed">("active");
+const cloudGrouped = ref<"" | "true" | "false">("");
+const cloudCopy = ref<"" | "true" | "false">("");
+const cloudReadable = ref<"" | "true" | "false">("");
+const libraryCoverage = ref<LibrarySearchPage["coverage"] | null>(null);
+const libraryOfflineMode = ref(false);
+const offlineStatus = ref<{ nodeId: string; libraryId: string; syncedAt: string; count: number } | null>(null);
 const failedThumbnailIDs = ref(new Set<string>());
 const preprocessOpen = ref(false);
 const retryingFailedJobs = ref(false);
@@ -286,6 +303,15 @@ function currentFilters(): CollectionFilters {
   };
 }
 
+function cloudFilters(): CloudFilters {
+  return {
+    lifecycle: cloudLifecycle.value,
+    grouped: cloudGrouped.value === "" ? undefined : cloudGrouped.value === "true",
+    cloudCopy: cloudCopy.value === "" ? undefined : cloudCopy.value === "true",
+    readable: cloudReadable.value === "" ? undefined : cloudReadable.value === "true",
+  };
+}
+
 function effectiveAttributes(filters: CollectionFilters): string[] {
   const attributes = [...(filters.attributes || [])];
   if (filters.kind && !attributes.includes("type:" + filters.kind)) attributes.push("type:" + filters.kind);
@@ -319,7 +345,9 @@ const pageTitle = computed(() => {
 const selectedCount = computed(() => selectedIDs.value.size);
 const selectedMediaCount = computed(() => [...selectedResources.value.values()].filter((resource) => resource.available && ["image", "video"].includes(resource.kind)).length);
 const totalIndexed = computed(() => roots.value.reduce((sum, root) => sum + root.count, 0));
-const hasMore = computed(() => resources.value.length < total.value);
+const hasMore = computed(() => scope.value === "node" ? resources.value.length < total.value : libraryItems.value.length < total.value);
+const isLibraryScope = computed(() => scope.value !== "node");
+const gridCount = computed(() => scope.value === "node" ? resources.value.length : libraryItems.value.length);
 const previewIndex = computed(() => previewResource.value ? resources.value.findIndex((item) => item.id === previewResource.value?.id) : -1);
 const previewPosition = computed(() => previewIndex.value < 0 ? 1 : previewIndex.value + 1);
 const previewTotal = computed(() => Math.max(total.value, resources.value.length));
@@ -586,38 +614,111 @@ async function loadResources(append = false) {
   if (!append) void loadAttributeCatalog();
   if (activeFolderID.value === null) {
     resources.value = [];
+    libraryItems.value = [];
+    libraryCursor.value = "";
     total.value = 0;
     loading.value = false;
     return;
   }
   if (!append) {
     pageOffset.value = 0;
+    libraryCursor.value = "";
     loading.value = true;
   }
   errorMessage.value = "";
   try {
-    const result = await getResources({
-      query: query.value.trim(),
-      tags: selectedTags.value,
-      attributes: selectedAttributes.value,
-      unorganized: unorganizedOnly.value,
-      reachable: reachableOnly.value,
-      kind: selectedKind.value,
-      rootId: selectedRootID.value,
-      folderId: activeFolderID.value,
-      sort: sortOrder.value,
+    const filters = currentFilters();
+    const result = await loadLibraryPage(scope.value, scope.value === "node" ? filters : { ...filters, folderId: "all" }, {
       limit: pageSize,
       offset: append ? pageOffset.value : 0,
-    });
+      cursor: append ? libraryCursor.value : undefined,
+    }, scope.value === "node" ? undefined : cloudFilters());
     if (generation !== requestGeneration) return;
-    resources.value = append ? [...resources.value, ...result.items] : result.items;
     total.value = result.total;
+    if (result.scope === "node") {
+      resources.value = append ? [...resources.value, ...result.resources] : result.resources;
+      libraryItems.value = append ? [...libraryItems.value, ...result.items] : result.items;
+    } else {
+      libraryItems.value = append ? [...libraryItems.value, ...result.items] : result.items;
+      libraryCursor.value = result.nextCursor;
+      libraryNodeId.value = result.nodeId;
+      libraryCoverage.value = result.coverage;
+      libraryOfflineMode.value = result.offline;
+      if (!result.offline && offlineStatus.value && result.libraryId !== offlineStatus.value.libraryId) lockLocalIndex();
+    }
   } catch (error) {
-    if (generation === requestGeneration) showError(error);
+    if (generation === requestGeneration) {
+      if (scope.value !== "node" && append && error instanceof ApiError && error.status === 409) {
+        libraryCursor.value = "";
+        void loadResources();
+      } else {
+        showError(error);
+      }
+    }
   } finally {
     if (generation === requestGeneration) loading.value = false;
   }
 }
+
+function changeScope(next: LibraryScope) {
+  if (scope.value === next) return;
+  scope.value = next;
+  selectedTags.value = [];
+  selectedAttributes.value = [];
+  selectedRootID.value = "";
+  reachableOnly.value = false;
+  unorganizedOnly.value = false;
+  tagFilterOpen.value = false;
+  batchSuggestionsOpen.value = false;
+  resetCloudFilters();
+  clearSelection();
+  libraryItems.value = [];
+  libraryCursor.value = "";
+  libraryCoverage.value = null;
+  libraryOfflineMode.value = false;
+  pageOffset.value = 0;
+  total.value = 0;
+  void loadResources();
+}
+
+function resetCloudFilters() {
+  cloudLifecycle.value = "active";
+  cloudGrouped.value = "";
+  cloudCopy.value = "";
+  cloudReadable.value = "";
+  selectedKind.value = "";
+}
+
+function openLibraryDetail(item: LibraryItem) {
+  if (item.cloudFile) libraryDetailFile.value = item.cloudFile;
+}
+
+function libraryItemSubtitle(item: LibraryItem): string {
+  return item.cloudFile?.folderName || "未归组";
+}
+
+function coverageNodeLabel(id: string): string {
+  return resourceNodes.value.find((node) => node.id === id)?.name || id;
+}
+
+async function enableOfflineIndex() {
+  const passphrase = window.prompt("设置本地离线索引口令（仅用于此浏览器加密存储）");
+  if (!passphrase) return;
+  try {
+    await saveOfflineIndex(libraryNodeId.value, passphrase);
+    offlineStatus.value = offlineIndexStatus();
+    errorMessage.value = "";
+  } catch (cause) { showError(cause); }
+}
+
+async function unlockLocalIndex() {
+  const passphrase = window.prompt("输入本地离线索引口令");
+  if (!passphrase) return;
+  try { await unlockOfflineIndex(passphrase, libraryNodeId.value || undefined); offlineStatus.value = offlineIndexStatus(); errorMessage.value = ""; }
+  catch (cause) { showError(cause); }
+}
+
+function lockLocalIndex() { lockedOfflineIndex(); offlineStatus.value = null; libraryOfflineMode.value = false; }
 
 async function loadRoots() {
   const generation = authGeneration;
@@ -813,6 +914,13 @@ function syncDetailRoute() {
 function resetFolderFilters() {
   if (debounceTimer) clearTimeout(debounceTimer);
   suppressQueryWatch = true;
+  scope.value = "node";
+  libraryItems.value = [];
+  libraryCursor.value = "";
+  libraryDetailFile.value = null;
+  libraryCoverage.value = null;
+  libraryOfflineMode.value = false;
+  resetCloudFilters();
   selectedCollectionID.value = "";
   selectedTags.value = [];
   selectedAttributes.value = [];
@@ -994,6 +1102,7 @@ function chooseAll() {
   sortOrder.value = "modified_desc";
   unorganizedOnly.value = false;
   reachableOnly.value = false;
+  resetCloudFilters();
   query.value = "";
   void loadResources();
 }
@@ -1498,6 +1607,15 @@ function clearRemoteSession() {
   selectedResourceNodeID.value = "";
   password.value = "";
   resources.value = [];
+  scope.value = "node";
+  libraryItems.value = [];
+  libraryCursor.value = "";
+  libraryNodeId.value = "";
+  libraryDetailFile.value = null;
+  libraryCoverage.value = null;
+  libraryOfflineMode.value = false;
+  offlineStatus.value = null;
+  resetCloudFilters();
   roots.value = [];
   tags.value = [];
   attributeCatalog.value = [];
@@ -1613,6 +1731,47 @@ function stopPreprocessPolling() {
 
 function preprocessStatusLabel(status: string) {
   return ({ pending: "排队中", running: "处理中", done: "已完成", failed: "失败" } as Record<string, string>)[status] || status;
+}
+
+function preprocessFailure(error: string): { cause: string; advice: string } {
+  if (/ffmpeg/i.test(error)) return { cause: "缺少 FFmpeg 组件", advice: "安装 FFmpeg 并加入 PATH 后重试" };
+  if (/ARW/i.test(error)) return { cause: "RAW 文件无可提取的预览", advice: "原文件不受影响，可直接打开原件" };
+  if (/unknown format|invalid JPEG|dimensions are unsupported|无法为该文件生成缩略图/i.test(error)) return { cause: "格式不支持或文件可能损坏", advice: "原文件不受影响，请确认文件能正常打开" };
+  if (/不可用|不存在/.test(error)) return { cause: "源文件不可用", advice: "重新扫描所在目录或连接来源设备后重试" };
+  return { cause: "生成失败", advice: "可重试；若持续失败，请检查原文件能否正常打开" };
+}
+
+const failedJobGroups = computed(() => {
+  const groups = new Map<string, { advice: string; count: number }>();
+  for (const job of preprocessQueue.value.jobs) {
+    if (job.status !== "failed") continue;
+    const { cause, advice } = preprocessFailure(job.error || "");
+    const group = groups.get(cause) || { advice, count: 0 };
+    group.count += 1;
+    groups.set(cause, group);
+  }
+  return [...groups.entries()].map(([cause, group]) => ({ cause, ...group }));
+});
+
+function sourceDirLabel(path: string) {
+  const normalized = path.replace(/\\/g, "/");
+  const index = normalized.lastIndexOf("/");
+  const dir = index > 0 ? normalized.slice(0, index) : normalized;
+  const segments = dir.split("/").filter(Boolean);
+  return segments.length > 2 ? `…/${segments.slice(-2).join("/")}` : dir;
+}
+
+const duplicateResourceKeys = computed(() => {
+  const counts = new Map<string, number>();
+  for (const resource of resources.value) {
+    const key = `${resource.name.toLocaleLowerCase()}\u0000${resource.size}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([key]) => key));
+});
+
+function isDuplicateCandidate(resource: Resource) {
+  return duplicateResourceKeys.value.has(`${resource.name.toLocaleLowerCase()}\u0000${resource.size}`);
 }
 
 function startStatusPolling() {
@@ -1794,8 +1953,10 @@ onBeforeUnmount(() => {
           <HubSettings v-if="!remoteMode && authenticated" />
           <HubCloudDashboard v-if="remoteMode && authenticated && ownerSession" />
           <DeviceManager v-if="remoteMode && authenticated && ownerSession" />
-          <CloudPanel v-if="authenticated" ref="cloudPanelRef" :resources="resources" :remote="remoteMode" @open-resource="openCloudSource" />
-          <button v-if="authenticated" class="button button-secondary preprocess-toggle" type="button" @click="preprocessOpen = true"><Clock3 :size="14" />后台任务 <span v-if="preprocessQueue.counts.pending + preprocessQueue.counts.running">({{ preprocessQueue.counts.pending + preprocessQueue.counts.running }})</span></button>
+          <CloudPanel v-if="authenticated" :resources="resources" :remote="remoteMode" />
+          <LibrarySearch v-if="authenticated" ref="librarySearchRef" :remote="remoteMode" :nodes="resourceNodes" @open-resource="openCloudSource" />
+          <CloudFileDetail v-if="libraryDetailFile" :file="libraryDetailFile" :remote="remoteMode" :nodes="resourceNodes" :query-node-id="libraryNodeId" @close="libraryDetailFile = null" @changed="loadResources()" @open-resource="openCloudSource" />
+          <button v-if="authenticated" class="button button-secondary preprocess-toggle" type="button" @click="preprocessOpen = true"><Clock3 :size="14" />后台任务 <span v-if="preprocessQueue.counts.pending + preprocessQueue.counts.running">({{ preprocessQueue.counts.pending + preprocessQueue.counts.running }})</span><span v-if="preprocessQueue.counts.failed" class="preprocess-failed-badge" title="有失败任务，点击查看原因">{{ preprocessQueue.counts.failed }}</span></button>
           <button v-if="remoteMode && authenticated" class="quiet-button signout-button" title="退出登录" @click="signOut"><LogOut :size="15" /><span>退出</span></button>
         </div>
       </header>
@@ -1818,42 +1979,33 @@ onBeforeUnmount(() => {
 
         <section v-if="activeFolderID === null && authenticated" class="home-search-panel" aria-label="查找文件">
           <label for="home-search"><Search :size="18" /><strong>查找文件</strong></label>
-          <p>搜索 {{ libraryScopeLabel }} 中已收录的文件名、路径和手动标签。统一检索可查找设备已同步的索引与云层文件。</p>
           <form class="home-search-form" @submit.prevent="openFolder('all', homeQuery)">
             <input id="home-search" v-model="homeQuery" type="search" placeholder="输入文件名、路径或标签" autocomplete="off" />
             <button class="button button-primary" type="submit"><Search :size="15" />搜索资源库</button>
-            <button class="button button-secondary" type="button" @click="cloudPanelRef?.open(homeQuery)"><Cloud :size="15" />统一检索</button>
+            <button class="button button-secondary" type="button" title="跨设备与云库统一查找" @click="librarySearchRef?.open(homeQuery)"><Cloud :size="15" />统一检索</button>
           </form>
           <div v-if="!remoteMode && !roots.length && initialized" class="home-first-use">
-            <span>先添加一个本机目录，就能搜索和整理其中的文件。原文件留在原处。</span>
+            <span>添加一个本机目录即可开始整理，原文件留在原处。</span>
             <button class="button button-secondary" type="button" @click="openFolderPicker()"><Plus :size="15" />添加本机目录</button>
           </div>
         </section>
 
         <section v-if="activeFolderID === null" class="virtual-folders-panel" aria-label="文件夹">
-          <div class="virtual-folders-heading"><div><p class="eyebrow">顶层分组</p><h2>我的文件夹</h2><p>先按文件夹整理资源，进入后再用标签细分。文件保留在原位置。</p></div></div>
+          <div class="virtual-folders-heading"><div><p class="eyebrow">顶层分组</p><h2>我的文件夹</h2></div></div>
           <form class="virtual-folder-create" @submit.prevent="submitFolder"><label class="sr-only" for="new-folder-name">文件夹名称</label><input id="new-folder-name" v-model="newFolderName" maxlength="80" placeholder="新文件夹名称" /><button class="button button-primary" type="submit" :disabled="folderBusy || !newFolderName.trim()"><Plus :size="15" />新建文件夹</button></form>
           <div class="virtual-folder-grid">
             <button v-for="folder in folders" :key="folder.id" class="virtual-folder-card" type="button" @click="openFolder(folder.id)"><span class="virtual-folder-icon"><KeyRound v-if="folder.passwordProtected" :size="20" /><FolderOpen v-else :size="22" /></span><strong>{{ folder.name }}</strong><small>{{ folder.passwordProtected && activeFolderID !== folder.id ? '需要密码' : `${folder.count} 项资源` }}</small></button>
             <button class="virtual-folder-card virtual-folder-unfiled" type="button" @click="openFolder('unfiled')"><span class="virtual-folder-icon"><FolderOpen :size="22" /></span><strong>未归组</strong><small>{{ unfiledCount }} 项资源</small></button>
           </div>
-          <p v-if="!folders.length" class="virtual-folder-hint">已有资源都在“未归组”。新建文件夹后，可批量选择文件并归组，原文件位置不变。</p>
+          <p v-if="!folders.length" class="virtual-folder-hint">资源都在“未归组”，可批量选择后归入新文件夹。</p>
         </section>
 
         <section v-if="activeFolderID === null && !remoteMode" class="roots-panel">
           <div class="panel-heading">
             <span class="panel-icon"><FolderOpen :size="18" /></span>
-            <span class="panel-heading-copy"><strong>已收录的本机目录</strong><small>选择要纳入资源库的文件夹，不会移动或修改原文件。</small></span>
+            <span class="panel-heading-copy"><strong>已收录的本机目录</strong><small>原文件不会被移动或修改</small></span>
+            <button class="button button-secondary" type="button" :disabled="rootBusy" @click="openFolderPicker()"><Plus :size="15" />添加目录</button>
           </div>
-          <form class="root-form" @submit.prevent="submitRoot">
-            <label class="sr-only" for="root-path">文件夹路径</label>
-            <input id="root-path" v-model="rootPath" type="text" placeholder="文件夹路径" autocomplete="off" />
-            <button class="button button-secondary picker-button" type="button" :disabled="rootBusy" @click="openFolderPicker()"><FolderOpen :size="16" /><span>浏览文件夹</span></button>
-            <button class="button button-primary" type="submit" :disabled="rootBusy || !rootPath.trim()">
-              <LoaderCircle v-if="rootBusy" class="spin" :size="16" /><Plus v-else :size="16" /><span>{{ rootBusy ? "正在扫描" : "添加目录" }}</span>
-            </button>
-            <label class="root-preprocess-option"><input v-model="rootAutoPreprocess" type="checkbox" :disabled="rootBusy" /><span>扫描后自动执行预处理（生成缩略图和文件指纹）</span></label>
-          </form>
           <div v-if="roots.length" class="root-list">
             <div v-for="root in roots" :key="root.id" class="root-row">
               <span class="root-folder-icon"><FolderOpen :size="15" /></span>
@@ -1865,36 +2017,48 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </div>
-          <div class="panel-heading">
-            <span class="panel-icon"><HardDrive :size="18" /></span>
-            <span class="panel-heading-copy"><strong>本机附加内容与云层存储</strong><small>应用默认目录始终排在第一位；缩略图、视频片段和云层加密块共用目录配额，达到上限后使用后续目录。</small></span>
-          </div>
-          <form class="root-form" @submit.prevent="submitMediaStore">
-            <label class="sr-only" for="media-store-path">媒体存储目录</label>
-            <input id="media-store-path" v-model="mediaStorePath" type="text" placeholder="选择本机目录" autocomplete="off" readonly />
-            <button class="button button-secondary" type="button" :disabled="mediaStoreBusy" @click="openStorageDirectoryPicker"><FolderOpen :size="15" />选择目录</button>
-            <label class="sr-only" for="media-store-capacity">容量上限 GB</label>
-            <input id="media-store-capacity" v-model="mediaStoreCapacityGB" type="number" min="0" step="0.1" placeholder="容量上限 GB（0 不限）" />
-            <button class="button button-primary" type="submit" :disabled="mediaStoreBusy || !mediaStorePath.trim()"><Plus :size="16" />添加位置</button>
-          </form>
-          <div v-if="mediaStores.length" class="root-list">
-            <div v-for="store in mediaStores" :key="store.id" class="root-row">
-              <span class="root-folder-icon"><HardDrive :size="15" /></span>
-              <span class="root-path" :title="store.path">{{ store.path }}</span>
-              <span class="root-count">{{ formatBytes(store.usedBytes) }} / {{ store.maxBytes > 0 ? formatBytes(store.maxBytes) : "不限" }}{{ store.isDefault ? " · 新内容默认位置" : "" }}</span>
-              <label class="sr-only" :for="`media-capacity-${store.id}`">容量上限 GB</label>
-              <input :id="`media-capacity-${store.id}`" v-model="mediaStoreCapacityDrafts[store.id]" type="number" min="0" step="0.1" :placeholder="capacityGBText(store.maxBytes)" class="media-capacity-input" />
-              <button class="button button-ghost" type="button" :disabled="mediaStoreBusy" @click="saveMediaStoreCapacity(store)">保存上限</button>
-              <button v-if="!store.isDefault" class="button button-ghost" type="button" :disabled="mediaStoreBusy" @click="makeDefaultMediaStore(store.id)">设为默认</button>
-              <button v-if="!store.isDefault" class="button button-ghost" type="button" :disabled="mediaStoreBusy || mediaStores.length < 2" @click="migrateMediaStoreTo(store)">迁移并移除</button>
+          <details class="roots-advanced">
+            <summary>更多设置</summary>
+            <form class="root-form" @submit.prevent="submitRoot">
+              <label class="sr-only" for="root-path">文件夹路径</label>
+              <input id="root-path" v-model="rootPath" type="text" placeholder="手动输入文件夹路径" autocomplete="off" />
+              <button class="button button-secondary picker-button" type="button" :disabled="rootBusy" @click="openFolderPicker()"><FolderOpen :size="16" /><span>浏览文件夹</span></button>
+              <button class="button button-primary" type="submit" :disabled="rootBusy || !rootPath.trim()">
+                <LoaderCircle v-if="rootBusy" class="spin" :size="16" /><Plus v-else :size="16" /><span>{{ rootBusy ? "正在扫描" : "添加目录" }}</span>
+              </button>
+              <label class="root-preprocess-option"><input v-model="rootAutoPreprocess" type="checkbox" :disabled="rootBusy" /><span>扫描后自动生成缩略图</span></label>
+            </form>
+            <div class="panel-heading">
+              <span class="panel-icon"><HardDrive :size="18" /></span>
+              <span class="panel-heading-copy"><strong>本机存储位置</strong><small>缩略图、视频片段和云库加密块共用的存储目录与容量上限。</small></span>
             </div>
-          </div>
+            <form class="root-form" @submit.prevent="submitMediaStore">
+              <label class="sr-only" for="media-store-path">媒体存储目录</label>
+              <input id="media-store-path" v-model="mediaStorePath" type="text" placeholder="选择本机目录" autocomplete="off" readonly />
+              <button class="button button-secondary" type="button" :disabled="mediaStoreBusy" @click="openStorageDirectoryPicker"><FolderOpen :size="15" />选择目录</button>
+              <label class="sr-only" for="media-store-capacity">容量上限 GB</label>
+              <input id="media-store-capacity" v-model="mediaStoreCapacityGB" type="number" min="0" step="0.1" placeholder="容量上限 GB（0 不限）" />
+              <button class="button button-primary" type="submit" :disabled="mediaStoreBusy || !mediaStorePath.trim()"><Plus :size="16" />添加位置</button>
+            </form>
+            <div v-if="mediaStores.length" class="root-list">
+              <div v-for="store in mediaStores" :key="store.id" class="root-row">
+                <span class="root-folder-icon"><HardDrive :size="15" /></span>
+                <span class="root-path" :title="store.path">{{ store.path }}</span>
+                <span class="root-count">{{ formatBytes(store.usedBytes) }} / {{ store.maxBytes > 0 ? formatBytes(store.maxBytes) : "不限" }}{{ store.isDefault ? " · 新内容默认位置" : "" }}</span>
+                <label class="sr-only" :for="`media-capacity-${store.id}`">容量上限 GB</label>
+                <input :id="`media-capacity-${store.id}`" v-model="mediaStoreCapacityDrafts[store.id]" type="number" min="0" step="0.1" :placeholder="capacityGBText(store.maxBytes)" class="media-capacity-input" />
+                <button class="button button-ghost" type="button" :disabled="mediaStoreBusy" @click="saveMediaStoreCapacity(store)">保存上限</button>
+                <button v-if="!store.isDefault" class="button button-ghost" type="button" :disabled="mediaStoreBusy" @click="makeDefaultMediaStore(store.id)">设为默认</button>
+                <button v-if="!store.isDefault" class="button button-ghost" type="button" :disabled="mediaStoreBusy || mediaStores.length < 2" @click="migrateMediaStoreTo(store)">迁移并移除</button>
+              </div>
+            </div>
+          </details>
         </section>
 
         <section v-else-if="activeFolderID === null" class="roots-panel remote-roots-panel">
           <div class="panel-heading">
             <span class="panel-icon"><HardDrive :size="18" /></span>
-            <span class="panel-heading-copy"><strong>{{ selectedResourceNodeKind === "android" ? "手机索引目录" : "家中索引目录" }}</strong><small>{{ selectedResourceNodeKind === "android" ? "目录由手机 App 管理，可在手机上重新扫描。" : "目录保存在家中节点。远程访问时可以更新索引。" }}</small></span>
+            <span class="panel-heading-copy"><strong>{{ selectedResourceNodeKind === "android" ? "手机索引目录" : "家中索引目录" }}</strong><small>{{ selectedResourceNodeKind === "android" ? "目录由手机 App 管理" : "远程访问时可更新索引" }}</small></span>
             <span class="remote-root-count">{{ roots.length }} 个目录</span>
           </div>
           <div v-if="roots.length" class="root-list">
@@ -1913,7 +2077,7 @@ onBeforeUnmount(() => {
 
         <template v-else>
 		<div class="folder-context-bar"><button class="quiet-button" @click="openFolder(null)"><House :size="14" />文件夹首页</button><span>/</span><strong>{{ folderTitle }}</strong><div v-if="activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-context-actions"><button class="quiet-button" @click="openFolderPicker(activeFolderID || '')"><FolderSync :size="14" />扫描本地目录</button><button class="quiet-button" @click="editingFolderName = folderTitle; folderEditorOpen = !folderEditorOpen"><Pencil :size="14" />重命名</button><button class="quiet-button" @click="folderGateMode = 'set'; folderGatePassword = ''; folderGateError = ''; folderGateOpen = true"><KeyRound :size="14" />{{ folders.find((item) => item.id === activeFolderID)?.passwordProtected ? '修改密码' : '设置密码' }}</button><button v-if="folders.find((item) => item.id === activeFolderID)?.passwordProtected" class="quiet-button" @click="removeFolderPassword"><X :size="14" />取消密码</button><button class="quiet-button" @click="removeFolder"><Trash2 :size="14" />删除</button></div></div>
-        <p v-if="activeFolderID === 'unfiled'" class="folder-scope-hint">尚未放入虚拟文件夹的资源会显示在这里；“未添加标签”是另一种筛选，与是否归组无关。</p>
+        <p v-if="activeFolderID === 'unfiled'" class="folder-scope-hint">尚未归入文件夹的资源会显示在这里。</p>
         <form v-if="folderEditorOpen && activeFolderID !== 'all' && activeFolderID !== 'unfiled'" class="folder-rename-form" @submit.prevent="saveFolderName"><input v-model="editingFolderName" maxlength="80" aria-label="文件夹名称" /><button class="button button-primary" :disabled="folderBusy || !editingFolderName.trim()">保存</button><button type="button" class="button button-secondary" @click="folderEditorOpen = false">取消</button></form>
         <div v-if="visibleCollections.length" class="mobile-collections" aria-label="常用查询">
           <span>常用查询</span>
@@ -1932,22 +2096,27 @@ onBeforeUnmount(() => {
               <kbd>⌘ K</kbd>
               <button v-if="query" class="search-clear" type="button" aria-label="清除搜索" @click="query = ''"><X :size="14" /></button>
             </label>
-            <button class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: selectedTags.length || activeAttributeKeys.length }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>标签筛选{{ selectedTags.length + activeAttributeKeys.length ? ' · ' + (selectedTags.length + activeAttributeKeys.length) : '' }}</span><ChevronDown :size="14" /></button>
-            <button v-if="authenticated" class="button button-secondary cloud-search-entry" type="button" @click="cloudPanelRef?.open(query)"><Cloud :size="15" /><span>统一检索</span></button>
+            <button v-if="!isLibraryScope" class="button button-secondary tag-filter-toggle" type="button" :class="{ selected: selectedTags.length || activeAttributeKeys.length }" :aria-expanded="tagFilterOpen" aria-controls="tag-filter-options" @click="toggleTagFilter"><Tag :size="15" /><span>标签筛选{{ selectedTags.length + activeAttributeKeys.length ? ' · ' + (selectedTags.length + activeAttributeKeys.length) : '' }}</span><ChevronDown :size="14" /></button>
+            <button v-if="authenticated && !isLibraryScope" class="button button-secondary cloud-search-entry" type="button" @click="librarySearchRef?.open(query)"><Cloud :size="15" /><span>统一检索</span></button>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'grid' }" title="网格视图" @click="listMode = 'grid'"><LayoutGrid :size="16" /></button>
             <button class="button button-secondary display-mode-button" :class="{ selected: listMode === 'list' }" title="列表视图" @click="listMode = 'list'"><List :size="16" /></button>
           </div>
         </section>
 
         <div class="search-scope-bar" aria-label="当前搜索范围">
-          <span>搜索范围：{{ libraryScopeLabel }} / {{ folderTitle }} · 不含单独的云层目录</span>
-          <button v-if="activeFolderID !== 'all'" class="quiet-button" type="button" title="保留关键词，清除文件夹和其他筛选；不跨设备搜索" @click="openFolder('all', query)">在此设备全部资源中搜索</button>
+          <div class="scope-switch" role="group" aria-label="资源范围">
+            <button type="button" :class="{ active: scope === 'node' }" :aria-pressed="scope === 'node'" @click="changeScope('node')"><HardDrive :size="14" />{{ remoteMode ? '设备' : '本机' }}</button>
+            <button type="button" :class="{ active: scope === 'cloud' }" :aria-pressed="scope === 'cloud'" @click="changeScope('cloud')"><Cloud :size="14" />云库</button>
+            <button type="button" :class="{ active: scope === 'all' }" :aria-pressed="scope === 'all'" @click="changeScope('all')"><LibraryBig :size="14" />全部</button>
+          </div>
+          <span class="scope-context">{{ scope === 'node' ? libraryScopeLabel + ' / ' + folderTitle : scope === 'cloud' ? '云库副本' : '跨设备与云库' }}</span>
+          <button v-if="scope === 'node' && activeFolderID !== 'all'" class="quiet-button" type="button" title="保留关键词，清除其他筛选" @click="openFolder('all', query)">搜索全部资源</button>
         </div>
 
-        <section v-if="tagFilterOpen" id="tag-filter-options" class="tag-filter-panel" aria-label="标签筛选">
+        <section v-if="tagFilterOpen && !isLibraryScope" id="tag-filter-options" class="tag-filter-panel" aria-label="标签筛选">
           <div class="tag-filter-panel-heading"><strong>标签筛选</strong><button type="button" aria-label="收起标签筛选" @click="tagFilterOpen = false"><ChevronDown :size="15" /></button></div>
           <div class="tag-filter-group">
-            <div class="tag-filter-group-heading"><strong>手动标签</strong><label class="tag-filter-mode"><input v-model="multipleFilters" type="checkbox" @change="changeFilterMode" />多选</label><span>{{ multipleFilters ? "同时满足所选手动标签；同类属性可多选" : "单选；点击新标签替换旧标签，同类属性只选一项" }}</span></div>
+            <div class="tag-filter-group-heading"><strong>手动标签</strong><label class="tag-filter-mode"><input v-model="multipleFilters" type="checkbox" @change="changeFilterMode" />多选</label><span>{{ multipleFilters ? "同时满足所选标签" : "新标签替换旧标签" }}</span></div>
             <label class="tag-filter-search" for="tag-filter-search"><Search :size="14" /><input id="tag-filter-search" v-model="tagFilterQuery" type="search" placeholder="查找手动标签" autocomplete="off" /></label>
             <div class="tag-filter-list">
               <button v-for="tag in matchingTags" :key="tag.id" class="tag-filter-option" type="button" :class="{ active: selectedTags.includes(tag.name) }" :aria-pressed="selectedTags.includes(tag.name)" @click="toggleTag(tag.name)"><span>{{ tag.name }}</span><small>{{ tag.count }}</small><Check v-if="selectedTags.includes(tag.name)" :size="14" /></button>
@@ -1966,13 +2135,45 @@ onBeforeUnmount(() => {
         </section>
 
         <div class="resource-filter-controls" aria-label="更多筛选和排序">
-          <label><input v-model="reachableOnly" type="checkbox" @change="loadResources()" />仅显示源文件可用的资源</label>
-          <label>来源<select v-model="selectedRootID" @change="loadResources()"><option value="">全部目录</option><option v-for="root in roots" :key="root.id" :value="root.id">{{ root.path }}</option></select></label>
-          <label>排序<select v-model="sortOrder" @change="loadResources()"><option value="modified_desc">最近修改</option><option value="modified_asc">最早修改</option><option value="name_asc">名称 A-Z</option><option value="name_desc">名称 Z-A</option><option value="size_desc">文件最大</option></select></label>
+          <label v-if="!isLibraryScope"><input v-model="reachableOnly" type="checkbox" @change="loadResources()" />仅显示源文件可用的资源</label>
+          <label v-if="!isLibraryScope">来源<select v-model="selectedRootID" @change="loadResources()"><option value="">全部目录</option><option v-for="root in roots" :key="root.id" :value="root.id">{{ root.path }}</option></select></label>
+          <label v-if="isLibraryScope">类型<select v-model="selectedKind" @change="loadResources()"><option value="">全部类型</option><option value="image">图片</option><option value="video">视频</option><option value="audio">音频</option><option value="document">文档</option><option value="other">其他</option></select></label>
+          <label v-if="isLibraryScope">状态<select v-model="cloudLifecycle" @change="loadResources()"><option value="active">资源库</option><option value="trashed">回收站</option></select></label>
+          <label v-if="isLibraryScope">归组<select v-model="cloudGrouped" @change="loadResources()"><option value="">全部</option><option value="true">已归组</option><option value="false">未归组</option></select></label>
+          <label v-if="isLibraryScope">副本<select v-model="cloudCopy" @change="loadResources()"><option value="">全部</option><option value="true">有云库副本</option><option value="false">仅设备来源</option></select></label>
+          <label v-if="isLibraryScope">可读<select v-model="cloudReadable" @change="loadResources()"><option value="">全部</option><option value="true">可读</option><option value="false">暂不可读</option></select></label>
+          <label>排序<select v-model="sortOrder" @change="loadResources()"><option value="modified_desc">最近修改</option><option value="modified_asc">最早修改</option><option value="name_asc">名称 A-Z</option><option value="name_desc">名称 Z-A</option><option value="size_desc">{{ isLibraryScope ? '最近入库' : '文件最大' }}</option></select></label>
+        </div>
+
+        <div v-if="isLibraryScope" class="library-tools">
+          <span v-if="libraryOfflineMode" class="library-pill library-pill-amber" title="设备不可达，正在使用本浏览器加密保存的目录元数据；连接设备后才能打开或修改文件。">离线元数据</span>
+          <details class="library-tool">
+            <summary><ChevronDown :size="13" />索引覆盖</summary>
+            <div class="library-tool-body">
+              <p>未同步的设备文件不会出现在这里；受保护的文件请到来源设备解锁查看。</p>
+              <template v-if="libraryCoverage">
+                <p v-if="libraryCoverage.sources?.length" :title="libraryCoverage.generation ? '索引代次 ' + libraryCoverage.generation : undefined">覆盖 {{ libraryCoverage.sources.length }} 个来源设备<span v-if="libraryCoverage.lastCatalogAt"> · 最近更新 {{ libraryCoverage.lastCatalogAt }}</span></p>
+                <p v-for="source in libraryCoverage.sources || []" :key="source" :title="source">{{ coverageNodeLabel(source) }} · {{ libraryCoverage.sourceLastCatalogAt?.[source] || '尚无更新时间' }}<span v-if="libraryCoverage.offlineSources?.includes(source)"> · 当前离线</span></p>
+                <p v-for="source in libraryCoverage.unindexedSources || []" :key="source + '-unindexed'" :title="source">{{ coverageNodeLabel(source) }} · 暂无已索引文件<span v-if="libraryCoverage.offlineSources?.includes(source)"> · 当前离线</span></p>
+              </template>
+            </div>
+          </details>
+          <details class="library-tool">
+            <summary><ChevronDown :size="13" />离线索引</summary>
+            <div class="library-tool-body">
+              <p>在本浏览器加密保存目录信息，设备不可达时仍可检索；不保存文件内容。</p>
+              <div class="library-tool-actions">
+                <button class="button button-secondary" type="button" :disabled="!libraryNodeId" @click="enableOfflineIndex">开启并更新</button>
+                <button class="button button-secondary" type="button" @click="unlockLocalIndex">解锁本地索引</button>
+                <button v-if="offlineStatus" class="button button-secondary" type="button" @click="lockLocalIndex">锁定</button>
+              </div>
+              <p v-if="offlineStatus">{{ offlineStatus.count }} 条 · {{ offlineStatus.syncedAt }}</p>
+            </div>
+          </details>
         </div>
 
         <form v-if="collectionEditorOpen" class="collection-editor" @submit.prevent="saveCollection">
-          <div><strong>{{ editingCollectionID ? "编辑常用查询" : "保存为常用查询" }}</strong><p>保存当前搜索、手动标签、属性标签、目录和排序条件；下次打开时按最新资源重新查询。</p></div>
+          <div><strong>{{ editingCollectionID ? "编辑常用查询" : "保存为常用查询" }}</strong><p>保存当前筛选条件，结果随资源更新。</p></div>
           <label class="sr-only" for="collection-name">查询名称</label>
           <input id="collection-name" v-model="collectionName" maxlength="80" placeholder="给查询起个名字" autocomplete="off" />
           <button class="button button-primary" type="submit" :disabled="collectionBusy || !collectionName.trim()">{{ editingCollectionID ? "保存更改" : "保存查询" }}</button>
@@ -1980,30 +2181,30 @@ onBeforeUnmount(() => {
           <button v-if="editingCollectionID" class="quiet-button collection-delete" type="button" :disabled="collectionBusy" @click="removeCollection"><Trash2 :size="14" />删除</button>
         </form>
 
-        <div v-if="selectedTags.length" class="selected-tag-filters" aria-label="已选标签">
+        <div v-if="selectedTags.length && !isLibraryScope" class="selected-tag-filters" aria-label="已选标签">
           <span>{{ selectedTags.length > 1 ? "同时包含" : "手动标签" }}</span>
           <button v-for="name in selectedTags" :key="name" type="button" :aria-label="`移除标签 ${name}`" @click="toggleTag(name)"><Tag :size="12" />{{ name }}<X :size="12" /></button>
         </div>
 
-        <div v-if="activeAttributeKeys.length" class="selected-tag-filters selected-attribute-filters" aria-label="已选属性标签">
+        <div v-if="activeAttributeKeys.length && !isLibraryScope" class="selected-tag-filters selected-attribute-filters" aria-label="已选属性标签">
           <span>属性条件</span>
           <button v-for="key in activeAttributeKeys" :key="key" type="button" :aria-label="'移除属性 ' + attributeLabel(key)" @click="toggleAttribute(key)">{{ attributeLabel(key) }}<X :size="12" /></button>
           <button type="button" class="clear-attribute-filters" @click="clearAttributes">清除属性</button>
         </div>
 
         <div class="results-toolbar">
-          <div class="results-count"><span>{{ isFiltered ? "筛选结果" : "所有资源" }}</span><strong>{{ total.toLocaleString("zh-CN") }}</strong></div>
+          <div class="results-count"><span>{{ isLibraryScope ? (scope === 'cloud' ? '云库文件' : '全部文件') : (isFiltered ? '筛选结果' : '所有资源') }}</span><strong>{{ total.toLocaleString("zh-CN") }}</strong></div>
           <div class="results-toolbar-actions">
-            <button v-if="total" class="button button-secondary select-all-results" :disabled="selectingAll || !!bulkBusy || (selectedCount === total && !loading)" @click="selectAllMatching"><LoaderCircle v-if="selectingAll" class="spin" :size="14" /><Check v-else :size="14" />{{ selectingAll ? `选择中 ${selectionProgress.loaded}/${selectionProgress.total}` : selectedCount === total && !loading ? `已全选 ${total} 项` : `全选结果（${total}）` }}</button>
-            <button class="quiet-button batch-suggestion-toggle" :aria-expanded="batchSuggestionsOpen" title="按目录和文件名特征分析当前文件夹" @click="toggleBatchSuggestions"><Sparkles :size="14" />批量建议</button>
-            <button class="quiet-button save-collection-toggle" @click="openCollectionEditor()"><BookmarkPlus :size="14" />保存集合</button>
-            <button v-if="selectedCollection" class="quiet-button save-collection-toggle" @click="openCollectionEditor(selectedCollection)"><Pencil :size="14" />{{ activeCollection ? "编辑集合" : "更新集合" }}</button>
+            <button v-if="total && !isLibraryScope" class="button button-secondary select-all-results" :disabled="selectingAll || !!bulkBusy || (selectedCount === total && !loading)" @click="selectAllMatching"><LoaderCircle v-if="selectingAll" class="spin" :size="14" /><Check v-else :size="14" />{{ selectingAll ? `选择中 ${selectionProgress.loaded}/${selectionProgress.total}` : selectedCount === total && !loading ? `已全选 ${total} 项` : `全选结果（${total}）` }}</button>
+            <button v-if="!isLibraryScope" class="quiet-button batch-suggestion-toggle" :aria-expanded="batchSuggestionsOpen" title="按目录和文件名特征分析当前文件夹" @click="toggleBatchSuggestions"><Sparkles :size="14" />批量建议</button>
+            <button v-if="!isLibraryScope" class="quiet-button save-collection-toggle" @click="openCollectionEditor()"><BookmarkPlus :size="14" />保存集合</button>
+            <button v-if="selectedCollection && !isLibraryScope" class="quiet-button save-collection-toggle" @click="openCollectionEditor(selectedCollection)"><Pencil :size="14" />{{ activeCollection ? "编辑集合" : "更新集合" }}</button>
             <button v-if="isFiltered" class="quiet-button clear-filters" @click="chooseAll"><X :size="14" />清除筛选</button>
             <span v-else class="sort-label"><Clock3 :size="14" />最近修改</span>
           </div>
         </div>
 
-        <section v-if="batchSuggestionsOpen" class="batch-suggestions-panel" aria-label="批量标签建议">
+        <section v-if="batchSuggestionsOpen && !isLibraryScope" class="batch-suggestions-panel" aria-label="批量标签建议">
           <header class="batch-suggestions-header">
             <div><strong>批量整理建议</strong><p>{{ loadingBatchSuggestions ? `正在扫描当前分组资源` : `已扫描 ${batchSuggestionsScanned} 项资源` }}；建议根据文件夹和文件名特征生成。</p></div>
             <button class="quiet-button batch-suggestions-close" aria-label="收起批量建议" title="收起" @click="batchSuggestionsOpen = false"><X :size="16" /></button>
@@ -2026,7 +2227,7 @@ onBeforeUnmount(() => {
           <div v-else class="batch-suggestions-state">已扫描 {{ batchSuggestionsScanned }} 项资源，暂时没有足够集中的标签建议。</div>
         </section>
 
-        <div v-if="selectedCount || selectingAll" class="bulk-toolbar">
+        <div v-if="(selectedCount || selectingAll) && !isLibraryScope" class="bulk-toolbar">
           <div class="selection-summary"><span class="selection-check"><Check :size="14" /></span><strong>{{ selectingAll ? selectionProgress.loaded : selectedCount }}</strong><span>{{ selectingAll ? `/${selectionProgress.total} 项选择中` : '项已选' }}</span></div>
           <button v-if="selectedMediaCount" class="button button-secondary thumbnail-batch-button" :disabled="generatingThumbnailBatch || !!bulkBusy || selectingAll" @click="generateSelectedThumbnails"><LoaderCircle v-if="generatingThumbnailBatch" class="spin" :size="14" /><Image v-else :size="14" />{{ generatingThumbnailBatch ? `正在排队 ${thumbnailBatchProgress.done}/${thumbnailBatchProgress.total}` : `重新排队缩略图（${selectedMediaCount}）` }}</button>
           <span class="bulk-divider"></span>
@@ -2040,11 +2241,11 @@ onBeforeUnmount(() => {
 
         <div v-if="errorMessage" class="notice notice-error" role="alert"><CircleAlert :size="17" /><span>{{ errorMessage }}</span><button class="notice-close" aria-label="关闭提示" @click="errorMessage = ''"><X :size="15" /></button></div>
 
-        <div v-if="loading && !resources.length" class="resource-grid skeleton-grid" :class="{ 'list-mode': listMode === 'list' }" aria-label="正在加载资源">
+        <div v-if="loading && !gridCount" class="resource-grid skeleton-grid" :class="{ 'list-mode': listMode === 'list' }" aria-label="正在加载资源">
           <div v-for="index in 8" :key="index" class="skeleton-card"><div class="skeleton-preview"></div><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>
         </div>
 
-        <section v-else-if="resources.length" class="resource-grid" :class="{ 'list-mode': listMode === 'list' }" aria-label="资源列表">
+        <section v-else-if="scope === 'node' && resources.length" class="resource-grid" :class="{ 'list-mode': listMode === 'list' }" aria-label="资源列表">
           <article v-for="resource in resources" :key="resource.id" class="resource-card" :class="{ unavailable: !resource.available, selected: selectedIDs.has(resource.id) }">
             <label class="resource-select" :aria-label="`选择${resource.name}`">
               <input type="checkbox" :checked="selectedIDs.has(resource.id)" :disabled="selectingAll || !!bulkBusy" @change="toggleSelection(resource.id)" />
@@ -2057,10 +2258,12 @@ onBeforeUnmount(() => {
               <span v-else-if="resource.available && ['image', 'video'].includes(resource.kind) && !thumbnailURLs.has(resource.id) && ['pending', 'running'].includes(preprocessQueue.visible[resource.id] || '')" class="thumbnail-generate-button thumbnail-waiting">{{ preprocessStatusLabel(preprocessQueue.visible[resource.id]) }}</span>
               <span v-if="resource.available && resource.kind === 'video' && thumbnailURLs.has(resource.id) && !failedThumbnailIDs.has(resource.id)" class="video-preview-play" aria-hidden="true"><Play :size="17" fill="currentColor" /></span>
               <span class="type-pill">{{ kindLabel(resource.kind) }}</span>
+              <span v-if="isDuplicateCandidate(resource)" class="duplicate-pill" title="当前列表中有同名且同大小的文件，可能是重复副本">疑似重复</span>
               <span v-if="!resource.available" class="unavailable-pill">来源暂不可用</span>
             </div>
             <div class="resource-info">
               <p class="resource-name" :title="resource.path"><button type="button" class="resource-name-button" @click="openResourcePreview(resource)">{{ resource.name }}</button></p>
+              <p class="resource-source" :title="resource.path">{{ sourceDirLabel(resource.path) }}</p>
               <div class="resource-meta"><span>{{ formatBytes(resource.contentSize ?? resource.size) }}</span><span class="meta-dot"></span><span>{{ formatDate(resource.modified) }}</span></div>
               <div v-if="resource.available" class="resource-file-actions">
                 <button class="resource-file-action" type="button" @click="openResourcePreview(resource)"><Image :size="13" />预览</button>
@@ -2089,12 +2292,41 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
+        <section v-else-if="scope !== 'node' && libraryItems.length" class="resource-grid library-grid" :class="{ 'list-mode': listMode === 'list' }" aria-label="云库资源列表">
+          <article v-for="item in libraryItems" :key="item.key" class="resource-card library-card" :class="{ unavailable: !item.available }">
+            <div class="resource-preview library-preview" :class="'kind-' + item.kind" role="button" tabindex="0" :aria-label="'打开 ' + item.name" @click="openLibraryDetail(item)" @keydown.enter.self.prevent="openLibraryDetail(item)" @keydown.space.self.prevent="openLibraryDetail(item)">
+              <div class="preview-placeholder"><component :is="kindIcon(item.kind)" :size="29" :stroke-width="1.5" /></div>
+              <span class="type-pill">{{ kindLabel(item.kind) }}</span>
+              <span v-if="item.badges.includes('deviceOnly')" class="library-pill library-pill-amber">仅设备</span>
+              <span v-else class="library-pill library-pill-cloud"><Cloud :size="11" />云库</span>
+              <span v-if="item.badges.includes('history')" class="library-pill library-pill-history">历史</span>
+              <span v-if="!item.available" class="unavailable-pill">暂不可读</span>
+            </div>
+            <div class="resource-info">
+              <p class="resource-name" :title="item.name"><button type="button" class="resource-name-button" @click="openLibraryDetail(item)">{{ item.name }}</button></p>
+              <p class="resource-source" :title="libraryItemSubtitle(item)">{{ libraryItemSubtitle(item) }}</p>
+              <div class="resource-meta"><span>{{ formatBytes(item.size) }}</span><span class="meta-dot"></span><span>{{ formatDate(item.modified) }}</span></div>
+              <div class="resource-file-actions">
+                <button class="resource-file-action" type="button" @click="openLibraryDetail(item)"><ExternalLink :size="13" />详情</button>
+              </div>
+              <div v-if="item.cloudFile?.tags?.length" class="resource-tags">
+                <span v-for="tagName in item.cloudFile.tags" :key="tagName" class="tag-chip tag-chip-static"><Tag :size="11" />{{ tagName }}</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
         <section v-else-if="initialized && !loading && !errorMessage" class="empty-state">
-          <span class="empty-icon"><FolderOpen :size="25" /></span>
-          <template v-if="remoteMode && !nodeOnline">
+          <span class="empty-icon"><component :is="isLibraryScope ? Cloud : FolderOpen" :size="25" /></span>
+          <template v-if="isLibraryScope">
+            <h2>{{ query.trim() ? '没有匹配的文件' : (scope === 'cloud' ? '云库还没有文件' : '还没有已同步的文件') }}</h2>
+            <p>{{ query.trim() ? '换个关键词，或切换到“全部”查看设备来源。' : '文件加入云库或设备发布索引后会显示在这里。' }}</p>
+            <button v-if="query.trim()" class="button button-secondary" type="button" @click="chooseAll">清除搜索</button>
+          </template>
+          <template v-else-if="remoteMode && !nodeOnline">
             <h2>{{ selectedResourceNodeID ? '当前设备暂时离线' : '尚未选择资源设备' }}</h2>
-            <p>请在顶部选择在线设备，或连接原设备后重试。云层文件可从云层目录另行查找。</p>
-            <button class="button button-secondary" type="button" @click="cloudPanelRef?.open(query)"><Cloud :size="15" />统一检索</button>
+            <p>请在顶部选择在线设备后重试。</p>
+            <button class="button button-secondary" type="button" @click="librarySearchRef?.open(query)"><Cloud :size="15" />统一检索</button>
           </template>
           <template v-else-if="!remoteMode && !roots.length">
             <h2>添加第一个本机目录</h2>
@@ -2103,11 +2335,11 @@ onBeforeUnmount(() => {
           </template>
           <template v-else-if="isFiltered">
             <h2>当前范围内没有匹配文件</h2>
-            <p>搜索范围：{{ libraryScopeLabel }} / {{ folderTitle }}。可清除筛选，或改为搜索云层保存的文件与分类。</p>
+            <p>试试清除筛选，或用统一检索查找云库文件。</p>
             <div class="empty-state-actions">
               <button class="button button-secondary" type="button" @click="chooseAll">清除筛选</button>
-              <button v-if="activeFolderID !== 'all'" class="button button-secondary" type="button" @click="openFolder('all', query)">在此设备全部资源中搜索</button>
-              <button class="button button-secondary" type="button" @click="cloudPanelRef?.open(query)"><Cloud :size="15" />统一检索</button>
+              <button v-if="activeFolderID !== 'all'" class="button button-secondary" type="button" @click="openFolder('all', query)">搜索全部资源</button>
+              <button class="button button-secondary" type="button" @click="librarySearchRef?.open(query)"><Cloud :size="15" />统一检索</button>
             </div>
           </template>
           <template v-else>
@@ -2135,16 +2367,21 @@ onBeforeUnmount(() => {
     <div v-if="preprocessOpen" class="resource-preview-backdrop" @click.self="preprocessOpen = false">
       <section class="preprocess-dialog" role="dialog" aria-modal="true" aria-label="后台任务">
         <header class="resource-preview-header">
-          <div class="resource-preview-heading"><h2>后台任务</h2><p>已启用自动预处理的目录在扫描后入队；当前浏览的资源优先</p></div>
+          <div class="resource-preview-heading"><h2>后台任务</h2><p>缩略图与文件指纹生成，当前浏览的资源优先</p></div>
           <button class="quiet-button directory-close" aria-label="关闭后台任务" @click="preprocessOpen = false"><X :size="18" /></button>
         </header>
         <div class="preprocess-summary">
-          <span>排队 {{ preprocessQueue.counts.pending }}</span><span>处理中 {{ preprocessQueue.counts.running }}</span><span>失败 {{ preprocessQueue.counts.failed }}</span><span>完成 {{ preprocessQueue.counts.done }}</span>
+          <span>排队 {{ preprocessQueue.counts.pending }}</span><span>处理中 {{ preprocessQueue.counts.running }}</span><span :class="{ 'preprocess-summary-failed': preprocessQueue.counts.failed }">失败 {{ preprocessQueue.counts.failed }}</span><span>完成 {{ preprocessQueue.counts.done }}</span>
           <button class="button button-secondary preprocess-retry-all" type="button" :disabled="retryingFailedJobs || !preprocessQueue.counts.failed" @click="retryAllFailedJobs"><LoaderCircle v-if="retryingFailedJobs" class="spin" :size="13" /><RefreshCw v-else :size="13" />{{ retryingFailedJobs ? "正在重试" : "重试全部失败任务" }}</button>
+        </div>
+        <div v-if="failedJobGroups.length" class="preprocess-failure-groups">
+          <div v-for="group in failedJobGroups" :key="group.cause" class="preprocess-failure-group">
+            <CircleAlert :size="14" /><div><strong>{{ group.cause }} · {{ group.count }} 项</strong><small>{{ group.advice }}</small></div>
+          </div>
         </div>
         <div class="preprocess-list">
           <div v-for="job in preprocessQueue.jobs" :key="job.resourceId + job.operation" class="preprocess-row">
-            <component :is="job.operation === 'thumbnail' ? Image : File" :size="16" /><div><strong :title="job.name">{{ job.name }}</strong><small>{{ job.operation === 'thumbnail' ? '缩略图 / 封面' : '文件指纹' }} · {{ preprocessStatusLabel(job.status) }}<span v-if="job.priority && job.status === 'pending'"> · 当前列表优先</span></small><small v-if="job.error" class="preprocess-error" :title="job.error">{{ job.error }}</small></div>
+            <component :is="job.operation === 'thumbnail' ? Image : File" :size="16" /><div><strong :title="job.name">{{ job.name }}</strong><small>{{ job.operation === 'thumbnail' ? '缩略图 / 封面' : '文件指纹' }} · {{ preprocessStatusLabel(job.status) }}<span v-if="job.priority && job.status === 'pending'"> · 当前列表优先</span></small><small v-if="job.error" class="preprocess-error" :title="job.error">{{ preprocessFailure(job.error).cause }}：{{ preprocessFailure(job.error).advice }}</small></div>
             <button v-if="job.status === 'failed'" class="button button-secondary" @click="generateThumbnail(job.resourceId)">重试</button>
           </div>
           <p v-if="!preprocessQueue.jobs.length" class="directory-empty">任务队列为空</p>

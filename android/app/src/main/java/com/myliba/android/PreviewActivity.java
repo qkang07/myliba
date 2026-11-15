@@ -159,7 +159,7 @@ public final class PreviewActivity extends Activity {
 
     private void loadRemote() {
         if (cloud && mime.startsWith("video/")) {
-            showMessage("云层视频可以在线播放，点击上方“播放原片”。");
+            showMessage("云库视频可以在线播放，点击上方“播放原片”。");
             return;
         }
         if (!cloud && (mime.startsWith("image/") || mime.startsWith("video/"))) {

@@ -38,7 +38,7 @@ public final class CloudStorageService extends Service {
     private File root;
     private int port;
 
-    @Override public void onCreate(){super.onCreate();instance=this;getSystemService(NotificationManager.class).createNotificationChannel(new NotificationChannel("cloud-storage","Myliba 云层存储",NotificationManager.IMPORTANCE_LOW));}
+    @Override public void onCreate(){super.onCreate();instance=this;getSystemService(NotificationManager.class).createNotificationChannel(new NotificationChannel("cloud-storage","Myliba 云库存储",NotificationManager.IMPORTANCE_LOW));}
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         if(running)return START_STICKY;
         android.content.SharedPreferences p=getSharedPreferences(PREFS,MODE_PRIVATE);
@@ -66,7 +66,7 @@ public final class CloudStorageService extends Service {
         Intent open=new Intent(this,MainActivity.class);
         PendingIntent click=PendingIntent.getActivity(this,0,open,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
         Notification notification=new Notification.Builder(this,"cloud-storage").setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("Myliba 云层存储节点运行中").setContentText((openlist==null?"本机磁盘":"OpenList 云盘")+" · 只存储加密文件块").setContentIntent(click).setOngoing(true).build();
+            .setContentTitle("Myliba 云库存储节点运行中").setContentText((openlist==null?"本机磁盘":"OpenList 云盘")+" · 只存储加密文件块").setContentIntent(click).setOngoing(true).build();
         if(Build.VERSION.SDK_INT>=34)startForeground(4319,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);else startForeground(4319,notification);
         stopped=false;running=true;status="等待 Hub 注册";
         AppLog.info("Cloud storage node starting; transport "+(publicUrl.startsWith("p2p://")?"p2p":publicUrl.equals(relayUrl+"/cloud/relay/"+nodeId)?"relay":"direct"));

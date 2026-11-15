@@ -1,9 +1,7 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -1144,6 +1142,10 @@ func (c *cloudClient) mergeCatalogSearch(files []cloudFileView, includeLocal boo
 	if err != nil {
 		return nil, err
 	}
+	return c.mergeCatalogSearchFromRecords(files, records, includeLocal)
+}
+
+func (c *cloudClient) mergeCatalogSearchFromRecords(files []cloudFileView, records []cloudRecord, includeLocal bool) ([]cloudFileView, error) {
 	latest := map[string]cloudRecord{}
 	indexes := map[string]fileIndexView{}
 	// Each device publishes replacement snapshots, including empty tags and
@@ -1184,14 +1186,14 @@ func (c *cloudClient) mergeCatalogSearch(files []cloudFileView, includeLocal boo
 		for _, record := range latest {
 			ids[record.ObjectID] = true
 		}
-		for id := range ids {
-			index, err := c.indexer.buildFileIndex(id, false)
-			if err == nil {
-				organization[id] = index
-				localOrganization[id] = true
-			} else if !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
-			}
+		// Bulk-load live local organization; the old per-id buildFileIndex ran ~7 queries each and dominated search.
+		local, err := c.indexer.localOrganizationBatch(ids)
+		if err != nil {
+			return nil, err
+		}
+		for id, index := range local {
+			organization[id] = index
+			localOrganization[id] = true
 		}
 	}
 	result := []cloudFileView{}

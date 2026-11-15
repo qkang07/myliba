@@ -3,6 +3,8 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 )
 
 // migrateUnifiedLibrary adds the first, deliberately additive, part of the
@@ -116,6 +118,11 @@ CREATE TABLE IF NOT EXISTS library_search_meta (
 	scope INTEGER PRIMARY KEY,
 	generation TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS library_search_revision (
+	id INTEGER PRIMARY KEY CHECK(id=1),
+	version INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO library_search_revision(id,version) VALUES(1,0);
 CREATE TABLE IF NOT EXISTS library_operation_inbox (
 	op_id TEXT PRIMARY KEY,
 	author_id TEXT NOT NULL,
@@ -383,7 +390,41 @@ END;
 	if err != nil {
 		return err
 	}
-	return importUnifiedLibraryBaseline(db)
+	if err := importUnifiedLibraryBaseline(db); err != nil {
+		return err
+	}
+	return createSearchRevisionTriggers(db)
+}
+
+// createSearchRevisionTriggers bumps library_search_revision on projection-input writes only, so background file_assets/receipt writes no longer invalidate the search cache.
+func createSearchRevisionTriggers(db *sql.DB) error {
+	inputs := []struct {
+		table string
+		ops   []string
+	}{
+		{"library_resource_aliases", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"resources", []string{"INSERT", "DELETE"}}, // only the id set feeds the projection, never its mutable columns
+		{"library_file_folders", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"folders", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"library_file_tags", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"tags", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"library_classification_authoritative", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"library_legacy_baselines", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"library_legacy_folder_identities", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"library_file_folder_state", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"library_file_name_state", []string{"INSERT", "UPDATE", "DELETE"}},
+		{"library_file_current_revision", []string{"INSERT", "UPDATE", "DELETE"}},
+	}
+	for _, input := range inputs {
+		for _, op := range input.ops {
+			name := "library_search_rev_" + input.table + "_" + strings.ToLower(op)
+			trigger := fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS %s AFTER %s ON %s BEGIN UPDATE library_search_revision SET version=version+1 WHERE id=1; END;`, name, op, input.table)
+			if _, err := db.Exec(trigger); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // importUnifiedLibraryBaseline is idempotent. It intentionally never changes

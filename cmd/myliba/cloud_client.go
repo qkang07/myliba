@@ -106,23 +106,23 @@ type cloudFileView struct {
 }
 
 type cloudClient struct {
-	runtime       *cloudRuntime
-	indexer       *server
-	searchMu      sync.Mutex
-	searchStamp   string
-	searchChanges int64
-	searchReady   bool
-	searchRecords map[string]cloudRecord
-	assetMu       sync.Mutex
-	localDigestMu sync.Mutex
-	localDigests  map[string]string
-	queueMu       sync.Mutex
-	assetPending  map[string]bool
-	assetWake     chan struct{}
-	keyMu         sync.RWMutex
-	key           [32]byte
-	jobsMu        sync.Mutex
-	jobs          map[string]string
+	runtime        *cloudRuntime
+	indexer        *server
+	searchMu       sync.Mutex
+	searchStamp    string
+	searchRevision int64
+	searchReady    bool
+	searchRecords  map[string]cloudRecord
+	assetMu        sync.Mutex
+	localDigestMu  sync.Mutex
+	localDigests   map[string]string
+	queueMu        sync.Mutex
+	assetPending   map[string]bool
+	assetWake      chan struct{}
+	keyMu          sync.RWMutex
+	key            [32]byte
+	jobsMu         sync.Mutex
+	jobs           map[string]string
 }
 
 func newCloudClient(runtime *cloudRuntime) (*cloudClient, error) {
@@ -202,11 +202,11 @@ func (c *cloudClient) recovery(w http.ResponseWriter, r *http.Request) {
 	// imported key.
 	records, err := c.contentRecords()
 	if err != nil {
-		writeError(w, 500, "无法读取云层索引")
+		writeError(w, 500, "无法读取云库索引")
 		return
 	}
 	if len(records) != 0 {
-		writeError(w, 409, "此设备已有此文集的云层索引，不能直接替换密钥")
+		writeError(w, 409, "此设备已有此文集的云库索引，不能直接替换密钥")
 		return
 	}
 	if err := os.WriteFile(filepath.Join(c.runtime.disk.dir, "recovery.key"), raw, 0600); err != nil {
@@ -228,7 +228,7 @@ func (c *cloudClient) recovery(w http.ResponseWriter, r *http.Request) {
 func localCloudMutation(w http.ResponseWriter, r *http.Request) bool {
 	if r.Host != "127.0.0.1:4317" || r.Header.Get("X-Myliba-Local") != "1" ||
 		(r.Method != http.MethodGet && r.Header.Get("Origin") != "http://127.0.0.1:4317") {
-		writeError(w, http.StatusForbidden, "仅允许本机页面执行云层操作")
+		writeError(w, http.StatusForbidden, "仅允许本机页面执行云库操作")
 		return false
 	}
 	return true
@@ -445,12 +445,17 @@ func (c *cloudClient) loadRecords() ([]cloudRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.loadRecordsFromIDs(ids)
+}
+
+// ids come pre-validated from disk.list; immutable objects need no re-hash, and a concurrent prune is skipped.
+func (c *cloudClient) loadRecordsFromIDs(ids []string) ([]cloudRecord, error) {
 	records := []cloudRecord{}
 	for _, id := range ids {
-		if !c.runtime.disk.valid("catalog", id) {
+		file, err := c.runtime.disk.get("catalog", id)
+		if os.IsNotExist(err) {
 			continue
 		}
-		file, err := c.runtime.disk.get("catalog", id)
 		if err != nil {
 			return nil, err
 		}
@@ -472,13 +477,17 @@ func (c *cloudClient) validRecords() ([]cloudRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.validRecordsFromLoaded(records), nil
+}
+
+func (c *cloudClient) validRecordsFromLoaded(records []cloudRecord) []cloudRecord {
 	valid := make([]cloudRecord, 0, len(records))
 	for _, record := range records {
 		if _, err := c.openManifest(record); err == nil {
 			valid = append(valid, record)
 		}
 	}
-	return filterDowngradedCatalogRecords(valid), nil
+	return filterDowngradedCatalogRecords(valid)
 }
 
 // A format-4 record is an authenticated declaration that this author can
@@ -537,6 +546,10 @@ func (c *cloudClient) contentRecords() ([]cloudRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.contentRecordsFromValid(records), nil
+}
+
+func (c *cloudClient) contentRecordsFromValid(records []cloudRecord) []cloudRecord {
 	result := make([]cloudRecord, 0, len(records))
 	for _, record := range records {
 		manifest, err := c.openManifest(record)
@@ -544,19 +557,26 @@ func (c *cloudClient) contentRecords() ([]cloudRecord, error) {
 			result = append(result, record)
 		}
 	}
-	return result, nil
+	return result
 }
 
 // libraryFiles is the shared logical-file projection for the legacy cloud
 // listing and the paginated library-search endpoint. It deliberately merges
 // cloud objects and device indexes before any query filters are applied.
 func (c *cloudClient) buildLibraryFiles(includeLocal bool) ([]cloudFileView, error) {
-	records, err := c.contentRecords()
+	loaded, err := c.loadRecords()
 	if err != nil {
 		return nil, err
 	}
+	valid := c.validRecordsFromLoaded(loaded)
+	content := c.contentRecordsFromValid(valid)
+	return c.buildLibraryFilesFromRecords(content, valid, includeLocal)
+}
+
+// buildLibraryFilesFromRecords projects pre-loaded snapshots so one search rebuild reads and decrypts the catalog once.
+func (c *cloudClient) buildLibraryFilesFromRecords(content, valid []cloudRecord, includeLocal bool) ([]cloudFileView, error) {
 	items := []cloudFileView{}
-	for _, record := range latestCloudRecords(records) {
+	for _, record := range latestCloudRecords(content) {
 		manifest, err := c.openManifest(record)
 		if err != nil {
 			continue
@@ -588,17 +608,13 @@ func (c *cloudClient) buildLibraryFiles(includeLocal bool) ([]cloudFileView, err
 			Variants: variants,
 		})
 	}
-	items, err = c.mergeCatalogSearch(items, includeLocal)
-	if err != nil {
-		return nil, err
-	}
-	return items, nil
+	return c.mergeCatalogSearchFromRecords(items, valid, includeLocal)
 }
 
 func (c *cloudClient) list(w http.ResponseWriter, r *http.Request) {
 	items, err := c.libraryFiles(r.URL.Query().Get("scope") == "all")
 	if err != nil {
-		writeError(w, 500, "无法读取云层索引")
+		writeError(w, 500, "无法读取云库索引")
 		return
 	}
 	states, err := c.libraryLifecycleStates()
@@ -716,7 +732,7 @@ func (c *cloudClient) upload(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			c.jobs[id] = "失败：" + err.Error()
 		} else {
-			c.jobs[id] = "已加入云层"
+			c.jobs[id] = "已加入云库"
 		}
 		c.jobsMu.Unlock()
 	}()
@@ -922,7 +938,7 @@ func (c *cloudClient) versions(w http.ResponseWriter, r *http.Request) {
 	}
 	records, err := c.historyRecords(objectID)
 	if err != nil {
-		writeError(w, 404, "云层文件不存在")
+		writeError(w, 404, "云库文件不存在")
 		return
 	}
 	items := []cloudFileView{}
@@ -1091,7 +1107,7 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 		record, manifest, err = c.findRecord(r.PathValue("id"))
 	}
 	if err != nil {
-		writeError(w, 404, "云层文件不存在")
+		writeError(w, 404, "云库文件不存在")
 		return
 	}
 	streamFileID := manifest.FileID
@@ -1141,7 +1157,7 @@ func (c *cloudClient) download(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Range") != "" {
 		reader, readerErr := newCloudRangeReader(r.Context(), c, record, manifest, aead)
 		if readerErr != nil {
-			writeError(w, 500, "云层文件索引无效")
+			writeError(w, 500, "云库文件索引无效")
 			return
 		}
 		// Verify the first requested block before sending HTTP headers. If that

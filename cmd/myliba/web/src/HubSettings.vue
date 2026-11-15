@@ -83,12 +83,12 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
   <div v-if="open" class="resource-preview-backdrop" @click.self="open = false">
     <section class="hub-settings-dialog" role="dialog" aria-modal="true" aria-label="服务端连接">
       <header class="hub-settings-header">
-        <div><strong>服务端连接</strong><small>本机索引保存在此设备。选择一个 Hub 供远程访问。</small></div>
+        <div><strong>服务端连接</strong><small>选择用于远程访问的服务端</small></div>
         <button class="quiet-button directory-close" type="button" aria-label="关闭" @click="open = false"><X :size="18" /></button>
       </header>
       <div class="hub-settings-body">
         <p class="hub-current">当前：<strong>{{ activeName() }}</strong> · {{ statusText() }}</p>
-        <p v-if="view.status === 'auth_required'" class="hub-settings-error" role="alert">Hub 已响应，但拒绝了这台电脑保存的节点凭据。请先确认 Hub 使用原数据目录及 auth.json；若授权确已失效，编辑当前服务端并输入主人密码重新授权。</p>
+        <p v-if="view.status === 'auth_required'" class="hub-settings-error" role="alert" title="请先确认 Hub 使用原数据目录及 auth.json；若授权确已失效，再重新授权。">服务端拒绝了这台电脑的凭据。编辑当前服务端并输入主人密码即可重新授权。</p>
         <div v-for="profile in view.profiles" :key="profile.id" class="hub-profile-row">
           <div><strong>{{ profile.name }}</strong><small>{{ profile.url }}</small></div>
           <button class="button button-secondary" type="button" :disabled="busy || profile.id === view.activeId" @click="select(profile.id)"><Check v-if="profile.id === view.activeId" :size="13" />{{ profile.id === view.activeId ? "当前" : "连接" }}</button>
@@ -101,7 +101,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
           <label>名称<input v-model="name" maxlength="80" required placeholder="例如：我的 VPS" /></label>
           <label>服务端地址<input v-model="url" type="url" maxlength="2048" required placeholder="wss://example.com/node" autocomplete="url" /></label>
           <label>主人密码<input v-model="ownerPassword" type="password" maxlength="4096" :required="!editingID" placeholder="首次授权这台电脑，密码不会保存" autocomplete="current-password" /></label>
-          <p>主人密码仅用于向 Hub 为此电脑申请设备凭据；设备凭据保存在本机资源库，不会在页面中回显。</p>
+          <p>密码仅用于首次授权这台电脑，不会保存。</p>
           <div class="hub-form-actions"><button v-if="editingID" class="button button-secondary" type="button" @click="create">取消编辑</button><button class="button button-primary" type="submit" :disabled="busy"><LoaderCircle v-if="busy" class="spin" :size="14" /><Plus v-else :size="14" />{{ editingID ? "保存" : "添加并连接" }}</button></div>
         </form>
         <p v-if="error" class="hub-settings-error" role="alert">{{ error }}</p>

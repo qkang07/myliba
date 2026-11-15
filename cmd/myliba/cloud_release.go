@@ -102,7 +102,7 @@ func (c *cloudClient) recordForRevision(fileID, revisionID string) (cloudRecord,
 			return record, manifest, nil
 		}
 	}
-	return cloudRecord{}, cloudManifest{}, errors.New("云层尚无此版本的可验证原件")
+	return cloudRecord{}, cloudManifest{}, errors.New("云库尚无此版本的可验证原件")
 }
 
 // domainRepresentatives picks one complete-copy node per independent fault

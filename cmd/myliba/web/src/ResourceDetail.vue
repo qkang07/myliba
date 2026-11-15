@@ -280,9 +280,9 @@ async function uploadToCloud() {
   cloudBusy.value = true;
   try {
     await uploadResourceToCloud(resourceID);
-    cloudStatus.value = "已提交云层上传；上传完成后可在云层文件中查找";
+    cloudStatus.value = "已提交云库上传；上传完成后可在云库文件中查找";
     await refreshCloudStatus(resourceID);
-  } catch (cause) { cloudStatus.value = cause instanceof Error ? cause.message : "加入云层失败"; }
+  } catch (cause) { cloudStatus.value = cause instanceof Error ? cause.message : "加入云库失败"; }
   finally { cloudBusy.value = false; }
 }
 async function refreshCloudStatus(resourceID: string) {
@@ -375,9 +375,9 @@ onBeforeUnmount(() => {
         <span class="detail-kind-icon"><component :is="fileIcon" :size="25" /></span>
         <div><p class="eyebrow">资源详情 · {{ kindLabel }}</p><h1>{{ resource.name }}</h1><p>{{ resource.available ? "源文件可用" : "源文件暂不可用" }} · 文件总大小 {{ formatBytes(resource.contentSize ?? resource.size) }}</p></div>
         <button class="button button-secondary" :disabled="!resource.available" @click="download"><Download :size="15" />下载原文件</button>
-        <button v-if="!remote && !cloudFile && cloudJob !== '上传中' && !cloudJob.startsWith('已加入云层')" class="button button-secondary" :disabled="!resource.available || cloudBusy" @click="uploadToCloud">{{ cloudBusy ? '提交中…' : cloudJob.startsWith('失败') ? '重试加入云层' : '加入云层' }}</button>
+        <button v-if="!remote && !cloudFile && cloudJob !== '上传中' && !cloudJob.startsWith('已加入云库')" class="button button-secondary" :disabled="!resource.available || cloudBusy" @click="uploadToCloud">{{ cloudBusy ? '提交中…' : cloudJob.startsWith('失败') ? '重试加入云库' : '加入云库' }}</button>
       </header>
-      <p v-if="cloudFile || cloudJob || cloudLookupError" class="detail-cloud-state" role="status"><Check v-if="cloudFile" :size="15" /><CircleAlert v-else-if="cloudLookupError || cloudJob.startsWith('失败')" :size="15" /><LoaderCircle v-else class="spin" :size="15" />{{ cloudFile ? `已在云层 · ${cloudFile.replicas ?? cloudFile.minReplicas} 份副本 · ${cloudFile.availableReplicas ?? '—'} 份可用（60 秒内端点探测）` : cloudLookupError ? '云层状态暂不可用' : `云层状态：${cloudJob}` }}<span v-if="cloudFile && cloudFile.availableReplicas === 0"> · 当前没有已检测为可联通的副本</span></p>
+      <p v-if="cloudFile || cloudJob || cloudLookupError" class="detail-cloud-state" role="status"><Check v-if="cloudFile" :size="15" /><CircleAlert v-else-if="cloudLookupError || cloudJob.startsWith('失败')" :size="15" /><LoaderCircle v-else class="spin" :size="15" />{{ cloudFile ? `已在云库 · ${cloudFile.replicas ?? cloudFile.minReplicas} 份副本 · ${cloudFile.availableReplicas ?? '—'} 份可用` : cloudLookupError ? '云库状态暂不可用' : `云库状态：${cloudJob}` }}<span v-if="cloudFile && cloudFile.availableReplicas === 0"> · 暂无可用副本</span></p>
       <p v-if="cloudStatus" class="detail-error" role="status">{{ cloudStatus }}</p>
       <section v-if="!phoneNode" class="detail-panel share-panel" aria-label="外链分享">
         <div class="detail-panel-heading"><h2><Link2 :size="17" />外链分享</h2><span>仅此文件 · 节点在线时直传</span></div>
@@ -431,7 +431,7 @@ onBeforeUnmount(() => {
           <section class="detail-panel">
             <div class="detail-panel-heading"><h2>所属文件夹</h2></div>
             <label class="detail-folder-field">文件夹<select :value="resource.folderId" :disabled="folderBusy" @change="changeFolder"><option value="">未归组</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
-            <p class="detail-folder-hint">归组只改变资源库中的所属文件夹，不移动或复制原文件。</p>
+            <p class="detail-folder-hint">归组不移动或复制原文件。</p>
           </section>
           <section class="detail-panel">
             <div class="detail-panel-heading"><h2>属性标签</h2><span>随文件属性自动更新</span></div>

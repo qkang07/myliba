@@ -217,13 +217,25 @@ func TestLibraryProjectionRebuildsForCatalogAndLocalChanges(t *testing.T) {
 	if err != nil || len(files) != 1 || files[0].CatalogCreatedAt != record.CreatedAt || files[0].CatalogFormat != 4 {
 		t.Fatalf("cache hit lost internal sort metadata: %+v %v", files, err)
 	}
+	// Non-input writes (an orphan library_files row, file_assets backfill) must not invalidate the projection.
+	before := client.searchRevision
 	if _, err := db.Exec(`INSERT INTO library_files(file_id,created_at,updated_at) VALUES('other','2026-01-01','2026-01-01')`); err != nil {
 		t.Fatal(err)
 	}
-	before := client.searchChanges
+	if _, err := db.Exec(`INSERT INTO file_assets(id,resource_id,version_key,kind,spec,size,codec,created_at) VALUES('asset-1','source','v1','thumbnail','480',100,'','2026-01-01')`); err != nil {
+		t.Fatal(err)
+	}
 	files, err = client.libraryFiles(true)
-	if err != nil || len(files) != 1 || client.searchChanges == before {
-		t.Fatalf("local change did not rebuild projection: %+v %v", files, err)
+	if err != nil || len(files) != 1 || client.searchRevision != before {
+		t.Fatalf("unrelated local write over-invalidated projection: %+v %v", files, err)
+	}
+	// A real organization input (rename state) must invalidate and be visible.
+	if _, err := db.Exec(`INSERT INTO library_file_name_state(file_id,author_id,counter,op_id,current_name,updated_at) VALUES('logical','phone',1,'op-1','新文件-重命名.txt','2026-01-01')`); err != nil {
+		t.Fatal(err)
+	}
+	files, err = client.libraryFiles(true)
+	if err != nil || len(files) != 1 || client.searchRevision == before || files[0].Name != "新文件-重命名.txt" {
+		t.Fatalf("organization change did not rebuild projection: %+v %v", files, err)
 	}
 	var rows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM library_search_projection WHERE scope=1`).Scan(&rows); err != nil || rows != 1 {

@@ -72,25 +72,34 @@ func newCloudDisk(dir string) (*cloudDisk, error) {
 	return &cloudDisk{dir: dir, roots: []cloudDiskRoot{{path: filepath.Dir(dir), cloudDir: dir}}}, nil
 }
 
+// Query without d.mu: holding it across the single SQLite connection inverts lock order against search readers (open rows -> disk.has -> d.mu.RLock) and wedges the pool. Callers must not hold d.mu.
 func (d *cloudDisk) configureMediaStores(db *sql.DB) error {
 	if db == nil {
 		return nil
 	}
-	rows, err := db.Query(`SELECT path,max_bytes FROM media_stores ORDER BY is_default DESC,(id='appdata') DESC,added_at,id`)
+	roots, seen, err := loadMediaStoreRoots(db)
 	if err != nil {
 		return err
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.applyMediaStoreRootsLocked(roots, seen, db)
+	return nil
+}
+
+// Reads media_stores and creates cloud dirs without d.mu so the single SQLite connection is never held under the disk lock; usedBytes is filled by the caller.
+func loadMediaStoreRoots(db *sql.DB) ([]cloudDiskRoot, map[string]bool, error) {
+	rows, err := db.Query(`SELECT path,max_bytes FROM media_stores ORDER BY is_default DESC,(id='appdata') DESC,added_at,id`)
+	if err != nil {
+		return nil, nil, err
+	}
 	defer rows.Close()
 	roots := make([]cloudDiskRoot, 0, 4)
-	previous := make(map[string]cloudDiskRoot, len(d.roots))
-	for _, root := range d.roots {
-		previous[root.path] = root
-	}
 	seen := map[string]bool{}
 	for rows.Next() {
 		var root cloudDiskRoot
 		if err := rows.Scan(&root.path, &root.maxBytes); err != nil {
-			return err
+			return nil, nil, err
 		}
 		root.path = filepath.Clean(root.path)
 		if seen[root.path] {
@@ -99,21 +108,31 @@ func (d *cloudDisk) configureMediaStores(db *sql.DB) error {
 		seen[root.path] = true
 		root.cloudDir = filepath.Join(root.path, "cloud")
 		if err := os.MkdirAll(filepath.Join(root.cloudDir, "blocks"), 0700); err != nil {
-			return err
+			return nil, nil, err
 		}
 		if err := os.MkdirAll(filepath.Join(root.cloudDir, "catalog"), 0700); err != nil {
-			return err
-		}
-		root.readOnly = false
-		if old, ok := previous[root.path]; ok && old.usedBytes > 0 {
-			root.usedBytes = old.usedBytes
-		} else {
-			root.usedBytes = cloudDiskRootUsage(root.path)
+			return nil, nil, err
 		}
 		roots = append(roots, root)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, nil, err
+	}
+	return roots, seen, nil
+}
+
+// Swaps in roots, carrying forward known usage and appending the read-only legacy root. Caller MUST hold d.mu.
+func (d *cloudDisk) applyMediaStoreRootsLocked(roots []cloudDiskRoot, seen map[string]bool, db *sql.DB) {
+	previous := make(map[string]cloudDiskRoot, len(d.roots))
+	for _, root := range d.roots {
+		previous[root.path] = root
+	}
+	for i := range roots {
+		if old, ok := previous[roots[i].path]; ok && old.usedBytes > 0 {
+			roots[i].usedBytes = old.usedBytes
+		} else {
+			roots[i].usedBytes = cloudDiskRootUsage(roots[i].path)
+		}
 	}
 	legacyRoot := filepath.Clean(filepath.Dir(d.dir))
 	if !seen[legacyRoot] {
@@ -129,7 +148,6 @@ func (d *cloudDisk) configureMediaStores(db *sql.DB) error {
 		d.roots = roots
 	}
 	d.db = db
-	return nil
 }
 
 func cloudHash(data []byte) string {
@@ -332,13 +350,21 @@ func (d *cloudDisk) put(kind, id string, body io.Reader, limit int64) error {
 		persisted = true
 		return nil
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.db != nil {
-		if err := d.configureMediaStores(d.db); err != nil {
+	// Refresh the media-store roots BEFORE taking d.mu. configureMediaStores
+	// queries the single-connection SQLite pool; running that query while
+	// holding d.mu inverts the lock order against search readers that hold the
+	// connection (open rows) and then call disk.has -> d.mu.RLock, which wedges
+	// the pool and hangs every database endpoint.
+	d.mu.RLock()
+	db := d.db
+	d.mu.RUnlock()
+	if db != nil {
+		if err := d.configureMediaStores(db); err != nil {
 			return err
 		}
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	for i := range d.roots {
 		root := d.roots[i]
 		if root.readOnly {

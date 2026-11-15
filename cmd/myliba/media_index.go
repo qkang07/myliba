@@ -541,7 +541,10 @@ func (s *server) migrateMediaStore(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if disk != nil {
-		_ = disk.configureMediaStores(s.db)
+		// d.mu is already held here; call the split helpers directly since configureMediaStores would self-deadlock on the non-reentrant mutex.
+		if roots, seen, err := loadMediaStoreRoots(s.db); err == nil {
+			disk.applyMediaStoreRootsLocked(roots, seen, s.db)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -971,6 +974,97 @@ func (s *server) mediaContentSize(resourceID string, originalSize int64, modifie
 		return originalSize
 	}
 	return originalSize + assetSize.Int64
+}
+
+// Bulk set-based replacement for per-id buildFileIndex in mergeCatalogSearch; returns one view per requested id (zero-organization when no resources row), matching buildFileIndex(id,false).
+func (s *server) localOrganizationBatch(ids map[string]bool) (map[string]fileIndexView, error) {
+	result := make(map[string]fileIndexView, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	aliases := map[string]string{}
+	if err := s.scanOrganizationRows(`SELECT resource_id,file_id FROM library_resource_aliases`, func(rows *sql.Rows) error {
+		var resourceID, fileID string
+		if err := rows.Scan(&resourceID, &fileID); err != nil {
+			return err
+		}
+		aliases[resourceID] = fileID
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	existing := map[string]bool{}
+	if err := s.scanOrganizationRows(`SELECT id FROM resources`, func(rows *sql.Rows) error {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		existing[id] = true
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	folders := map[string]fileIndexView{}
+	if err := s.scanOrganizationRows(`SELECT lf.file_id,f.id,f.name,f.password_hash<>'' FROM library_file_folders lf JOIN folders f ON f.id=lf.folder_id`, func(rows *sql.Rows) error {
+		var fileID, folderID, folderName string
+		var protected bool
+		if err := rows.Scan(&fileID, &folderID, &folderName, &protected); err != nil {
+			return err
+		}
+		if _, ok := folders[fileID]; !ok { // QueryRow semantics: the first folder wins.
+			folders[fileID] = fileIndexView{FolderID: folderID, FolderName: folderName, Protected: protected}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	tags := map[string][]string{}
+	if err := s.scanOrganizationRows(`SELECT lt.file_id,t.name FROM library_file_tags lt JOIN tags t ON t.id=lt.tag_id ORDER BY lt.file_id,t.name`, func(rows *sql.Rows) error {
+		var fileID, name string
+		if err := rows.Scan(&fileID, &name); err != nil {
+			return err
+		}
+		tags[fileID] = append(tags[fileID], name)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	for id := range ids {
+		fileID := id
+		if alias, ok := aliases[id]; ok && alias != "" {
+			fileID = alias
+		}
+		view := fileIndexView{FileID: fileID, Tags: []string{}}
+		if existing[id] {
+			view.OrganizationKnown = true
+			if folder, ok := folders[fileID]; ok {
+				view.FolderID, view.FolderName, view.Protected = folder.FolderID, folder.FolderName, folder.Protected
+			}
+			if fileTags, ok := tags[fileID]; ok {
+				view.Tags = fileTags
+			}
+		}
+		result[id] = view
+	}
+	return result, nil
+}
+
+// Runs a bulk read for localOrganizationBatch, tolerating a missing table on a pre-migration database.
+func (s *server) scanOrganizationRows(query string, scan func(*sql.Rows) error) error {
+	rows, err := s.db.Query(query)
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return nil
+		}
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func (s *server) fileIndex(w http.ResponseWriter, r *http.Request) {

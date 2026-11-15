@@ -81,36 +81,39 @@ func (c *cloudClient) ensureSearchProjectionLocked() error {
 	if c.indexer != nil {
 		stamp += ":indexer"
 	}
-	var changes int64
-	if err := db.QueryRow(`SELECT total_changes()`).Scan(&changes); err != nil {
+	var revision int64
+	if err := db.QueryRow(`SELECT version FROM library_search_revision`).Scan(&revision); err != nil {
 		return err
 	}
-	if c.searchReady && c.searchStamp == stamp && c.searchChanges == changes {
+	if c.searchReady && c.searchStamp == stamp && c.searchRevision == revision {
 		return nil
 	}
-	cloud, err := c.buildLibraryFiles(false)
+	// One catalog load per rebuild; the freshness re-checks below still discard it if the catalog mutates mid-build.
+	loaded, err := c.loadRecordsFromIDs(ids)
 	if err != nil {
 		return err
 	}
-	all, err := c.buildLibraryFiles(true)
+	valid := c.validRecordsFromLoaded(loaded)
+	records := c.contentRecordsFromValid(valid)
+	cloud, err := c.buildLibraryFilesFromRecords(records, valid, false)
+	if err != nil {
+		return err
+	}
+	all, err := c.buildLibraryFilesFromRecords(records, valid, true)
 	if err != nil {
 		return err
 	}
 	// Keep the decrypted record headers only in process memory so replica
 	// availability can be refreshed without decrypting the entire catalog.
-	records, err := c.contentRecords()
-	if err != nil {
-		return err
-	}
 	lookup := make(map[string]cloudRecord, len(records))
 	for _, record := range records {
 		lookup[record.ObjectID+"\x00"+record.RevisionID] = record
 	}
 	var after int64
-	if err := db.QueryRow(`SELECT total_changes()`).Scan(&after); err != nil {
+	if err := db.QueryRow(`SELECT version FROM library_search_revision`).Scan(&after); err != nil {
 		return err
 	}
-	if after != changes { // A concurrent local mutation needs another rebuild.
+	if after != revision { // A concurrent organization mutation needs another rebuild.
 		c.searchReady = false
 		return nil
 	}
@@ -122,11 +125,11 @@ func (c *cloudClient) ensureSearchProjectionLocked() error {
 		c.searchReady = false
 		return nil
 	}
-	committedChanges, err := c.writeLibraryProjection(cloud, all)
+	committedRevision, err := c.writeLibraryProjection(cloud, all)
 	if err != nil {
 		return err
 	}
-	c.searchChanges = committedChanges
+	c.searchRevision = committedRevision
 	c.searchStamp, c.searchRecords, c.searchReady = stamp, lookup, true
 	return nil
 }
@@ -216,14 +219,15 @@ func (c *cloudClient) writeLibraryProjection(cloud, all []cloudFileView) (int64,
 			return 0, err
 		}
 	}
-	var changes int64
-	if err := tx.QueryRow(`SELECT total_changes()`).Scan(&changes); err != nil {
+	var revision int64
+	// Projection rows carry no revision trigger, so this reads the organization version at commit time.
+	if err := tx.QueryRow(`SELECT version FROM library_search_revision`).Scan(&revision); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return changes, nil
+	return revision, nil
 }
 
 func (c *cloudClient) readLibraryProjection(includeLocal bool) ([]cloudFileView, error) {

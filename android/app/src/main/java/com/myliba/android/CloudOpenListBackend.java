@@ -44,13 +44,13 @@ final class CloudOpenListBackend {
         directoriesReady=true;
     }
     void put(String kind,String id,byte[] data)throws Exception{
-        if(!valid(kind,id))throw new IOException("无效的云层对象");
+        if(!valid(kind,id))throw new IOException("无效的云库对象");
         ensureDirectories();
         Response response=request("PUT",kind+"/"+id,data,null,4096);
         if(response.status!=200&&response.status!=201&&response.status!=204)throw new IOException("OpenList 写入失败：HTTP "+response.status);
     }
     byte[] get(String kind,String id,int limit)throws Exception{
-        if(!valid(kind,id))throw new IOException("无效的云层对象");
+        if(!valid(kind,id))throw new IOException("无效的云库对象");
         ensureDirectories();
         Response response=request("GET",kind+"/"+id,null,null,limit);
         if(response.status==404)throw new FileNotFoundException(id);
@@ -58,7 +58,7 @@ final class CloudOpenListBackend {
         return response.body;
     }
     List<String> list(String kind)throws Exception{
-        if(!"blocks".equals(kind)&&!"catalog".equals(kind))throw new IOException("无效的云层目录");
+        if(!"blocks".equals(kind)&&!"catalog".equals(kind))throw new IOException("无效的云库目录");
         ensureDirectories();
         byte[] xml="<?xml version=\"1.0\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:resourcetype/></d:prop></d:propfind>".getBytes(StandardCharsets.UTF_8);
         Response response=request("PROPFIND",kind+"/",xml,"Depth: 1\r\nContent-Type: application/xml\r\n",MAX_LIST);

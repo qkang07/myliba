@@ -222,7 +222,7 @@ func (c *cloudClient) uploadOriginal(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			c.jobs[objectID] = "失败：" + err.Error()
 		} else {
-			c.jobs[objectID] = "已加入云层"
+			c.jobs[objectID] = "已加入云库"
 		}
 		c.jobsMu.Unlock()
 	}()

@@ -33,7 +33,7 @@ final class CloudSecretStore {
         String saved=settings.getString(name,"");if(saved.isEmpty())return "";
         if(!saved.startsWith(PREFIX)){settings.edit().putString(name,protect(saved)).apply();return saved;}
         byte[] payload=Base64.decode(saved.substring(PREFIX.length()),Base64.DEFAULT);
-        if(payload.length<29)throw new IllegalStateException("云层凭据已损坏");
+        if(payload.length<29)throw new IllegalStateException("云库凭据已损坏");
         byte[] iv=new byte[12];System.arraycopy(payload,0,iv,0,12);
         Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,iv));
         return new String(cipher.doFinal(payload,12,payload.length-12),StandardCharsets.UTF_8);

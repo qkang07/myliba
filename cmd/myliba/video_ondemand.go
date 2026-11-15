@@ -225,7 +225,7 @@ func (c *cloudClient) demandInput(ctx context.Context, id string) (string, strin
 			file.Close()
 			return path, key, func() {}, nil
 		}
-		return "", "", nil, errors.New("云层原片不可用")
+		return "", "", nil, errors.New("云库原片不可用")
 	}
 	dataKey, err := hex.DecodeString(manifest.DataKey)
 	if err != nil || len(dataKey) != 32 {

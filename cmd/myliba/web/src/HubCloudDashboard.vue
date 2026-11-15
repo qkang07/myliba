@@ -72,7 +72,7 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
         <div class="hub-settings-body hub-cloud-body">
           <p v-if="error" class="form-error" role="alert">{{ error }}</p>
           <p v-if="loading">正在读取节点…</p>
-          <p v-else-if="!overview.enabled">云层暂不可用。请检查 Hub 服务状态。</p>
+          <p v-else-if="!overview.enabled">云库暂不可用。请检查 Hub 服务状态。</p>
           <template v-else>
             <div class="hub-cloud-summary">
               <div><strong>{{ overview.online ?? 0 }} / {{ overview.nodes.length }}</strong><span>在线 / 已登记节点</span></div>

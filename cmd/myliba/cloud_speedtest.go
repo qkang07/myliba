@@ -71,7 +71,7 @@ func (c *cloudClient) diagnosePeer(w http.ResponseWriter, r *http.Request) {
 	}
 	_, token, err := c.runtime.credentials()
 	if err != nil || len(token) < 32 {
-		writeError(w, http.StatusServiceUnavailable, "云层授权不可用")
+		writeError(w, http.StatusServiceUnavailable, "云库授权不可用")
 		return
 	}
 	c.runtime.probePeers([]cloudNode{*peer}, token)
@@ -104,7 +104,7 @@ func (c *cloudRuntime) speedTest(parent context.Context, peer cloudNode, path st
 	defer cancel()
 	_, token, err := c.credentials()
 	if err != nil || len(token) < 32 {
-		result.Error = "云层授权不可用"
+		result.Error = "云库授权不可用"
 		return result
 	}
 	request := func() (*http.Response, error) {

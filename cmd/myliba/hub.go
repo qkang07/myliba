@@ -107,7 +107,7 @@ func runHub() error {
 	})))
 	mux.Handle("DELETE /api/hub/cloud/nodes/{id}", hub.requireOwner(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if cloud == nil {
-			writeError(w, http.StatusNotFound, "云层未启用")
+			writeError(w, http.StatusNotFound, "云库未启用")
 			return
 		}
 		cloud.removeOfflineNode(w, r)

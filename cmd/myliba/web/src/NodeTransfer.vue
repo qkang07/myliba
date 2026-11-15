@@ -189,7 +189,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="node-transfer-page">
     <header class="transfer-heading">
-      <div><span class="transfer-eyebrow">NODE TO NODE</span><h1>节点间文件传输</h1><p>支持在线桌面与手机资源节点互传。浏览器用 WebRTC 分块转发，Hub 只负责连接信令；已索引文件会携带逻辑身份和初始分类。</p></div>
+      <div><span class="transfer-eyebrow">NODE TO NODE</span><h1>节点间文件传输</h1><p>在线桌面与手机节点互传，已索引文件会保留原有分类。</p></div>
       <button type="button" class="transfer-close" @click="emit('close')"><X :size="16" />返回资源空间</button>
     </header>
 

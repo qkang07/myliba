@@ -110,7 +110,7 @@ final class NodeResourceApi {
         }
         if(parts.length==2&&"preprocess".equals(parts[1])&&"GET".equals(method))return json(200,new JSONObject().put("counts",new JSONObject().put("pending",0).put("running",0).put("done",0).put("failed",0)).put("jobs",new JSONArray()).put("visible",new JSONObject()));
         if(parts.length==2&&"tag-batch-suggestions".equals(parts[1])&&"GET".equals(method))return json(200,new JSONObject().put("suggestions",new JSONArray()).put("scanned",0));
-        if(parts.length==2&&"cloud".equals(parts[1]))return error(404,"手机资源节点的云层功能独立配置");
+        if(parts.length==2&&"cloud".equals(parts[1]))return error(404,"手机资源节点的云库功能独立配置");
         return mutate(method,parts,requestBody);
     }
 

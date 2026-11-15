@@ -284,7 +284,7 @@ func pairCloudStorage(rawHub, deviceID, password string) (string, error) {
 	var paired struct {
 		Token string `json:"token"`
 	}
-	if err := post("/api/hub/devices", map[string]any{"id": deviceID, "name": "云层存储节点", "kind": "storage", "canCloud": true}, &paired); err != nil {
+	if err := post("/api/hub/devices", map[string]any{"id": deviceID, "name": "云库存储节点", "kind": "storage", "canCloud": true}, &paired); err != nil {
 		return "", err
 	}
 	if len(paired.Token) < 32 || strings.ContainsAny(paired.Token, "\r\n") {

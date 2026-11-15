@@ -423,7 +423,7 @@ func (c *cloudClient) cloudAssetPart(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("libraryRead") == "1" {
 		record, manifest, err := c.versionRecord(r.PathValue("id"), r.PathValue("revision"))
 		if err != nil {
-			writeError(w, 404, "云层资产版本不存在")
+			writeError(w, 404, "云库资产版本不存在")
 			return
 		}
 		if !c.authorizeCloudLibraryRead(w, r, record, manifest, "thumbnail") {
@@ -444,7 +444,7 @@ func (c *cloudClient) cloudVideo(w http.ResponseWriter, r *http.Request) {
 		}
 		input, key, closeInput, err := c.demandInput(r.Context(), r.PathValue("id"))
 		if err != nil {
-			writeError(w, 503, "云层原片不可用")
+			writeError(w, 503, "云库原片不可用")
 			return
 		}
 		defer closeInput()
@@ -514,7 +514,7 @@ func (c *cloudClient) cloudVideoPart(w http.ResponseWriter, r *http.Request) {
 		}
 		input, key, closeInput, err := c.demandInput(r.Context(), r.PathValue("id"))
 		if err != nil {
-			writeError(w, 503, "云层原片不可用")
+			writeError(w, 503, "云库原片不可用")
 			return
 		}
 		defer closeInput()

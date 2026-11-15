@@ -54,7 +54,7 @@ async function copyDeviceID(id: string) {
         </header>
         <div class="hub-settings-body">
           <div v-for="device in view.devices" :key="device.id" class="hub-profile-row">
-            <div><strong>{{ device.name }}</strong><small>{{ device.kind === "android" ? "手机" : device.kind === "storage" ? "存储节点" : "电脑" }} · {{ device.canBrowse ? "可浏览" : "不可浏览" }} · {{ device.canServe ? "可提供资源" : "不可提供资源" }} · {{ device.canCloud ? "可访问云层" : "无云层权限" }}{{ device.revokedAt ? " · 已撤销" : "" }}</small><small class="hub-device-id">{{ device.id }}</small></div>
+            <div><strong>{{ device.name }}</strong><small>{{ device.kind === "android" ? "手机" : device.kind === "storage" ? "存储节点" : "电脑" }} · {{ device.canBrowse ? "可浏览" : "不可浏览" }} · {{ device.canServe ? "可提供资源" : "不可提供资源" }} · {{ device.canCloud ? "可访问云库" : "无云库权限" }}{{ device.revokedAt ? " · 已撤销" : "" }}</small><small class="hub-device-id">{{ device.id }}</small></div>
             <button v-if="device.kind === 'android'" class="quiet-button" type="button" :aria-label="`复制 ${device.name} 的设备 ID`" @click="copyDeviceID(device.id)"><Copy :size="16" /></button>
             <button v-if="!device.revokedAt" class="quiet-button" type="button" :disabled="busy" :aria-label="`撤销 ${device.name}`" @click="revoke(device.id)"><Trash2 :size="16" /></button>
           </div>

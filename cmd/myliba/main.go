@@ -70,7 +70,8 @@ func configureLocalLog(dataDir string) {
 		log.Printf("open local log file: %v", err)
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, file))
+	// File first: the Windows GUI-subsystem binary has no console, so a failing os.Stderr write would abort MultiWriter before the file.
+	log.SetOutput(io.MultiWriter(file, os.Stderr))
 	log.Printf("Myliba desktop starting; diagnostic log: %s", file.Name())
 }
 

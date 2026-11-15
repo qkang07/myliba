@@ -175,7 +175,7 @@ async function start() {
       result = await variant(quality, false, false, session.signal);
     }
     if (current !== generation) return;
-    if (props.cloud && (result.status === "missing" || result.status === "failed")) throw new Error("云层尚无此清晰度，请在源节点生成后同步。");
+    if (props.cloud && (result.status === "missing" || result.status === "failed")) throw new Error("云库尚无此清晰度，请在源节点生成后同步。");
     if (result.status === "missing" || result.status === "failed") result = await variant(quality, true);
     while (current === generation && result.status === "processing") {
       message.value = `正在生成 ${quality} 视频片段，首次播放需要等待转换完成…`;

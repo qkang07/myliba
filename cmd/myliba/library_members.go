@@ -63,7 +63,7 @@ func (s *server) retireLibraryMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) rejoinLibraryMember(w http.ResponseWriter, r *http.Request) {
-	if s.cloud == nil || s.cloud.runtime == nil { writeError(w, 503, "云层未启用"); return }
+	if s.cloud == nil || s.cloud.runtime == nil { writeError(w, 503, "云库未启用"); return }
 	wsURL, token, err := s.cloud.runtime.credentials()
 	if err != nil || wsURL == "" || len(token) < 32 { writeError(w, 503, "重新加入前需连接 Hub"); return }
 	hub, err := hubHTTPURL(wsURL)
