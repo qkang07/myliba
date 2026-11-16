@@ -83,7 +83,9 @@ func (s *server) videoPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, s.ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", source).Output()
+	probe := exec.CommandContext(ctx, s.ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", source)
+	hideConsoleWindow(probe)
+	output, err := probe.Output()
 	duration, e := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
 	if err != nil || e != nil || math.IsNaN(duration) || math.IsInf(duration, 0) || duration <= 0 {
 		writeError(w, 400, "无法读取视频时长")
@@ -177,6 +179,7 @@ func (s *server) buildVideoPreview(dir, source string, info os.FileInfo, spec pr
 				}
 			}()
 			cmd := exec.CommandContext(ctx, s.ffmpegPath, "-hide_banner", "-loglevel", "error", "-y", "-i", source, "-filter_complex", strings.Join(filters, ";"), "-map", "[out]", "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", name)
+			hideConsoleWindow(cmd)
 			if out, e := cmd.CombinedOutput(); e != nil {
 				err = fmt.Errorf("ffmpeg: %w: %s", e, string(out))
 			} else if now, e := os.Stat(source); e != nil || preprocessVersion(now) != preprocessVersion(info) {

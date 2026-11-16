@@ -115,6 +115,9 @@ final class MobileUi {
         private void rect(Canvas c,float x,float y,float w,float h){c.drawRoundRect(x,y,x+w,y+h,2,2,p);}
         @Override public void draw(Canvas c){c.save();android.graphics.Rect b=getBounds();c.translate(b.left,b.top);c.scale(b.width()/24f,b.height()/24f);p.setColor(color);p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(1.7f);p.setStrokeCap(Paint.Cap.ROUND);p.setStrokeJoin(Paint.Join.ROUND);
             switch(name){
+                case "home":lines(c,3,10,12,3,21,10,21,21,3,21,3,10);lines(c,9,21,9,13,15,13,15,21);break;
+                case "bookmark":lines(c,5,3,19,3,19,21,12,16,5,21,5,3);break;
+                case "inbox":lines(c,3,14,6,4,18,4,21,14,21,20,3,20,3,14,8,14,10,17,14,17,16,14,21,14);break;
                 case "search":c.drawCircle(10.5f,10.5f,6.5f,p);lines(c,15.5f,15.5f,21,21);break;
                 case "folder":lines(c,3,7,3,19,21,19,21,7,12,7,10,4,3,4,3,7);break;
                 case "library":rect(c,3,3,7,7);rect(c,14,3,7,7);rect(c,3,14,7,7);rect(c,14,14,7,7);break;

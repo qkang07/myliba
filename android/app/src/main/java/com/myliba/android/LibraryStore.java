@@ -22,12 +22,14 @@ final class LibraryStore {
         Facet(String key,String name,int count){this.key=key;this.name=name;this.count=count;}
     }
     static final class Meta {
+        String filterKey;
         List<Group> roots=new ArrayList<>(),folders=new ArrayList<>(),collections=new ArrayList<>();
         List<Facet> tags=new ArrayList<>(),attributes=new ArrayList<>();int total,unfiled;boolean online=true;
     }
     static final class Page { List<Entry> items=new ArrayList<>();int total; }
     Meta metadata(LocalFilters filters)throws Exception{
         Meta m=new Meta();
+        m.filterKey=filters.serialize();
         String folder=filters.folderId;
         if(!remote){
             for(LocalLibrary.Root r:local.roots()){m.roots.add(new Group(r.uri,r.name,r.count));m.total+=r.count;}

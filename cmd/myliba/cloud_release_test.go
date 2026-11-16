@@ -239,6 +239,46 @@ func TestReleaseCheckIssuesBoundCredentialAndReleaseIsIdempotent(t *testing.T) {
 	if out := release(); out["idempotent"] != true {
 		t.Fatalf("second release must be idempotent: %+v", out)
 	}
+	// A phone that lost the release response can recover even after its old
+	// credential expires, without treating the missing location as a failure.
+	recheck := httptest.NewRequest(http.MethodPost, "/api/library/files/"+f.fileID+"/release-check", strings.NewReader(string(checkBody)))
+	recheck.SetPathValue("fileId", f.fileID)
+	rechecked := httptest.NewRecorder()
+	f.client.releaseCheck(rechecked, recheck)
+	var finished map[string]any
+	if rechecked.Code != 200 || json.Unmarshal(rechecked.Body.Bytes(), &finished) != nil || finished["released"] != true {
+		t.Fatalf("release-check must report completed release: %d %s", rechecked.Code, rechecked.Body.String())
+	}
+}
+
+func TestReleaseRollsBackLocationWhenLogWriteFails(t *testing.T) {
+	f := setupReleaseFixture(t)
+	checkBody, _ := json.Marshal(map[string]string{"locationId": f.locationID, "revisionId": f.revisionID})
+	check := httptest.NewRequest(http.MethodPost, "/api/library/files/"+f.fileID+"/release-check", strings.NewReader(string(checkBody)))
+	check.SetPathValue("fileId", f.fileID)
+	checked := httptest.NewRecorder()
+	f.client.releaseCheck(checked, check)
+	var eligibility struct {
+		Credential string `json:"credential"`
+	}
+	if checked.Code != 200 || json.Unmarshal(checked.Body.Bytes(), &eligibility) != nil || eligibility.Credential == "" {
+		t.Fatalf("release-check failed: %d %s", checked.Code, checked.Body.String())
+	}
+	if _, err := f.db.Exec(`CREATE TRIGGER reject_release_log BEFORE INSERT ON library_release_log BEGIN SELECT RAISE(ABORT,'simulated log failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	releaseBody, _ := json.Marshal(map[string]string{"locationId": f.locationID, "credential": eligibility.Credential})
+	req := httptest.NewRequest(http.MethodPost, "/api/library/files/"+f.fileID+"/release", strings.NewReader(string(releaseBody)))
+	req.SetPathValue("fileId", f.fileID)
+	rec := httptest.NewRecorder()
+	f.client.releaseOriginal(rec, req)
+	if rec.Code != 500 {
+		t.Fatalf("expected failed log write: %d %s", rec.Code, rec.Body.String())
+	}
+	var state string
+	if err := f.db.QueryRow(`SELECT state FROM library_locations WHERE location_id=?`, f.locationID).Scan(&state); err != nil || state != "available" {
+		t.Fatalf("failed log write must roll back location: %q %v", state, err)
+	}
 }
 
 // T19: an expired credential cannot authorize deletion.

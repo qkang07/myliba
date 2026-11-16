@@ -81,6 +81,7 @@ func demandEncode(ctx context.Context, s *server, input, key, quality string, in
 		"-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-profile:v", "baseline", "-level:v", "4.1", "-pix_fmt", "yuv420p",
 		"-b:v", q.bitrate, "-maxrate", q.bitrate, "-bufsize", q.bitrate, "-g", "120", "-keyint_min", "120", "-sc_threshold", "0",
 		"-c:a", "aac", "-b:a", q.audioBitrate, "-ac", "2", "-movflags", "empty_moov+default_base_moof+frag_keyframe", "-f", "mp4", "pipe:1")
+	hideConsoleWindow(cmd)
 	var out limitedVideoBuffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -161,7 +162,9 @@ func demandManifest(ctx context.Context, s *server, input, key, quality string) 
 	case <-probeCtx.Done():
 		return videoManifest{}, probeCtx.Err()
 	}
-	output, err := exec.CommandContext(probeCtx, s.ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input).Output()
+	probe := exec.CommandContext(probeCtx, s.ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input)
+	hideConsoleWindow(probe)
+	output, err := probe.Output()
 	<-demandSlots
 	duration, parseErr := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
 	if err != nil || parseErr != nil || math.IsNaN(duration) || math.IsInf(duration, 0) || duration <= 0 || duration > 86400 {

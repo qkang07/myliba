@@ -174,6 +174,7 @@ func (s *server) transcodeVideo(ctx context.Context, dir, source string, sourceI
 		"-f", "hls", "-hls_segment_type", "fmp4", "-hls_time", "4", "-hls_playlist_type", "vod",
 		"-hls_flags", "independent_segments", "-hls_fmp4_init_filename", "init.mp4",
 		"-hls_segment_filename", filepath.Join(tmp, "segment-%05d.m4s"), filepath.Join(tmp, "index.m3u8"))
+	hideConsoleWindow(cmd)
 	cmd.Dir = tmp
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg: %w: %s", err, strings.TrimSpace(string(output)))

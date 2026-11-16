@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -259,6 +260,27 @@ func (c *cloudClient) releaseCheck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "释放检查需要 fileId 与 locationId")
 		return
 	}
+	if c.runtime == nil || c.runtime.db == nil {
+		writeError(w, 503, "资源库数据库不可用")
+		return
+	}
+	// The phone may have received no response after a successful release. Let it
+	// finish its local journal without requiring a new credential for a location
+	// that is already gone.
+	var releasedRevision string
+	err := c.runtime.db.QueryRow(`SELECT revision_id FROM library_release_log WHERE location_id=? AND file_id=?`, strings.TrimSpace(input.LocationID), fileID).Scan(&releasedRevision)
+	if err == nil {
+		if strings.TrimSpace(input.RevisionID) != "" && strings.TrimSpace(input.RevisionID) != releasedRevision {
+			writeError(w, 409, "释放记录的版本与请求不符")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"released": true, "fileId": fileID, "revisionId": releasedRevision, "locationId": strings.TrimSpace(input.LocationID)})
+		return
+	}
+	if err != sql.ErrNoRows {
+		writeError(w, 500, "无法查询释放记录")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 	eval := c.evaluateRelease(ctx, fileID, strings.TrimSpace(input.LocationID), strings.TrimSpace(input.RevisionID))
@@ -304,11 +326,15 @@ func (c *cloudClient) releaseOriginal(w http.ResponseWriter, r *http.Request) {
 	}
 	// Idempotent finish: a crashed client may retry after the location was already
 	// removed. The release log makes the second call a no-op success.
-	var logged string
+	var loggedFile, loggedRevision string
 	if c.runtime.db != nil {
-		_ = c.runtime.db.QueryRow(`SELECT credential_id FROM library_release_log WHERE location_id=?`, locationID).Scan(&logged)
+		_ = c.runtime.db.QueryRow(`SELECT file_id,revision_id FROM library_release_log WHERE location_id=?`, locationID).Scan(&loggedFile, &loggedRevision)
 	}
-	if logged != "" {
+	if loggedFile != "" {
+		if loggedFile != fileID || loggedRevision != cred.RevisionID {
+			writeError(w, 409, "释放记录与请求不符")
+			return
+		}
 		writeJSON(w, 200, map[string]any{"released": true, "locationId": locationID, "idempotent": true})
 		return
 	}
@@ -325,15 +351,31 @@ func (c *cloudClient) releaseOriginal(w http.ResponseWriter, r *http.Request) {
 	}
 	taskID := c.createTransferTask("release", fileID, cred.RevisionID, "", locationID, eval.manifest.Size)
 	c.setTransferState(taskID, "deletingLocal", "")
-	if _, err := c.runtime.db.Exec(`UPDATE library_locations SET state='missing',updated_at=? WHERE location_id=? AND file_id=?`, now(), locationID, fileID); err != nil {
+	tx, err := c.runtime.db.BeginTx(ctx, nil)
+	if err != nil {
 		c.setTransferState(taskID, transferRetryableFailed, err.Error())
 		writeError(w, 500, "无法移除本机位置")
 		return
 	}
-	if _, err := c.runtime.db.Exec(`INSERT INTO library_release_log(location_id,file_id,revision_id,credential_id,released_at) VALUES(?,?,?,?,?)
-		ON CONFLICT(location_id) DO NOTHING`, locationID, fileID, cred.RevisionID, cred.CredentialID, now()); err != nil {
+	result, err := tx.Exec(`UPDATE library_locations SET state='missing',updated_at=? WHERE location_id=? AND file_id=? AND revision_id=? AND state='available'`, now(), locationID, fileID, cred.RevisionID)
+	if err == nil {
+		var affected int64
+		affected, err = result.RowsAffected()
+		if err == nil && affected != 1 {
+			err = errors.New("位置已变化，请重新检查")
+		}
+	}
+	if err == nil {
+		_, err = tx.Exec(`INSERT INTO library_release_log(location_id,file_id,revision_id,credential_id,released_at) VALUES(?,?,?,?,?)`, locationID, fileID, cred.RevisionID, cred.CredentialID, now())
+	}
+	if err == nil {
+		err = tx.Commit()
+	} else {
+		_ = tx.Rollback()
+	}
+	if err != nil {
 		c.setTransferState(taskID, transferRetryableFailed, err.Error())
-		writeError(w, 500, "无法记录释放结果")
+		writeError(w, 500, "无法提交释放结果")
 		return
 	}
 	c.setTransferState(taskID, transferCommitted, "")

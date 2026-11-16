@@ -75,12 +75,23 @@ const KIND_TO_TYPE: Record<string, LibraryType> = {
   other: "other",
 };
 
-function librarySort(sort: ResourceSort): LibrarySort {
+export function librarySort(sort: ResourceSort): LibrarySort {
   switch (sort) {
     case "name_asc": return "name_asc";
     case "name_desc": return "name_desc";
     case "modified_asc": return "modified_asc";
     case "size_desc": return "ingested_desc";
+    default: return "modified_desc";
+  }
+}
+
+export function resourceSort(sort: LibrarySort): ResourceSort {
+  switch (sort) {
+    case "name_asc": return "name_asc";
+    case "name_desc": return "name_desc";
+    case "modified_asc": return "modified_asc";
+    case "ingested_desc": return "size_desc";
+    // 主界面排序没有“最早入库”，旧查询的 ingested_asc 回退到最近修改。
     default: return "modified_desc";
   }
 }

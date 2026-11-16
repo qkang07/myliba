@@ -96,6 +96,11 @@ func (s *server) startPreprocessing() error {
 	if s.jobsStop == nil {
 		s.jobsStop = make(chan struct{})
 	}
+	var paused string
+	if err := s.db.QueryRow(`SELECT value FROM app_settings WHERE key='preprocess_paused'`).Scan(&paused); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	s.preprocessPaused.Store(paused == "1")
 	if _, err := s.db.Exec(`UPDATE preprocess_jobs SET status='pending' WHERE status='running'`); err != nil {
 		return err
 	}
@@ -158,6 +163,15 @@ func (s *server) preprocessWorker() {
 		case <-s.jobsStop:
 			return
 		default:
+		}
+		if s.preprocessPaused.Load() {
+			select {
+			case <-s.jobsWake:
+			case <-s.jobsStop:
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
 		}
 		id, operation, version, err := s.claimPreprocessJob()
 		if err != nil {
@@ -307,7 +321,30 @@ func (s *server) listPreprocessJobs(w http.ResponseWriter, r *http.Request) {
 			visible[id] = status
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "jobs": jobs, "visible": visible})
+	writeJSON(w, http.StatusOK, map[string]any{"counts": counts, "jobs": jobs, "visible": visible, "paused": s.preprocessPaused.Load()})
+}
+
+func (s *server) pausePreprocessing(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Paused bool `json:"paused"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "参数无效")
+		return
+	}
+	value := "0"
+	if input.Paused {
+		value = "1"
+	}
+	if _, err := s.db.Exec(`INSERT INTO app_settings(key,value) VALUES('preprocess_paused',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, value); err != nil {
+		writeError(w, http.StatusInternalServerError, "无法保存队列状态")
+		return
+	}
+	s.preprocessPaused.Store(input.Paused)
+	if !input.Paused {
+		s.wakePreprocessing()
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"paused": input.Paused})
 }
 
 func (s *server) prioritizePreprocessJobs(w http.ResponseWriter, r *http.Request) {

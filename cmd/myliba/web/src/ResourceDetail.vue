@@ -430,7 +430,7 @@ onBeforeUnmount(() => {
           </section>
           <section class="detail-panel">
             <div class="detail-panel-heading"><h2>所属文件夹</h2></div>
-            <label class="detail-folder-field">文件夹<select :value="resource.folderId" :disabled="folderBusy" @change="changeFolder"><option value="">未归组</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
+            <label class="detail-folder-field">文件夹<select :value="resource.folderId" :disabled="folderBusy" @change="changeFolder"><option value="">未分入文件夹</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></label>
             <p class="detail-folder-hint">归组不移动或复制原文件。</p>
           </section>
           <section class="detail-panel">

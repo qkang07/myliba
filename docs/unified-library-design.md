@@ -1,6 +1,6 @@
 # 统一资源库：跨设备检索、分类同步与手机空间释放
 
-状态：设计草案，作为后续分期实施和验收的依据，不代表功能已经完成。更新：2026-11-09。
+状态：设计草案，作为后续分期实施和验收的依据，不代表功能已经完成。更新：2026-11-16。
 
 需求来源：[使用场景](senarios.md)。本文承接[统一文件索引](file-index-and-content.md)、[云库索引与虚拟节点](cloud-index-and-virtual-nodes.md)；涉及统一检索、分类同步和实施顺序的冲突，以本文的目标设计为后续实现依据。历史改动记录见[产品体验](product-experience.md)。
 
@@ -284,7 +284,7 @@ HTTP 请求级校验失败返回相应 4xx；正常并发操作可被接收并�
 
 ## 11. 分期交付计划
 
-当前代码缺口速览（2026-11-09；以下均待用户执行对应验收）：
+当前代码缺口速览（2026-11-16；以下均待用户执行对应验收）：
 
 | 阶段 | 代码状态与剩余缺口 |
 | --- | --- |
@@ -476,7 +476,9 @@ Android 打开补强（2026-11-07）：统一检索的云库预览会先检查�
 - 交付：手机上传后释放原件，另一端保留分类并从云库恢复相同内容。
 - 门槛：T17–T20 真机通过；模拟块丢失、旧版本、磁盘满和删除拒绝均不能误报释放成功。
 
-当前进展（2026-11-09）：P5 各子项已有代码实现。故障域身份与独立副本计数（`cloud_fault_domain.go`，同盘多网关/同虚拟存储多入口只算一个域，未知域不计入）；持久上传任务状态机与读回验证（`cloud_transfer.go` 的 `library_transfer_tasks`、`encryptBlocks`/`verifyStoredBlocks` 读回解密重哈希、`commitUploadedContent` 持久化 `library_verified_content`）；恢复密钥可恢复性证明（`cloud_recovery.go` 本机 AEAD 往返自证明与远端按库/节点/UTC 日 HMAC 证明，`recoveryHolder` 排除待释放设备、30 天窗口）；释放检查/释放端点与短期凭据（`cloud_release.go` 的 `evaluateRelease` 共享门槛、HMAC 凭据绑定位置/版本/策略/摘要/时间、释放前复核与 `library_release_log` 幂等）；分块原件上传与来源位置登记（`cloud_original_upload.go`，≤1MiB 分块经同一加密/读回/提交流水线，登记 `source:<nodeId>:<resourceRef>`）。Android `OriginalUploadService` 以前台服务持久化分块上传任务，明文仅走 P2P WebRTC 直连（Hub 只中继信令、不见内容），提供上传开关、任务/释放 UI，释放按“释放检查→重核 SAF 摘要→`DocumentsContract.deleteDocument`→`/release`”顺序，崩溃后将中断任务标记失败并幂等收尾。Web CloudPanel 增加传输任务状态面板（待上传/读取/传输/读回验证/安全保存/失败原因）、恢复密钥状态与本机自证明、详情安全释放检查（独立故障域数量、阻塞原因、恢复密钥持有者）与释放操作，`api.ts` 补充对应 helpers，文件详情新增 `releaseLocations` 暴露可释放位置标识。实现边界：Web 释放只移除本机位置记录，手机来源的 SAF 删除必须先由手机完成；单节点云库可存储读取但按设计不满足默认释放策略。代码构建与现有单元/协议测试通过不等于验收通过；T17–T20 真机、块丢失/旧版本/磁盘满/删除拒绝故障注入与“释放后另一端保留分类并从云库恢复相同内容”的闭环均待用户验收，P5 不标记阶段完成。
+早期进展（2026-11-09）：P5 各子项已有代码实现。故障域身份与独立副本计数（`cloud_fault_domain.go`，同盘多网关/同虚拟存储多入口只算一个域，未知域不计入）；持久上传任务状态机与读回验证（`cloud_transfer.go` 的 `library_transfer_tasks`、`encryptBlocks`/`verifyStoredBlocks` 读回解密重哈希、`commitUploadedContent` 持久化 `library_verified_content`）；恢复密钥可恢复性证明（`cloud_recovery.go` 本机 AEAD 往返自证明与远端按库/节点/UTC 日 HMAC 证明，`recoveryHolder` 排除待释放设备、30 天窗口）；释放检查/释放端点与短期凭据（`cloud_release.go` 的 `evaluateRelease` 共享门槛、HMAC 凭据绑定位置/版本/策略/摘要/时间、释放前复核与 `library_release_log` 幂等）；分块原件上传与来源位置登记（`cloud_original_upload.go`，≤1MiB 分块经同一加密/读回/提交流水线，登记 `source:<nodeId>:<resourceRef>`）。Android `OriginalUploadService` 以前台服务持久化分块上传任务，明文仅走 P2P WebRTC 直连（Hub 只中继信令、不见内容），提供上传开关、任务/释放 UI，释放按“释放检查→重核 SAF 摘要→`DocumentsContract.deleteDocument`→`/release`”顺序，崩溃后将中断上传任务标记失败；释放中断收尾当时尚未闭环。Web CloudPanel 增加传输任务状态面板（待上传/读取/传输/读回验证/安全保存/失败原因）、恢复密钥状态与本机自证明、详情安全释放检查（独立故障域数量、阻塞原因、恢复密钥持有者）与释放操作，`api.ts` 补充对应 helpers，文件详情新增 `releaseLocations` 暴露可释放位置标识。实现边界：Web 释放只移除本机位置记录，手机来源的 SAF 删除必须先由手机完成；单节点云库可存储读取但按设计不满足默认释放策略。代码构建与现有单元/协议测试通过不等于验收通过；T17–T20 真机、块丢失/旧版本/磁盘满/删除拒绝故障注入与“释放后另一端保留分类并从云库恢复相同内容”的闭环均待用户验收，P5 不标记阶段完成。
+
+当前进展（2026-11-16）：P5 释放中断收尾增加 Android 持久阶段记录：删除前同步落盘，重启后核实 SAF 授权、根目录可用性和目标文档状态；原件仍在时重新检查，确已不存在时继续向查询节点移除位置，无法确认时保留待核实状态与手动重试入口。查询节点 `/release-check` 可报告已完成的释放，避免手机丢失响应后因旧凭据过期而无法收尾；`/release` 的位置状态与释放日志改为同一事务，日志写入失败时回滚位置状态。Go 构建、vet、现有单元/协议测试和 Android 编译通过；T19 的杀进程、SAF 拒绝、撤权与存储卷暂不可用等真机故障场景仍待用户验收，P5 不标记阶段完成。
 
 ### P6：规模、维护与网络优化
 

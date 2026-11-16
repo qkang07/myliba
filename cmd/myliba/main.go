@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -42,6 +43,7 @@ type server struct {
 	videoSlots     chan struct{}
 	jobsWake       chan struct{}
 	jobsStop       chan struct{}
+	preprocessPaused atomic.Bool
 	folderAccessMu sync.Mutex
 	folderAccess   map[string]folderAccessSession
 }
@@ -278,6 +280,7 @@ func main() {
 	mux.HandleFunc("GET /api/resources/{id}/thumbnail", app.serveThumbnail)
 	mux.HandleFunc("POST /api/resources/{id}/thumbnail", app.serveThumbnail)
 	mux.HandleFunc("GET /api/preprocess", app.listPreprocessJobs)
+	mux.HandleFunc("POST /api/preprocess/pause", app.pausePreprocessing)
 	mux.HandleFunc("POST /api/preprocess/prioritize", app.prioritizePreprocessJobs)
 	mux.HandleFunc("POST /api/preprocess/retry-failed", app.retryFailedPreprocessJobs)
 	mux.HandleFunc("POST /api/preprocess/{id}/retry", app.retryPreprocessJob)
@@ -397,6 +400,10 @@ CREATE TABLE IF NOT EXISTS preprocess_jobs (
     PRIMARY KEY(resource_id, operation)
 );
 CREATE INDEX IF NOT EXISTS preprocess_jobs_queue_idx ON preprocess_jobs(status, priority DESC, priority_at DESC, created_at);
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS file_shares (
     id TEXT PRIMARY KEY,
     resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
@@ -1015,7 +1022,9 @@ func (s *server) videoInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, s.ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path).Output()
+	probe := exec.CommandContext(ctx, s.ffprobePath, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	hideConsoleWindow(probe)
+	output, err := probe.Output()
 	if err != nil {
 		writeError(w, http.StatusUnsupportedMediaType, "无法读取视频时长")
 		return

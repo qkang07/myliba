@@ -1073,6 +1073,7 @@ export interface PreprocessQueue {
   counts: Record<"pending" | "running" | "done" | "failed", number>;
   jobs: PreprocessJob[];
   visible: Record<string, PreprocessJob["status"]>;
+  paused: boolean;
 }
 
 export function getPreprocessQueue(ids: string[] = []) {
@@ -1089,6 +1090,9 @@ export function retryPreprocessJob(id: string) {
 }
 export function retryFailedPreprocessJobs() {
   return request<{ retried: number }>("/api/preprocess/retry-failed", { method: "POST" });
+}
+export function setPreprocessPaused(paused: boolean) {
+  return request<{ paused: boolean }>("/api/preprocess/pause", { method: "POST", body: JSON.stringify({ paused }) });
 }
 export interface PreviewClip { start: number; end: number }
 export interface PreviewSpec { quality: "360p" | "720p" | "1080p"; clips: PreviewClip[] }

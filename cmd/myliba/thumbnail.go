@@ -192,6 +192,7 @@ func (s *server) generateThumbnail(parent context.Context, sourcePath, kind stri
 			"-vf", fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease", width, height),
 			"-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1")
 		cmd := exec.CommandContext(ctx, s.ffmpegPath, args...)
+		hideConsoleWindow(cmd)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		var output bytes.Buffer

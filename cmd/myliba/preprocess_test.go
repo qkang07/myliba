@@ -127,6 +127,8 @@ func TestPreprocessRemoteRoutesAreScoped(t *testing.T) {
 		{http.MethodPost, "/api/preprocess/prioritize", true},
 		{http.MethodPost, "/api/preprocess/retry-failed", true},
 		{http.MethodGet, "/api/preprocess/retry-failed", false},
+		{http.MethodPost, "/api/preprocess/pause", true},
+		{http.MethodGet, "/api/preprocess/pause", false},
 		{http.MethodPost, "/api/preprocess/item/retry", true},
 		{http.MethodDelete, "/api/preprocess/item/retry", false},
 		{http.MethodGet, "/api/preprocess/item/retry", false},
@@ -206,6 +208,89 @@ func TestPreprocessWorkerCompletesQueuedThumbnail(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("background thumbnail did not complete")
+}
+
+func TestPreprocessPauseAndResume(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "library")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(filepath.Join(root, "item.jpg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(f, image.NewRGBA(image.Rect(0, 0, 24, 24)), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "library.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO roots(id,path,added_at) VALUES('root',?,'2026-01-01')`, root); err != nil {
+		t.Fatal(err)
+	}
+	thumbDir := filepath.Join(dir, "thumbnails")
+	if err := os.Mkdir(thumbDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	app := &server{db: db, thumbnailDir: thumbDir, thumbnailLocks: map[string]*sync.Mutex{}, jobsWake: make(chan struct{}, 1)}
+	if err := app.startPreprocessing(); err != nil {
+		t.Fatal(err)
+	}
+	defer close(app.jobsStop)
+	pause := func(paused bool) {
+		body, _ := json.Marshal(map[string]bool{"paused": paused})
+		response := httptest.NewRecorder()
+		app.pausePreprocessing(response, httptest.NewRequest(http.MethodPost, "/api/preprocess/pause", bytes.NewReader(body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("pause %v: %d %s", paused, response.Code, response.Body.String())
+		}
+	}
+	pause(true)
+	response := httptest.NewRecorder()
+	app.listPreprocessJobs(response, httptest.NewRequest(http.MethodGet, "/api/preprocess", nil))
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"paused":true`)) {
+		t.Fatalf("queue paused state: %d %s", response.Code, response.Body.String())
+	}
+	scan := httptest.NewRequest(http.MethodPost, "/api/roots/root/scan", nil)
+	scan.SetPathValue("id", "root")
+	response = httptest.NewRecorder()
+	app.scanRoot(response, scan)
+	if response.Code != http.StatusOK {
+		t.Fatalf("scan: %d %s", response.Code, response.Body.String())
+	}
+	time.Sleep(300 * time.Millisecond)
+	var status string
+	if err := db.QueryRow(`SELECT status FROM preprocess_jobs LIMIT 1`).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("paused queue processed job: status=%s err=%v", status, err)
+	}
+	pause(false)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if db.QueryRow(`SELECT status FROM preprocess_jobs LIMIT 1`).Scan(&status) == nil && status == "done" {
+			pause(true)
+			restarted := &server{db: db, jobsWake: make(chan struct{}, 1)}
+			if err := restarted.startPreprocessing(); err != nil {
+				t.Fatal(err)
+			}
+			defer close(restarted.jobsStop)
+			if !restarted.preprocessPaused.Load() {
+				t.Fatal("pause state not restored on startup")
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("queued thumbnail did not complete after resume")
 }
 
 func TestOtherFilesReceiveFingerprintTask(t *testing.T) {

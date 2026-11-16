@@ -778,6 +778,8 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "preprocess" && parts[2] == "prioritize":
 		return method == http.MethodPost
+	case len(parts) == 3 && parts[1] == "preprocess" && parts[2] == "pause":
+		return method == http.MethodPost
 	case len(parts) == 3 && parts[1] == "preprocess" && parts[2] == "retry-failed":
 		return method == http.MethodPost
 	case len(parts) == 4 && parts[1] == "preprocess" && parts[3] == "retry":
