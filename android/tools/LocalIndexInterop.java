@@ -5,7 +5,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 
-/** Regenerates public test vectors using the production Android encryption code. */
+/**
+ * Regenerates public test vectors using the production Android encryption code.
+ * args[0] receives format-4 device index records, args[1] format-5 records.
+ * The checked-in android-index-records.jsonl format-3 fixture predates the
+ * format-4 codec and is kept unchanged for legacy interoperability coverage.
+ */
 public final class LocalIndexInterop {
     public static void main(String[] args)throws Exception{
         byte[] key=LocalIndexCrypto.key("11".repeat(32));
@@ -20,9 +25,26 @@ public final class LocalIndexInterop {
             String stamp="2026-11-03T00:00:0"+phase+"Z";
             String record=LocalIndexCrypto.seal(key,id,"v1",node,stamp,manifest);
             String nonce=record.split("\"nonce\":\"")[1].split("\"")[0],sealed=record.split("\"sealed\":\"")[1].split("\"")[0];
-            if(!manifest.equals(LocalIndexCrypto.open(key,id,"v1",node,stamp,nonce,sealed)))throw new AssertionError("publisher cannot reopen its persisted record");
+            if(!manifest.equals(LocalIndexCrypto.open(key,4,false,id,"v1",node,0,stamp,nonce,sealed)))throw new AssertionError("publisher cannot reopen its persisted record");
             records.add(record);
         }
         Files.write(Path.of(args[0]),records,StandardCharsets.UTF_8);
+        if(args.length>1){
+            ArrayList<String> format5=new ArrayList<>();
+            long[] epochs={0,7};
+            for(int phase=0;phase<epochs.length;phase++){
+                String index="{\"fileId\":\""+id+"\",\"revisionId\":\"v1\",\"name\":\"照片.jpg\",\"kind\":\"image\",\"modified\":\"2026-11-03T00:00:00Z\",\"tags\":[],\"folderId\":\"\",\"folderName\":\"\",\"organizationKnown\":true,\"deleted\":false,\"original\":{\"size\":6,\"local\":[{\"nodeId\":\"phone-interop\",\"storageId\":\"saf-root\",\"resourceRef\":\"Y29udGVudDovL3Rlc3QvcGhvdG8uanBn\"}]},\"assets\":[],\"contentSize\":6}";
+                String manifest="{\"indexOnly\":true,\"localIndex\":"+index+"}";
+                String stamp="2026-11-17T00:00:0"+phase+"Z";
+                String record=LocalIndexCrypto.seal5(key,id,"v1",node,epochs[phase],stamp,manifest);
+                String nonce=record.split("\"nonce\":\"")[1].split("\"")[0],sealed=record.split("\"sealed\":\"")[1].split("\"")[0];
+                if(!manifest.equals(LocalIndexCrypto.open(key,5,false,id,"v1",node,epochs[phase],stamp,nonce,sealed)))throw new AssertionError("format 5 record cannot be reopened");
+                boolean rejected=false;
+                try{LocalIndexCrypto.open(key,5,false,id,"v1",node,epochs[phase]+1,stamp,nonce,sealed);}catch(Exception expected){rejected=true;}
+                if(!rejected)throw new AssertionError("format 5 AAD does not bind authorEpoch");
+                format5.add(record);
+            }
+            Files.write(Path.of(args[1]),format5,StandardCharsets.UTF_8);
+        }
     }
 }

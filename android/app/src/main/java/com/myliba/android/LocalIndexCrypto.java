@@ -7,7 +7,7 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-/** Format-4 catalog encoding with format-3 compatibility reads. No Android dependencies. */
+/** Format-5 catalog encoding with format-3/4 compatibility reads. No Android dependencies. */
 final class LocalIndexCrypto {
     static byte[] key(String value) {
         if(!value.matches("[0-9a-fA-F]{64}"))throw new IllegalArgumentException("恢复密钥需为 64 位十六进制字符");
@@ -27,14 +27,32 @@ final class LocalIndexCrypto {
         String epochField=epoch>0?",\"authorEpoch\":"+epoch:"";
         return aad.substring(0,aad.length()-1)+epochField+",\"nonce\":\""+hex(nonce)+"\",\"sealed\":\""+hex(sealed)+"\"}";
     }
+    static String seal5(byte[] key,String object,String revision,String author,long epoch,String stamp,String manifest)throws Exception{
+        for(String value:new String[]{object,revision,author,stamp})if(!value.matches("[a-zA-Z0-9:._-]{1,128}"))throw new IllegalArgumentException("Invalid catalog identity");
+        if(epoch<0)throw new IllegalArgumentException("Invalid author epoch");
+        String aad=recordAad(5,false,hash(key),object,revision,author,epoch,stamp);
+        byte[] nonce=new byte[12];new SecureRandom().nextBytes(nonce);
+        Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,new SecretKeySpec(key,"AES"),new GCMParameterSpec(128,nonce));cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
+        byte[] sealed=cipher.doFinal(manifest.getBytes(StandardCharsets.UTF_8));
+        return aad.substring(0,aad.length()-1)+",\"nonce\":\""+hex(nonce)+"\",\"sealed\":\""+hex(sealed)+"\"}";
+    }
     static String open(byte[] key,String object,String revision,String author,String stamp,String nonceHex,String sealedHex)throws Exception{
         return open(key,3,false,object,revision,author,stamp,nonceHex,sealedHex);
     }
     static String open(byte[] key,int format,boolean keepHistory,String object,String revision,String author,String stamp,String nonceHex,String sealedHex)throws Exception{
-        String aad="{\"format\":"+format+",\"keepHistory\":"+keepHistory+",\"libraryId\":\""+hash(key)+"\",\"objectId\":\""+object+"\",\"revisionId\":\""+revision+"\",\"authorId\":\""+author+"\",\"createdAt\":\""+stamp+"\",\"blockIds\":[]}";
+        return open(key,format,keepHistory,object,revision,author,0,stamp,nonceHex,sealedHex);
+    }
+    static String open(byte[] key,int format,boolean keepHistory,String object,String revision,String author,long epoch,String stamp,String nonceHex,String sealedHex)throws Exception{
+        String aad=recordAad(format,keepHistory,hash(key),object,revision,author,epoch,stamp);
         byte[] nonce=decode(nonceHex),sealed=decode(sealedHex);
         Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,new SecretKeySpec(key,"AES"),new GCMParameterSpec(128,nonce));cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
         return new String(cipher.doFinal(sealed),StandardCharsets.UTF_8);
+    }
+    // Format 5 binds authorEpoch (including 0) between authorId and createdAt;
+    // the field order must stay byte-identical with Go cloudRecordAAD.
+    private static String recordAad(int format,boolean keepHistory,String library,String object,String revision,String author,long epoch,String stamp){
+        String epochField=format>=5?",\"authorEpoch\":"+epoch:"";
+        return "{\"format\":"+format+",\"keepHistory\":"+keepHistory+",\"libraryId\":\""+library+"\",\"objectId\":\""+object+"\",\"revisionId\":\""+revision+"\",\"authorId\":\""+author+"\""+epochField+",\"createdAt\":\""+stamp+"\",\"blockIds\":[]}";
     }
     private static byte[] decode(String hex){if(hex.length()%2!=0||!hex.matches("[0-9a-f]+"))throw new IllegalArgumentException("Invalid hex");byte[] bytes=new byte[hex.length()/2];for(int i=0;i<bytes.length;i++)bytes[i]=(byte)Integer.parseInt(hex.substring(2*i,2*i+2),16);return bytes;}
 }

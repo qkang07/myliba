@@ -67,6 +67,18 @@ final class RemoteClient {
         if("/api/session".equals(path)&&("GET".equals(method)||"POST".equals(method)))configureSession(result);
         return result;
     }
+    /** Long-running control request. It deliberately uses authenticated HTTPS
+     * instead of RTC because classification prepare/upload/activate may spend
+     * minutes without producing an intermediate response frame. */
+    JSONObject jsonLong(String method,String path,JSONObject body)throws Exception{
+        byte[] data;
+        try{data=httpBytes(method,path,body,8*1024*1024,"",10*60*1000);}
+        catch(Failure ex){
+            if(ex.status!=401||"/api/session/device".equals(path))throw ex;
+            deviceSession();data=httpBytes(method,path,body,8*1024*1024,"",10*60*1000);
+        }
+        return data.length==0?new JSONObject():new JSONObject(new String(data,StandardCharsets.UTF_8));
+    }
     private void configureSession(JSONObject result){
         nodes=result.optJSONArray("nodes")==null?new JSONArray():result.optJSONArray("nodes");selectedNodeId=result.optString("selectedNodeId");owner=result.optBoolean("owner",false);
         rtc.configure(cookie,result.optJSONArray("iceServers"));rtcConfigured=true;if(result.optBoolean("nodeOnline"))rtc.connectAsync();
@@ -97,9 +109,12 @@ final class RemoteClient {
             }catch(Failure ex){if(!"GET".equals(method)||ex.status<500)throw ex;AppLog.info("Remote content falling back to limited Hub relay after RTC HTTP "+ex.status);}
             catch(Exception ex){if(!"GET".equals(method))throw ex;AppLog.info("Remote content falling back to limited Hub relay: "+ex.getClass().getSimpleName());}
         }
+        return httpBytes(method,path,body,max,readTicket,30000);
+    }
+    private byte[] httpBytes(String method,String path,JSONObject body,int max,String readTicket,int readTimeout)throws Exception{
         HttpURLConnection c=(HttpURLConnection)new URL(base+path).openConnection();
         try{
-            c.setRequestMethod(method);c.setConnectTimeout(12000);c.setReadTimeout(30000);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
+            c.setRequestMethod(method);c.setConnectTimeout(12000);c.setReadTimeout(readTimeout);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
             c.setRequestProperty("Origin",base);c.setRequestProperty("Referer",base+"/");c.setRequestProperty("Accept","application/json, image/*");
             if(!cookie.isEmpty())c.setRequestProperty("Cookie",cookie);
             String activeFolderToken=folderAccessToken;if(!activeFolderToken.isEmpty())c.setRequestProperty("X-Myliba-Folder-Access",activeFolderToken);

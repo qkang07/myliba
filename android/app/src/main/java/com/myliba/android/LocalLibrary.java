@@ -1,18 +1,31 @@
 package com.myliba.android;
 
+import android.icu.lang.UCharacter;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.net.Uri;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.text.Normalizer;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 
 final class LocalLibrary extends SQLiteOpenHelper {
@@ -20,11 +33,33 @@ final class LocalLibrary extends SQLiteOpenHelper {
         final String uri;
         final String name;
         final int count;
+        final boolean preserveStructure;
 
-        Root(String uri, String name, int count) {
+        Root(String uri, String name, int count, boolean preserveStructure) {
             this.uri = uri;
             this.name = name;
             this.count = count;
+            this.preserveStructure = preserveStructure;
+        }
+    }
+
+    static final class IndexNode {
+        final String id;
+        final String parentId;
+        final String name;
+        final String version;
+        final int count;
+        final boolean hasChildren;
+        String path;
+
+        IndexNode(String id, String parentId, String name, String version, int count, boolean hasChildren) {
+            this.id = id;
+            this.parentId = parentId;
+            this.name = name;
+            this.version = version;
+            this.count = count;
+            this.hasChildren = hasChildren;
+            this.path = name;
         }
     }
 
@@ -135,7 +170,8 @@ final class LocalLibrary extends SQLiteOpenHelper {
     }
 
     LocalLibrary(Context context) {
-        super(context, "local-library.db", null, 17);
+        super(context, "local-library.db", null, 19);
+        verifyClassificationNameVectors();
     }
 
     @Override public void onConfigure(SQLiteDatabase db) {
@@ -143,7 +179,7 @@ final class LocalLibrary extends SQLiteOpenHelper {
     }
 
     @Override public void onCreate(SQLiteDatabase db) {
-        db.execSQL("CREATE TABLE roots (uri TEXT PRIMARY KEY, name TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE roots (uri TEXT PRIMARY KEY, name TEXT NOT NULL, preserve_structure INTEGER NOT NULL DEFAULT 1)");
         db.execSQL("CREATE TABLE items (uri TEXT PRIMARY KEY, root_uri TEXT NOT NULL REFERENCES roots(uri) ON DELETE CASCADE, name TEXT NOT NULL, path TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, modified INTEGER NOT NULL, scan_token TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file', folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL, file_id TEXT NOT NULL UNIQUE, logical_file_id TEXT NOT NULL, revision_id TEXT NOT NULL)");
         db.execSQL("CREATE INDEX items_root ON items(root_uri)");
         db.execSQL("CREATE TABLE tags (item_uri TEXT NOT NULL REFERENCES items(uri) ON DELETE CASCADE, name TEXT NOT NULL, PRIMARY KEY(item_uri, name))");
@@ -152,6 +188,10 @@ final class LocalLibrary extends SQLiteOpenHelper {
         createAliasTables(db);
         createIndexSyncTables(db);
         createOperationSyncTables(db);
+        createClassificationTables(db);
+        createClassificationOperationTables(db);
+        ensureClassificationIdentity(db);
+        ensureActiveClassificationState(db);
     }
 
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
@@ -249,7 +289,666 @@ final class LocalLibrary extends SQLiteOpenHelper {
             createOperationSyncTables(db);
             oldVersion = 17;
         }
+        if (oldVersion == 17) {
+            db.execSQL("ALTER TABLE roots ADD COLUMN preserve_structure INTEGER NOT NULL DEFAULT 1");
+            createClassificationTables(db);
+            ensureClassificationIdentity(db);
+            oldVersion = 18;
+        }
+        if (oldVersion == 18) {
+            createClassificationOperationTables(db);
+            backfillClassificationOperations(db);
+            ensureActiveClassificationState(db);
+            oldVersion = 19;
+        }
         if (oldVersion != newVersion) throw new IllegalStateException("Missing local library migration to " + newVersion + " from " + oldVersion);
+    }
+
+    private static void createClassificationTables(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_library_identity (id INTEGER PRIMARY KEY CHECK(id=1), library_id TEXT NOT NULL, node_id TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_nodes (library_id TEXT NOT NULL, index_id TEXT NOT NULL, parent_id TEXT, name TEXT NOT NULL, name_key TEXT NOT NULL, origin TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, name_op_id TEXT NOT NULL DEFAULT '', parent_op_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(library_id,index_id), FOREIGN KEY(library_id,parent_id) REFERENCES classification_nodes(library_id,index_id) ON DELETE RESTRICT)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS classification_nodes_browse ON classification_nodes(library_id,parent_id,deleted,name_key,index_id)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_adds (library_id TEXT NOT NULL, logical_file_id TEXT NOT NULL, index_id TEXT NOT NULL, add_token TEXT NOT NULL, origin TEXT NOT NULL, operation_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, PRIMARY KEY(library_id,logical_file_id,index_id,add_token), FOREIGN KEY(library_id,index_id) REFERENCES classification_nodes(library_id,index_id) ON DELETE CASCADE)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_removes (library_id TEXT NOT NULL, logical_file_id TEXT NOT NULL, index_id TEXT NOT NULL, add_token TEXT NOT NULL, operation_id TEXT NOT NULL, removed_at TEXT NOT NULL, PRIMARY KEY(library_id,logical_file_id,index_id,add_token))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_memberships (library_id TEXT NOT NULL, logical_file_id TEXT NOT NULL, index_id TEXT NOT NULL, has_manual INTEGER NOT NULL DEFAULT 0, has_automatic INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(library_id,logical_file_id,index_id), FOREIGN KEY(library_id,index_id) REFERENCES classification_nodes(library_id,index_id) ON DELETE CASCADE)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS classification_memberships_index ON classification_memberships(library_id,index_id,logical_file_id)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_ancestors (library_id TEXT NOT NULL, ancestor_id TEXT NOT NULL, descendant_id TEXT NOT NULL, depth INTEGER NOT NULL CHECK(depth>=0), PRIMARY KEY(library_id,ancestor_id,descendant_id), FOREIGN KEY(library_id,ancestor_id) REFERENCES classification_nodes(library_id,index_id) ON DELETE CASCADE, FOREIGN KEY(library_id,descendant_id) REFERENCES classification_nodes(library_id,index_id) ON DELETE CASCADE)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS classification_ancestors_desc ON classification_ancestors(library_id,descendant_id,depth,ancestor_id)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_source_dirs (library_id TEXT NOT NULL, node_id TEXT NOT NULL, root_id TEXT NOT NULL, source_dir_key TEXT NOT NULL, index_id TEXT NOT NULL, display_segments_json TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(library_id,node_id,root_id,source_dir_key))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_imports (library_id TEXT NOT NULL, node_id TEXT NOT NULL, root_id TEXT NOT NULL, source_entry_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('processed','skipped')), index_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(library_id,node_id,root_id,source_entry_id))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_requests (library_id TEXT NOT NULL, actor TEXT NOT NULL, request_id TEXT NOT NULL, request_hash TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(library_id,actor,request_id))");
+    }
+
+    private static void createClassificationOperationTables(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_operations (library_id TEXT NOT NULL, op_id TEXT NOT NULL, author_id TEXT NOT NULL, counter INTEGER NOT NULL, clock INTEGER NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, context_json TEXT NOT NULL, baseline_id TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL CHECK(origin IN ('local','remote')), received_at TEXT NOT NULL, PRIMARY KEY(library_id,op_id), UNIQUE(library_id,author_id,counter))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_author_clocks (library_id TEXT NOT NULL, author_id TEXT NOT NULL, last_clock INTEGER NOT NULL, last_counter INTEGER NOT NULL, PRIMARY KEY(library_id,author_id))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_conflicts (library_id TEXT NOT NULL, op_id TEXT NOT NULL, author_id TEXT NOT NULL, counter INTEGER NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '', resolved INTEGER NOT NULL DEFAULT 0, seen_at TEXT NOT NULL, PRIMARY KEY(library_id,op_id))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS classification_library_state (library_id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'shadow' CHECK(mode IN ('shadow','active')), baseline_id TEXT NOT NULL DEFAULT '', activated_at TEXT NOT NULL DEFAULT '')");
+        addClassificationColumnIfMissing(db, "classification_source_dirs", "parent_index_id", "TEXT NOT NULL DEFAULT ''");
+        addClassificationColumnIfMissing(db, "classification_imports", "logical_file_id", "TEXT NOT NULL DEFAULT ''");
+    }
+
+    private static void addClassificationColumnIfMissing(SQLiteDatabase db, String table, String column, String definition) {
+        try (Cursor cursor = db.rawQuery("PRAGMA table_info(" + table + ")", null)) {
+            while (cursor.moveToNext()) if (column.equals(cursor.getString(1))) return;
+        }
+        db.execSQL("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+    }
+
+    private static final class BackfillFile {
+        final JSONArray adds = new JSONArray();
+        final Map<String, JSONArray> removeTokens = new LinkedHashMap<>();
+    }
+
+    // Existing manual edits live only in the projection. Synthesize envelopes so
+    // the deterministic replay reproduces them instead of erasing them, ordering
+    // creates parents-first, memberships while indexes are alive, deletes
+    // children-first.
+    private static void backfillClassificationOperations(SQLiteDatabase db) {
+        ensureClassificationIdentity(db);
+        String libraryId, nodeId;
+        try (Cursor cursor = db.rawQuery("SELECT library_id,node_id FROM classification_library_identity WHERE id=1", null)) {
+            if (!cursor.moveToFirst()) return;
+            libraryId = cursor.getString(0); nodeId = cursor.getString(1);
+        }
+        db.execSQL("UPDATE classification_source_dirs SET parent_index_id=COALESCE((SELECT n.parent_id FROM classification_nodes n WHERE n.library_id=classification_source_dirs.library_id AND n.index_id=classification_source_dirs.index_id),'') WHERE parent_index_id=''");
+        backfillImportFileIds(db);
+        try {
+            List<String[]> manual = new ArrayList<>();
+            Set<String> manualIds = new HashSet<>();
+            try (Cursor cursor = db.rawQuery("SELECT index_id,COALESCE(parent_id,''),name FROM classification_nodes WHERE library_id=? AND origin='manual' ORDER BY index_id", new String[]{libraryId})) {
+                while (cursor.moveToNext()) { manual.add(new String[]{cursor.getString(0), cursor.getString(1), cursor.getString(2)}); manualIds.add(cursor.getString(0)); }
+            }
+            for (String[] node : classificationTopoParentsFirst(manual, manualIds)) {
+                JSONObject domain = new JSONObject().put("indexId", node[0]).put("name", node[2]).put("origin", "manual");
+                if (!node[1].isEmpty()) domain.put("parentId", node[1]);
+                ClassificationOperations.recordOperation(db, libraryId, "index.create", UUID.randomUUID().toString(), domain);
+            }
+            try (Cursor cursor = db.rawQuery("SELECT index_id,COALESCE(parent_id,''),name FROM classification_nodes WHERE library_id=? AND deleted=0 AND origin<>'manual' AND (name_op_id<>'' OR parent_op_id<>'') ORDER BY index_id", new String[]{libraryId})) {
+                while (cursor.moveToNext()) {
+                    JSONObject patch = new JSONObject().put("name", cursor.getString(2)).put("parentId", cursor.getString(1).isEmpty() ? JSONObject.NULL : cursor.getString(1));
+                    JSONObject domain = new JSONObject().put("indexId", cursor.getString(0)).put("patch", patch);
+                    ClassificationOperations.recordOperation(db, libraryId, "index.update", UUID.randomUUID().toString(), domain);
+                }
+            }
+            backfillMembershipOperations(db, libraryId);
+            List<String[]> deleted = new ArrayList<>();
+            Set<String> deletedIds = new HashSet<>();
+            try (Cursor cursor = db.rawQuery("SELECT index_id,COALESCE(parent_id,'') FROM classification_nodes WHERE library_id=? AND deleted=1 ORDER BY index_id", new String[]{libraryId})) {
+                while (cursor.moveToNext()) { deleted.add(new String[]{cursor.getString(0), cursor.getString(1)}); deletedIds.add(cursor.getString(0)); }
+            }
+            List<String[]> deleteOrder = classificationTopoParentsFirst(deleted, deletedIds);
+            Collections.reverse(deleteOrder);
+            for (String[] node : deleteOrder) {
+                ClassificationOperations.recordOperation(db, libraryId, "index.delete", UUID.randomUUID().toString(), new JSONObject().put("indexId", node[0]));
+            }
+        } catch (org.json.JSONException failure) { throw new IllegalStateException(failure); }
+        ClassificationOperations.replay(db, libraryId, nodeId);
+    }
+
+    private static void backfillImportFileIds(SQLiteDatabase db) {
+        List<String[]> rows = new ArrayList<>();
+        try (Cursor cursor = db.rawQuery("SELECT library_id,node_id,root_id,source_entry_id,index_id FROM classification_imports WHERE state='processed' AND index_id<>'' AND logical_file_id=''", null)) {
+            while (cursor.moveToNext()) rows.add(new String[]{cursor.getString(0), cursor.getString(1), cursor.getString(2), cursor.getString(3), cursor.getString(4)});
+        }
+        for (String[] row : rows) {
+            String token = "automatic:" + classificationSeed(row[0], row[1], row[2], row[3], row[4]);
+            String fileId = "";
+            try (Cursor cursor = db.rawQuery("SELECT logical_file_id FROM classification_adds WHERE library_id=? AND add_token=? LIMIT 1", new String[]{row[0], token})) {
+                if (cursor.moveToFirst()) fileId = cursor.getString(0);
+            }
+            if (!fileId.isEmpty()) db.execSQL("UPDATE classification_imports SET logical_file_id=? WHERE library_id=? AND node_id=? AND root_id=? AND source_entry_id=?",
+                    new Object[]{fileId, row[0], row[1], row[2], row[3]});
+        }
+    }
+
+    private static void backfillMembershipOperations(SQLiteDatabase db, String libraryId) throws org.json.JSONException {
+        Map<String, Map<String, BackfillFile>> groups = new TreeMap<>();
+        try (Cursor cursor = db.rawQuery("SELECT operation_id,logical_file_id,index_id,add_token FROM classification_adds WHERE library_id=? AND origin='manual' ORDER BY operation_id,logical_file_id,index_id,add_token", new String[]{libraryId})) {
+            while (cursor.moveToNext()) {
+                BackfillFile file = groups.computeIfAbsent(cursor.getString(0), k -> new LinkedHashMap<>()).computeIfAbsent(cursor.getString(1), k -> new BackfillFile());
+                file.adds.put(new JSONObject().put("indexId", cursor.getString(2)).put("token", cursor.getString(3)).put("origin", "manual"));
+            }
+        }
+        try (Cursor cursor = db.rawQuery("SELECT operation_id,logical_file_id,index_id,add_token FROM classification_removes WHERE library_id=? ORDER BY operation_id,logical_file_id,index_id,add_token", new String[]{libraryId})) {
+            while (cursor.moveToNext()) {
+                BackfillFile file = groups.computeIfAbsent(cursor.getString(0), k -> new LinkedHashMap<>()).computeIfAbsent(cursor.getString(1), k -> new BackfillFile());
+                file.removeTokens.computeIfAbsent(cursor.getString(2), k -> new JSONArray()).put(cursor.getString(3));
+            }
+        }
+        for (Map<String, BackfillFile> group : groups.values()) {
+            List<String> fileIds = new ArrayList<>(group.keySet());
+            for (int start = 0; start < fileIds.size(); start += 200) {
+                JSONArray files = new JSONArray();
+                for (int at = start; at < Math.min(start + 200, fileIds.size()); at++) {
+                    BackfillFile file = group.get(fileIds.get(at));
+                    JSONArray removes = new JSONArray();
+                    for (Map.Entry<String, JSONArray> remove : file.removeTokens.entrySet()) removes.put(new JSONObject().put("indexId", remove.getKey()).put("observedTokens", remove.getValue()));
+                    files.put(new JSONObject().put("fileId", fileIds.get(at)).put("adds", file.adds).put("removes", removes));
+                }
+                ClassificationOperations.recordOperation(db, libraryId, "index.memberships", UUID.randomUUID().toString(), new JSONObject().put("files", files));
+            }
+        }
+    }
+
+    private static List<String[]> classificationTopoParentsFirst(List<String[]> rows, Set<String> ids) {
+        List<String[]> order = new ArrayList<>();
+        Set<String> emitted = new HashSet<>();
+        boolean progress = true;
+        while (order.size() < rows.size() && progress) {
+            progress = false;
+            for (String[] row : rows) {
+                if (emitted.contains(row[0])) continue;
+                if (row[1].isEmpty() || !ids.contains(row[1]) || emitted.contains(row[1])) { order.add(row); emitted.add(row[0]); progress = true; }
+            }
+        }
+        for (String[] row : rows) if (!emitted.contains(row[0])) { order.add(row); emitted.add(row[0]); }
+        return order;
+    }
+
+    private static void ensureClassificationIdentity(SQLiteDatabase db) {
+        try (Cursor cursor = db.rawQuery("SELECT 1 FROM classification_library_identity WHERE id=1", null)) {
+            if (cursor.moveToFirst()) return;
+        }
+        ContentValues values = new ContentValues();
+        values.put("id", 1);
+        values.put("library_id", "local:" + UUID.randomUUID());
+        values.put("node_id", "android:" + UUID.randomUUID());
+        db.insertOrThrow("classification_library_identity", null, values);
+    }
+
+    private static void ensureActiveClassificationState(SQLiteDatabase db) {
+        ensureClassificationIdentity(db);
+        String libraryId;
+        try (Cursor cursor = db.rawQuery("SELECT library_id FROM classification_library_identity WHERE id=1", null)) {
+            if (!cursor.moveToFirst()) throw new IllegalStateException("分类索引身份不存在");
+            libraryId = cursor.getString(0);
+        }
+        db.execSQL("INSERT OR IGNORE INTO classification_library_state(library_id,mode,baseline_id,activated_at) VALUES(?,'active','',?)",
+                new Object[]{libraryId, Instant.now().toString()});
+    }
+
+    String[] classificationIdentity(SQLiteDatabase db) {
+        ensureClassificationIdentity(db);
+        try (Cursor cursor = db.rawQuery("SELECT library_id,node_id FROM classification_library_identity WHERE id=1", null)) {
+            if (!cursor.moveToFirst()) throw new IllegalStateException("分类索引身份不存在");
+            return new String[]{cursor.getString(0), cursor.getString(1)};
+        }
+    }
+
+    String classificationMode() {
+        SQLiteDatabase db = getReadableDatabase();
+        String[] identity = classificationIdentity(db);
+        try (Cursor cursor = db.rawQuery("SELECT mode FROM classification_library_state WHERE library_id=?", new String[]{identity[0]})) {
+            return cursor.moveToFirst() ? cursor.getString(0) : "shadow";
+        }
+    }
+
+    String classificationLibraryId() {
+        return classificationIdentity(getReadableDatabase())[0];
+    }
+
+    /** Binds a new-model local library to the shared encrypted library. */
+    void bindSharedClassification(String sharedLibraryId, String sharedNodeId) {
+        if (!sharedLibraryId.matches("[0-9a-f]{64}") || sharedNodeId.isEmpty() || sharedNodeId.length() > 160) {
+            throw new IllegalArgumentException("共享分类索引身份无效");
+        }
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            String[] identity = classificationIdentity(db);
+            if (!identity[0].equals(sharedLibraryId)) {
+                db.execSQL("PRAGMA defer_foreign_keys=ON");
+                String[] tables = {"classification_ancestors", "classification_memberships", "classification_removes", "classification_adds",
+                        "classification_nodes", "classification_source_dirs", "classification_imports",
+                        "classification_requests", "classification_operations",
+                        "classification_author_clocks", "classification_conflicts", "classification_library_state"};
+                for (String table : tables) db.execSQL("UPDATE " + table + " SET library_id=? WHERE library_id=?", new Object[]{sharedLibraryId, identity[0]});
+                db.execSQL("UPDATE classification_source_dirs SET node_id=? WHERE library_id=? AND node_id=?", new Object[]{sharedNodeId, sharedLibraryId, identity[1]});
+                db.execSQL("UPDATE classification_imports SET node_id=? WHERE library_id=? AND node_id=?", new Object[]{sharedNodeId, sharedLibraryId, identity[1]});
+                db.execSQL("UPDATE classification_library_identity SET library_id=?,node_id=? WHERE id=1", new Object[]{sharedLibraryId, sharedNodeId});
+            } else if (!identity[1].equals(sharedNodeId)) {
+                db.execSQL("UPDATE classification_source_dirs SET node_id=? WHERE library_id=? AND node_id=?", new Object[]{sharedNodeId, sharedLibraryId, identity[1]});
+                db.execSQL("UPDATE classification_imports SET node_id=? WHERE library_id=? AND node_id=?", new Object[]{sharedNodeId, sharedLibraryId, identity[1]});
+                db.execSQL("UPDATE classification_library_identity SET node_id=? WHERE id=1", new Object[]{sharedNodeId});
+            }
+            db.execSQL("INSERT INTO classification_library_state(library_id,mode,baseline_id,activated_at) VALUES(?,'active','',?) " +
+                            "ON CONFLICT(library_id) DO UPDATE SET mode='active',baseline_id='',activated_at=excluded.activated_at",
+                    new Object[]{sharedLibraryId, Instant.now().toString()});
+            ClassificationOperations.replay(db, sharedLibraryId, sharedNodeId);
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    private static boolean legacyClassificationKind(String kind) {
+        return kind.startsWith("folder.") || kind.startsWith("tag.");
+    }
+
+    private static boolean classificationActive(SQLiteDatabase db) {
+        ensureClassificationIdentity(db);
+        try (Cursor cursor = db.rawQuery("SELECT 1 FROM classification_library_state s JOIN classification_library_identity i ON i.library_id=s.library_id WHERE i.id=1 AND s.mode='active'", null)) {
+            return cursor.moveToFirst();
+        }
+    }
+
+
+    static String classificationSeed(String... parts) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (String part : parts) {
+                byte[] bytes = part.getBytes(StandardCharsets.UTF_8);
+                digest.update(ByteBuffer.allocate(4).putInt(bytes.length).array());
+                digest.update(bytes);
+            }
+            StringBuilder result = new StringBuilder();
+            for (byte value : digest.digest()) result.append(String.format("%02x", value & 0xff));
+            return result.toString();
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException(impossible);
+        }
+    }
+
+    String ensureClassificationSourceDirectory(SQLiteDatabase db, String[] identity, String rootId, String sourceKey,
+                                                String name, String parentId, String displaySegmentsJson) {
+        try (Cursor cursor = db.rawQuery("SELECT index_id,disabled FROM classification_source_dirs WHERE library_id=? AND node_id=? AND root_id=? AND source_dir_key=?",
+                new String[]{identity[0], identity[1], rootId, sourceKey})) {
+            if (cursor.moveToFirst()) {
+                String indexId = cursor.getString(0);
+                if (cursor.getInt(1) != 0) return null;
+                try (Cursor node = db.rawQuery("SELECT deleted FROM classification_nodes WHERE library_id=? AND index_id=?", new String[]{identity[0], indexId})) {
+                    return node.moveToFirst() && node.getInt(0) == 0 ? indexId : null;
+                }
+            }
+        }
+        String indexId = "source-index:" + classificationSeed(identity[0], identity[1], rootId, sourceKey);
+        String nodeName = normalizeClassificationName(name);
+        ContentValues node = new ContentValues();
+        node.put("library_id", identity[0]);
+        node.put("index_id", indexId);
+        if (parentId == null) node.putNull("parent_id"); else node.put("parent_id", parentId);
+        node.put("name", nodeName);
+        node.put("name_key", classificationNameKey(nodeName));
+        node.put("origin", "automatic");
+        node.put("created_at", Instant.now().toString());
+        node.put("updated_at", Instant.now().toString());
+        db.insertWithOnConflict("classification_nodes", null, node, SQLiteDatabase.CONFLICT_IGNORE);
+        db.execSQL("UPDATE classification_nodes SET name=?,name_key=?,updated_at=? WHERE library_id=? AND index_id=? AND name_op_id='' AND deleted=0",
+                new Object[]{nodeName, classificationNameKey(nodeName), Instant.now().toString(), identity[0], indexId});
+        ContentValues mapping = new ContentValues();
+        mapping.put("library_id", identity[0]);
+        mapping.put("node_id", identity[1]);
+        mapping.put("root_id", rootId);
+        mapping.put("source_dir_key", sourceKey);
+        mapping.put("index_id", indexId);
+        mapping.put("display_segments_json", displaySegmentsJson);
+        mapping.put("parent_index_id", parentId == null ? "" : parentId);
+        mapping.put("disabled", 0);
+        db.insertWithOnConflict("classification_source_dirs", null, mapping, SQLiteDatabase.CONFLICT_IGNORE);
+        db.execSQL("UPDATE classification_source_dirs SET display_segments_json=?,parent_index_id=? WHERE library_id=? AND node_id=? AND root_id=? AND source_dir_key=? AND EXISTS(SELECT 1 FROM classification_nodes n WHERE n.library_id=classification_source_dirs.library_id AND n.index_id=classification_source_dirs.index_id AND n.name_op_id='' AND n.deleted=0)",
+                new Object[]{displaySegmentsJson, parentId == null ? "" : parentId, identity[0], identity[1], rootId, sourceKey});
+        return indexId;
+    }
+
+    void classifyScannedItem(SQLiteDatabase db, String[] identity, String rootId, String sourceEntryId,
+                             String itemUri, String indexId) {
+        try (Cursor cursor = db.rawQuery("SELECT 1 FROM classification_imports WHERE library_id=? AND node_id=? AND root_id=? AND source_entry_id=?",
+                new String[]{identity[0], identity[1], rootId, sourceEntryId})) {
+            if (cursor.moveToFirst()) return;
+        }
+        String state = "skipped";
+        String storedIndex = indexId == null ? "" : indexId;
+        String logicalFileId = "";
+        if (indexId != null) {
+            try (Cursor cursor = db.rawQuery("SELECT COALESCE(NULLIF(logical_file_id,''),file_id) FROM items WHERE uri=?", new String[]{itemUri})) {
+                if (!cursor.moveToFirst()) throw new IllegalStateException("收录文件身份不存在");
+                logicalFileId = cursor.getString(0);
+            }
+            ContentValues add = new ContentValues();
+            add.put("library_id", identity[0]);
+            add.put("logical_file_id", logicalFileId);
+            add.put("index_id", indexId);
+            add.put("add_token", "automatic:" + classificationSeed(identity[0], identity[1], rootId, sourceEntryId, indexId));
+            add.put("origin", "automatic");
+            add.put("created_at", Instant.now().toString());
+            db.insertWithOnConflict("classification_adds", null, add, SQLiteDatabase.CONFLICT_IGNORE);
+            state = "processed";
+        }
+        ContentValues progress = new ContentValues();
+        progress.put("library_id", identity[0]);
+        progress.put("node_id", identity[1]);
+        progress.put("root_id", rootId);
+        progress.put("source_entry_id", sourceEntryId);
+        progress.put("state", state);
+        progress.put("index_id", storedIndex);
+        progress.put("logical_file_id", logicalFileId);
+        progress.put("updated_at", Instant.now().toString());
+        db.insertOrThrow("classification_imports", null, progress);
+        rebuildClassificationProjection(db, identity[0]);
+    }
+
+    private static void rebuildClassificationProjection(SQLiteDatabase db, String libraryId) {
+        db.delete("classification_memberships", "library_id=?", new String[]{libraryId});
+        db.execSQL("INSERT INTO classification_memberships(library_id,logical_file_id,index_id,has_manual,has_automatic,updated_at) " +
+                        "SELECT a.library_id,a.logical_file_id,a.index_id,MAX(CASE WHEN a.origin IN ('manual','legacy-import') THEN 1 ELSE 0 END),MAX(CASE WHEN a.origin='automatic' THEN 1 ELSE 0 END),? " +
+                        "FROM classification_adds a JOIN classification_nodes n ON n.library_id=a.library_id AND n.index_id=a.index_id AND n.deleted=0 " +
+                        "LEFT JOIN classification_removes r ON r.library_id=a.library_id AND r.logical_file_id=a.logical_file_id AND r.index_id=a.index_id AND r.add_token=a.add_token " +
+                        "WHERE a.library_id=? AND r.add_token IS NULL GROUP BY a.library_id,a.logical_file_id,a.index_id",
+                new Object[]{Instant.now().toString(), libraryId});
+        db.delete("classification_ancestors", "library_id=?", new String[]{libraryId});
+        db.execSQL("WITH RECURSIVE paths(ancestor_id,descendant_id,depth) AS (" +
+                        "SELECT index_id,index_id,0 FROM classification_nodes WHERE library_id=? AND deleted=0 UNION ALL " +
+                        "SELECT n.parent_id,p.descendant_id,p.depth+1 FROM paths p JOIN classification_nodes n ON n.library_id=? AND n.index_id=p.ancestor_id WHERE n.parent_id IS NOT NULL AND p.depth<1024) " +
+                        "INSERT INTO classification_ancestors(library_id,ancestor_id,descendant_id,depth) SELECT ?,ancestor_id,descendant_id,depth FROM paths",
+                new Object[]{libraryId, libraryId, libraryId});
+    }
+
+    private static String classificationNodeVersion(String id, String parentId, String name, int deleted, String nameOp, String parentOp) {
+        return classificationSeed("classification-node-v1", id, parentId == null ? "" : parentId, name,
+                String.valueOf(deleted), nameOp == null ? "" : nameOp, parentOp == null ? "" : parentOp);
+    }
+
+    private static String classificationName(String raw) {
+        String name = normalizeClassificationName(raw);
+        if (name.isEmpty() || name.codePointCount(0, name.length()) > 255) throw new IllegalArgumentException("索引名称需为 1 到 255 个字符");
+        for (int at = 0; at < name.length();) {
+            int value = name.codePointAt(at);
+            if (value == 0 || Character.isISOControl(value)) throw new IllegalArgumentException("索引名称不能包含控制字符");
+            at += Character.charCount(value);
+        }
+        return name;
+    }
+
+    static String normalizeClassificationName(String value) {
+        String raw = value == null ? "" : value;
+        int start = 0, end = raw.length();
+        while (start < end) {
+            int current = raw.codePointAt(start);
+            if (!classificationWhitespace(current)) break;
+            start += Character.charCount(current);
+        }
+        while (start < end) {
+            int current = raw.codePointBefore(end);
+            if (!classificationWhitespace(current)) break;
+            end -= Character.charCount(current);
+        }
+        return Normalizer.normalize(raw.substring(start, end), Normalizer.Form.NFC);
+    }
+
+    private static boolean classificationWhitespace(int value) {
+        return (value >= 0x0009 && value <= 0x000d) || value == 0x0020 || value == 0x0085 || value == 0x00a0 ||
+                value == 0x1680 || (value >= 0x2000 && value <= 0x200a) || value == 0x2028 || value == 0x2029 ||
+                value == 0x202f || value == 0x205f || value == 0x3000;
+    }
+
+    static String classificationNameKey(String value) {
+        String normalized = normalizeClassificationName(value);
+        return Normalizer.normalize(UCharacter.foldCase(normalized, true), Normalizer.Form.NFC);
+    }
+
+    private static boolean classificationNameVectorsVerified;
+
+    private static synchronized void verifyClassificationNameVectors() {
+        if (classificationNameVectorsVerified) return;
+        String[][] vectors = {
+                {"  Cafe\u0301  ", "Café", "café"},
+                {"\u212Bngstro\u0308m", "Ångström", "ångström"},
+                {"Straße", "Straße", "strasse"},
+                {"Σίσυφος", "Σίσυφος", "σίσυφοσ"},
+                {"\u212Aelvin", "Kelvin", "kelvin"},
+                {"İ", "İ", "i\u0307"},
+                {"\u00a0项目\u3000", "项目", "项目"},
+        };
+        for (String[] vector : vectors) {
+            if (!normalizeClassificationName(vector[0]).equals(vector[1]) || !classificationNameKey(vector[0]).equals(vector[2])) {
+                throw new IllegalStateException("此 Android Unicode 运行时不支持分类名称规范版本 1");
+            }
+        }
+        classificationNameVectorsVerified = true;
+    }
+
+    private static void refreshLegacyClassification(SQLiteDatabase db, String[] identity) {
+        ClassificationOperations.replay(db, identity[0], identity[1]);
+    }
+
+    private static IndexNode readIndexNode(SQLiteDatabase db, String libraryId, String indexId) {
+        try (Cursor cursor = db.rawQuery("SELECT n.index_id,n.parent_id,n.name,n.deleted,n.name_op_id,n.parent_op_id," +
+                "EXISTS(SELECT 1 FROM classification_nodes c WHERE c.library_id=n.library_id AND c.parent_id=n.index_id AND c.deleted=0)," +
+                "(SELECT COUNT(DISTINCT m.logical_file_id) FROM classification_ancestors a JOIN classification_memberships m ON m.library_id=a.library_id AND m.index_id=a.descendant_id WHERE a.library_id=n.library_id AND a.ancestor_id=n.index_id) " +
+                "FROM classification_nodes n WHERE n.library_id=? AND n.index_id=?", new String[]{libraryId, indexId})) {
+            if (!cursor.moveToFirst() || cursor.getInt(3) != 0) return null;
+            String parent = cursor.isNull(1) ? null : cursor.getString(1);
+            return new IndexNode(cursor.getString(0), parent, cursor.getString(2),
+                    classificationNodeVersion(cursor.getString(0), parent, cursor.getString(2), cursor.getInt(3), cursor.getString(4), cursor.getString(5)),
+                    cursor.getInt(7), cursor.getInt(6) != 0);
+        }
+    }
+
+    private static String readIndexPath(SQLiteDatabase db, String libraryId, IndexNode node) {
+        ArrayList<String> parts = new ArrayList<>();
+        try (Cursor cursor = db.rawQuery("SELECT n.name FROM classification_ancestors a JOIN classification_nodes n ON n.library_id=a.library_id AND n.index_id=a.ancestor_id WHERE a.library_id=? AND a.descendant_id=? AND a.depth>0 ORDER BY a.depth DESC", new String[]{libraryId, node.id})) {
+            while (cursor.moveToNext()) parts.add(cursor.getString(0));
+        }
+        parts.add(node.name);
+        return String.join(" / ", parts);
+    }
+
+    List<IndexNode> indexChildren(String parentId) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            String[] identity = classificationIdentity(db);
+            refreshLegacyClassification(db, identity);
+            ArrayList<String> ids = new ArrayList<>();
+            String sql = parentId == null ?
+                    "SELECT index_id FROM classification_nodes WHERE library_id=? AND parent_id IS NULL AND deleted=0 ORDER BY name_key,index_id" :
+                    "SELECT index_id FROM classification_nodes WHERE library_id=? AND parent_id=? AND deleted=0 ORDER BY name_key,index_id";
+            String[] args = parentId == null ? new String[]{identity[0]} : new String[]{identity[0], parentId};
+            try (Cursor cursor = db.rawQuery(sql, args)) { while (cursor.moveToNext()) ids.add(cursor.getString(0)); }
+            ArrayList<IndexNode> result = new ArrayList<>();
+            for (String id : ids) { IndexNode node = readIndexNode(db, identity[0], id); if (node != null) { node.path=readIndexPath(db,identity[0],node); result.add(node); } }
+            db.setTransactionSuccessful();
+            return result;
+        } finally { db.endTransaction(); }
+    }
+
+    List<IndexNode> allIndexes() {
+        SQLiteDatabase db=getWritableDatabase();db.beginTransaction();
+        try {
+            String[] identity=classificationIdentity(db);refreshLegacyClassification(db,identity);ArrayList<IndexNode> result=new ArrayList<>();
+            try(Cursor cursor=db.rawQuery("SELECT index_id FROM classification_nodes WHERE library_id=? AND deleted=0 ORDER BY name_key,index_id",new String[]{identity[0]})){
+                while(cursor.moveToNext()){IndexNode node=readIndexNode(db,identity[0],cursor.getString(0));if(node!=null){node.path=readIndexPath(db,identity[0],node);result.add(node);}}
+            }
+            Collections.sort(result,(a,b)->a.path.compareToIgnoreCase(b.path));db.setTransactionSuccessful();return result;
+        } finally {db.endTransaction();}
+    }
+
+    List<IndexNode> indexAncestors(String indexId) {
+        SQLiteDatabase db=getReadableDatabase();String[] identity=classificationIdentity(db);ArrayList<IndexNode> result=new ArrayList<>();
+        try(Cursor cursor=db.rawQuery("SELECT ancestor_id FROM classification_ancestors WHERE library_id=? AND descendant_id=? AND depth>0 ORDER BY depth DESC",new String[]{identity[0],indexId})){
+            while(cursor.moveToNext()){IndexNode node=readIndexNode(db,identity[0],cursor.getString(0));if(node!=null)result.add(node);}
+        }
+        return result;
+    }
+
+    IndexNode createIndex(String parentId, String rawName) {
+        String name = classificationName(rawName);
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            String[] identity = classificationIdentity(db);
+            refreshLegacyClassification(db, identity);
+            if (parentId != null && readIndexNode(db, identity[0], parentId) == null) throw new IllegalStateException("上级索引不存在");
+            String[] duplicateArgs = parentId == null ? new String[]{identity[0], classificationNameKey(name)} : new String[]{identity[0], parentId, classificationNameKey(name)};
+            String duplicateSql = parentId == null ? "SELECT COUNT(*) FROM classification_nodes WHERE library_id=? AND parent_id IS NULL AND deleted=0 AND name_key=?" : "SELECT COUNT(*) FROM classification_nodes WHERE library_id=? AND parent_id=? AND deleted=0 AND name_key=?";
+            try (Cursor cursor = db.rawQuery(duplicateSql, duplicateArgs)) { cursor.moveToFirst(); if (cursor.getInt(0) != 0) throw new IllegalStateException("同级已有同名索引"); }
+            String operationId = UUID.randomUUID().toString();
+            String indexId = "index:" + operationId;
+            JSONObject domain = new JSONObject();
+            try {
+                domain.put("indexId", indexId);
+                domain.put("name", name);
+                domain.put("origin", "manual");
+                if (parentId != null) domain.put("parentId", parentId);
+            } catch (org.json.JSONException failure) { throw new IllegalStateException(failure); }
+            ClassificationOperations.recordOperation(db, identity[0], "index.create", operationId, domain);
+            ClassificationOperations.replay(db, identity[0], identity[1]);
+            IndexNode result = readIndexNode(db, identity[0], indexId);
+            db.setTransactionSuccessful();
+            return result;
+        } finally { db.endTransaction(); }
+    }
+
+    IndexNode updateIndex(String indexId, String rawName, String parentId, String baseVersion) {
+        String name = classificationName(rawName);
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            String[] identity = classificationIdentity(db);
+            refreshLegacyClassification(db, identity);
+            IndexNode current = readIndexNode(db, identity[0], indexId);
+            if (current == null) throw new IllegalStateException("索引不存在");
+            if (!current.version.equals(baseVersion)) throw new IllegalStateException("索引已发生变化，请刷新后重试");
+            if (indexId.equals(parentId)) throw new IllegalStateException("索引不能成为自己的上级");
+            if (parentId != null) {
+                if (readIndexNode(db, identity[0], parentId) == null) throw new IllegalStateException("上级索引不存在");
+                try (Cursor cursor = db.rawQuery("SELECT COUNT(*) FROM classification_ancestors WHERE library_id=? AND ancestor_id=? AND descendant_id=?", new String[]{identity[0], indexId, parentId})) { cursor.moveToFirst(); if (cursor.getInt(0) != 0) throw new IllegalStateException("索引不能移动到自己的下级"); }
+            }
+            String duplicateSql = parentId == null ? "SELECT COUNT(*) FROM classification_nodes WHERE library_id=? AND index_id<>? AND parent_id IS NULL AND deleted=0 AND name_key=?" : "SELECT COUNT(*) FROM classification_nodes WHERE library_id=? AND index_id<>? AND parent_id=? AND deleted=0 AND name_key=?";
+            String[] duplicateArgs = parentId == null ? new String[]{identity[0], indexId, classificationNameKey(name)} : new String[]{identity[0], indexId, parentId, classificationNameKey(name)};
+            try (Cursor cursor = db.rawQuery(duplicateSql, duplicateArgs)) { cursor.moveToFirst(); if (cursor.getInt(0) != 0) throw new IllegalStateException("同级已有同名索引"); }
+            String operationId = UUID.randomUUID().toString();
+            JSONObject patch = new JSONObject(), domain = new JSONObject();
+            try {
+                patch.put("name", name);
+                patch.put("parentId", parentId == null ? JSONObject.NULL : parentId);
+                domain.put("indexId", indexId);
+                domain.put("baseVersion", baseVersion);
+                domain.put("patch", patch);
+            } catch (org.json.JSONException failure) { throw new IllegalStateException(failure); }
+            ClassificationOperations.recordOperation(db, identity[0], "index.update", operationId, domain);
+            ClassificationOperations.replay(db, identity[0], identity[1]);
+            IndexNode result = readIndexNode(db, identity[0], indexId);
+            db.setTransactionSuccessful();
+            return result;
+        } finally { db.endTransaction(); }
+    }
+
+    void deleteIndex(String indexId, String baseVersion) {
+        SQLiteDatabase db = getWritableDatabase(); db.beginTransaction();
+        try {
+            String[] identity = classificationIdentity(db); refreshLegacyClassification(db, identity);
+            IndexNode current = readIndexNode(db, identity[0], indexId);
+            if (current == null) throw new IllegalStateException("索引不存在");
+            if (!current.version.equals(baseVersion)) throw new IllegalStateException("索引已发生变化，请刷新后重试");
+            if (current.hasChildren || current.count != 0) throw new IllegalStateException("索引仍有下级或文件归属");
+            String operationId = UUID.randomUUID().toString();
+            JSONObject domain = new JSONObject();
+            try { domain.put("indexId", indexId); domain.put("baseVersion", baseVersion); } catch (org.json.JSONException failure) { throw new IllegalStateException(failure); }
+            ClassificationOperations.recordOperation(db, identity[0], "index.delete", operationId, domain);
+            ClassificationOperations.replay(db, identity[0], identity[1]);
+            db.setTransactionSuccessful();
+        } finally { db.endTransaction(); }
+    }
+
+    void changeIndexMemberships(List<String> itemUris, List<String> addIndexIds, List<String> removeIndexIds) {
+        changeIndexMemberships(UUID.randomUUID().toString(), itemUris, addIndexIds, removeIndexIds);
+    }
+
+    private List<String> logicalFileIdsForItemUris(List<String> itemUris) {
+        SQLiteDatabase db=getReadableDatabase();LinkedHashSet<String> result=new LinkedHashSet<>();
+        for(String uri:itemUris)try(Cursor cursor=db.rawQuery("SELECT COALESCE(NULLIF(logical_file_id,''),file_id) FROM items WHERE uri=?",new String[]{uri})){
+            if(!cursor.moveToFirst())throw new IllegalStateException("文件不存在");result.add(cursor.getString(0));
+        }
+        return new ArrayList<>(result);
+    }
+
+    private static String membershipDigest(SQLiteDatabase db, String libraryId, String fileId) {
+        try (Cursor cursor = db.rawQuery("SELECT GROUP_CONCAT(index_id,char(31)) FROM (SELECT index_id FROM classification_memberships WHERE library_id=? AND logical_file_id=? ORDER BY index_id)", new String[]{libraryId, fileId})) {
+            return cursor.moveToFirst() && !cursor.isNull(0) ? cursor.getString(0) : "";
+        }
+    }
+
+    String changeIndexMemberships(String requestId, List<String> itemUris, List<String> addIndexIds, List<String> removeIndexIds) {
+        return changeIndexMembershipsByFileIds(requestId,logicalFileIdsForItemUris(itemUris),addIndexIds,removeIndexIds);
+    }
+
+    String changeIndexMembershipsByFileIds(String requestId, List<String> requestedFileIds, List<String> addIndexIds, List<String> removeIndexIds) {
+        if (requestId == null || requestId.trim().isEmpty() || requestId.length() > 160) throw new IllegalArgumentException("requestId 无效");
+        if (requestedFileIds.isEmpty() || requestedFileIds.size() > 200 || addIndexIds.size() + removeIndexIds.size() == 0 || addIndexIds.size() > 20 || removeIndexIds.size() > 20) throw new IllegalArgumentException("索引归属批次无效");
+        SQLiteDatabase db = getWritableDatabase(); db.beginTransaction();
+        try {
+            String[] identity = classificationIdentity(db); refreshLegacyClassification(db, identity);
+            LinkedHashSet<String> fileIds = new LinkedHashSet<>(requestedFileIds);
+            LinkedHashSet<String> adds = new LinkedHashSet<>(addIndexIds), removes = new LinkedHashSet<>(removeIndexIds);
+            if (fileIds.contains("") || fileIds.contains(null) || adds.contains("") || removes.contains("")) throw new IllegalArgumentException("索引归属批次无效");
+            for (String id : adds) if (removes.contains(id)) throw new IllegalArgumentException("同一索引不能同时加入和移除");
+            ArrayList<String> canonicalFiles = new ArrayList<>(fileIds), canonicalAdds = new ArrayList<>(adds), canonicalRemoves = new ArrayList<>(removes);
+            Collections.sort(canonicalFiles); Collections.sort(canonicalAdds); Collections.sort(canonicalRemoves);
+            String requestHash = classificationSeed("index.memberships", String.join("\u0000", canonicalFiles), String.join("\u0000", canonicalAdds), String.join("\u0000", canonicalRemoves));
+            try (Cursor cursor = db.rawQuery("SELECT request_hash,result_json FROM classification_requests WHERE library_id=? AND actor=? AND request_id=?", new String[]{identity[0], identity[1], requestId})) {
+                if (cursor.moveToFirst()) {
+                    if (!requestHash.equals(cursor.getString(0))) throw new IllegalStateException("requestIdConflict");
+                    String cached = cursor.getString(1); db.setTransactionSuccessful(); return cached;
+                }
+            }
+            for(String fileId:fileIds)try(Cursor cursor=db.rawQuery("SELECT 1 FROM items WHERE COALESCE(NULLIF(logical_file_id,''),file_id)=? LIMIT 1",new String[]{fileId})){
+                if(!cursor.moveToFirst())throw new IllegalStateException("文件不存在");
+            }
+            for (String id : adds) if (readIndexNode(db, identity[0], id) == null) throw new IllegalStateException("索引不存在");
+            for (String id : removes) if (readIndexNode(db, identity[0], id) == null) throw new IllegalStateException("索引不存在");
+            java.util.HashMap<String,String> before = new java.util.HashMap<>();
+            for (String fileId : fileIds) before.put(fileId, membershipDigest(db, identity[0], fileId));
+            String operationId = UUID.randomUUID().toString();
+            JSONArray files = new JSONArray();
+            try {
+                for (String fileId : fileIds) {
+                    JSONObject file = new JSONObject().put("fileId", fileId);
+                    JSONArray addArray = new JSONArray();
+                    for (String indexId : adds) addArray.put(new JSONObject().put("indexId", indexId).put("token", "manual:" + classificationSeed(operationId, fileId, indexId)).put("origin", "manual"));
+                    file.put("adds", addArray);
+                    JSONArray removeArray = new JSONArray();
+                    for (String indexId : removes) {
+                        JSONArray tokens = new JSONArray();
+                        try (Cursor cursor = db.rawQuery("SELECT add_token FROM classification_adds WHERE library_id=? AND logical_file_id=? AND index_id=? ORDER BY add_token", new String[]{identity[0], fileId, indexId})) {
+                            while (cursor.moveToNext()) tokens.put(cursor.getString(0));
+                        }
+                        removeArray.put(new JSONObject().put("indexId", indexId).put("observedTokens", tokens));
+                    }
+                    file.put("removes", removeArray);
+                    files.put(file);
+                }
+            } catch (org.json.JSONException failure) { throw new IllegalStateException(failure); }
+            JSONObject domain = new JSONObject();
+            try { domain.put("files", files); } catch (org.json.JSONException failure) { throw new IllegalStateException(failure); }
+            if (domain.toString().getBytes(StandardCharsets.UTF_8).length > 900 << 10) throw new IllegalStateException("单次归属变更过大，请分批操作");
+            ClassificationOperations.recordOperation(db, identity[0], "index.memberships", operationId, domain);
+            ClassificationOperations.replay(db, identity[0], identity[1]);
+            int changed = 0; JSONObject state = new JSONObject(); String result;
+            try {
+                for (String fileId : fileIds) {
+                    String after = membershipDigest(db, identity[0], fileId); if (!after.equals(before.get(fileId))) changed++;
+                    JSONArray memberships = new JSONArray(); if (!after.isEmpty()) for (String indexId : after.split("\u001f", -1)) memberships.put(indexId);
+                    state.put(fileId, memberships);
+                }
+                result = new JSONObject().put("changedFiles", changed).put("operationId", operationId).put("state", state).toString();
+            } catch (org.json.JSONException failure) { throw new IllegalStateException(failure); }
+            ContentValues request = new ContentValues(); request.put("library_id", identity[0]); request.put("actor", identity[1]); request.put("request_id", requestId); request.put("request_hash", requestHash); request.put("result_json", result); request.put("created_at", Instant.now().toString());
+            db.insertOrThrow("classification_requests", null, request);
+            db.setTransactionSuccessful(); return result;
+        } finally { db.endTransaction(); }
+    }
+
+    List<IndexNode> directIndexes(String itemUri) {
+        SQLiteDatabase db = getWritableDatabase(); db.beginTransaction();
+        try {
+            String[] identity = classificationIdentity(db); refreshLegacyClassification(db, identity);
+            String fileId; try (Cursor cursor = db.rawQuery("SELECT COALESCE(NULLIF(logical_file_id,''),file_id) FROM items WHERE uri=?", new String[]{itemUri})) { if (!cursor.moveToFirst()) return Collections.emptyList(); fileId = cursor.getString(0); }
+            ArrayList<IndexNode> result = new ArrayList<>();
+            try (Cursor cursor = db.rawQuery("SELECT index_id FROM classification_memberships WHERE library_id=? AND logical_file_id=? ORDER BY index_id", new String[]{identity[0], fileId})) { while (cursor.moveToNext()) { IndexNode node = readIndexNode(db, identity[0], cursor.getString(0)); if (node != null) { node.path=readIndexPath(db,identity[0],node); result.add(node); } } }
+            db.setTransactionSuccessful(); return result;
+        } finally { db.endTransaction(); }
     }
 
     private static void createOrganizationTables(SQLiteDatabase db) {
@@ -327,6 +1026,18 @@ final class LocalLibrary extends SQLiteOpenHelper {
         getWritableDatabase().insertWithOnConflict("roots", null, values, SQLiteDatabase.CONFLICT_IGNORE);
     }
 
+    void setRootPreserveStructure(String uri, boolean enabled) {
+        ContentValues values = new ContentValues();
+        values.put("preserve_structure", enabled ? 1 : 0);
+        getWritableDatabase().update("roots", values, "uri=?", new String[]{uri});
+    }
+
+    boolean rootPreservesStructure(SQLiteDatabase db, String uri) {
+        try (Cursor cursor = db.rawQuery("SELECT preserve_structure FROM roots WHERE uri=?", new String[]{uri})) {
+            return cursor.moveToFirst() && cursor.getInt(0) != 0;
+        }
+    }
+
     void removeRoot(String uri) {
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
@@ -349,8 +1060,8 @@ final class LocalLibrary extends SQLiteOpenHelper {
     List<Root> roots() {
         List<Root> result = new ArrayList<>();
         try (Cursor cursor = getReadableDatabase().rawQuery(
-                "SELECT r.uri, r.name, COUNT(i.uri) FROM roots r LEFT JOIN items i ON i.root_uri=r.uri AND NOT EXISTS (SELECT 1 FROM library_file_lifecycle l WHERE l.file_id=COALESCE(NULLIF(i.logical_file_id,''),i.file_id) AND l.state='trashed') AND NOT EXISTS (SELECT 1 FROM library_file_deletions d WHERE d.file_id=COALESCE(NULLIF(i.logical_file_id,''),i.file_id)) GROUP BY r.uri ORDER BY r.name COLLATE NOCASE", null)) {
-            while (cursor.moveToNext()) result.add(new Root(cursor.getString(0), cursor.getString(1), cursor.getInt(2)));
+                "SELECT r.uri, r.name, COUNT(i.uri),r.preserve_structure FROM roots r LEFT JOIN items i ON i.root_uri=r.uri AND NOT EXISTS (SELECT 1 FROM library_file_lifecycle l WHERE l.file_id=COALESCE(NULLIF(i.logical_file_id,''),i.file_id) AND l.state='trashed') AND NOT EXISTS (SELECT 1 FROM library_file_deletions d WHERE d.file_id=COALESCE(NULLIF(i.logical_file_id,''),i.file_id)) GROUP BY r.uri ORDER BY r.name COLLATE NOCASE", null)) {
+            while (cursor.moveToNext()) result.add(new Root(cursor.getString(0), cursor.getString(1), cursor.getInt(2), cursor.getInt(3) != 0));
         }
         return result;
     }
@@ -659,15 +1370,24 @@ final class LocalLibrary extends SQLiteOpenHelper {
         }
     }
 
-    void rejoinMember(String node){
+    long rejoinEpoch(String node){
+        SQLiteDatabase db=getReadableDatabase();long epoch=0;String state="";
+        try(Cursor row=db.rawQuery("SELECT epoch,state FROM library_members WHERE node_id=?",new String[]{node})){if(row.moveToFirst()){epoch=row.getLong(0);state=row.getString(1);}}
+        if(!"retired".equals(state))throw new IllegalStateException("当前节点未退役");
+        try(Cursor row=db.rawQuery("SELECT COUNT(*) FROM library_operations WHERE state IN ('pending','failed')",null)){if(row.moveToFirst()&&row.getInt(0)>0)throw new IllegalStateException("旧作者仍有待发布操作，请先处理");}
+        return epoch+1;
+    }
+
+    void rejoinMember(String node,long expectedEpoch){
         SQLiteDatabase db=getWritableDatabase();db.beginTransaction();
         try{
             long epoch=0;String state="";
             try(Cursor row=db.rawQuery("SELECT epoch,state FROM library_members WHERE node_id=?",new String[]{node})){if(row.moveToFirst()){epoch=row.getLong(0);state=row.getString(1);}}
             if(!"retired".equals(state))throw new IllegalStateException("当前节点未退役");
+            if(expectedEpoch!=epoch+1)throw new IllegalStateException("成员 epoch 已变化，请重试");
             try(Cursor row=db.rawQuery("SELECT COUNT(*) FROM library_operations WHERE state IN ('pending','failed')",null)){if(row.moveToFirst()&&row.getInt(0)>0)throw new IllegalStateException("旧作者仍有待发布操作，请先处理");}
             db.execSQL("INSERT INTO library_operation_identity(key,value) VALUES('author',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",new Object[]{"android-"+UUID.randomUUID()});
-            recordLibraryOperation(db,"member.join","{\"nodeId\":"+JSONObject.quote(node)+",\"epoch\":"+(epoch+1)+"}");
+            recordLibraryOperation(db,"member.join","{\"nodeId\":"+JSONObject.quote(node)+",\"epoch\":"+expectedEpoch+"}");
             db.setTransactionSuccessful();
         }finally{db.endTransaction();}
     }
@@ -730,6 +1450,7 @@ final class LocalLibrary extends SQLiteOpenHelper {
     // Caller owns the surrounding transaction, so the visible classification
     // update and its durable cross-device operation cannot be separated.
     private static void recordLibraryOperation(SQLiteDatabase db, String kind, String fields) {
+        if (legacyClassificationKind(kind) && classificationActive(db)) throw new IllegalStateException("classificationUpgradeRequired");
         String author = operationAuthor(db);
         long counter = 1;
         try (Cursor cursor = db.rawQuery("SELECT next_counter FROM library_operation_authors WHERE author_id=?", new String[]{author})) {
@@ -832,9 +1553,13 @@ final class LocalLibrary extends SQLiteOpenHelper {
         db.beginTransaction();
         try {
             String localAuthor = operationAuthor(db);
+            String localClassificationAuthor = ClassificationOperations.classificationAuthor(db);
+            String[] classificationIdentity = classificationIdentity(db);
+            boolean classificationActive = classificationActive(db);
             for (RemoteOperation operation : operations) {
                 if (operation.id.isEmpty() || operation.author.isEmpty() || operation.kind.isEmpty() || operation.counter < 1 || operation.payload.length() > 1 << 20) continue;
-                if(!knownOperationKind(operation.kind)){
+                boolean classificationOperation = ClassificationOperations.knownKind(operation.kind);
+                if(!knownOperationKind(operation.kind) && !classificationOperation){
                     ContentValues quarantine=new ContentValues();quarantine.put("op_id",operation.id);quarantine.put("author_id",operation.author);quarantine.put("counter",operation.counter);quarantine.put("kind",operation.kind);quarantine.put("reason","不支持的整理操作，请升级客户端");quarantine.put("seen_at",Instant.now().toString());
                     db.insertWithOnConflict("library_operation_quarantine",null,quarantine,SQLiteDatabase.CONFLICT_IGNORE);
                     continue;
@@ -856,7 +1581,24 @@ final class LocalLibrary extends SQLiteOpenHelper {
                 }
                 if (operation.counter > frontier + 1) continue;
                 if (operation.counter == frontier + 1) {
-                    materializeRemoteOperation(db, operation);
+                    if (classificationOperation) {
+                        if (!classificationActive) continue;
+                        try {
+                            ClassificationOperations.receiveOperation(db, classificationIdentity[0], classificationIdentity[1], operation.id, operation.author, operation.counter, operation.kind, operation.payload);
+                        } catch (ClassificationOperations.PendingException pending) {
+                            continue;
+                        } catch (ClassificationOperations.QuarantineException rejected) {
+                            ContentValues quarantine=new ContentValues();quarantine.put("op_id",operation.id);quarantine.put("author_id",operation.author);quarantine.put("counter",operation.counter);quarantine.put("kind",operation.kind);quarantine.put("reason",rejected.getMessage());quarantine.put("seen_at",Instant.now().toString());
+                            db.insertWithOnConflict("library_operation_quarantine",null,quarantine,SQLiteDatabase.CONFLICT_IGNORE);
+                            continue;
+                        }
+                    } else if (classificationActive && legacyClassificationKind(operation.kind)) {
+                        ContentValues quarantine=new ContentValues();quarantine.put("op_id",operation.id);quarantine.put("author_id",operation.author);quarantine.put("counter",operation.counter);quarantine.put("kind",operation.kind);quarantine.put("reason","旧分类操作不受支持");quarantine.put("seen_at",Instant.now().toString());
+                        db.insertWithOnConflict("library_operation_quarantine",null,quarantine,SQLiteDatabase.CONFLICT_IGNORE);
+                        continue;
+                    } else {
+                        materializeRemoteOperation(db, operation);
+                    }
                     ContentValues inbox = new ContentValues();
                     inbox.put("op_id", operation.id); inbox.put("author_id", operation.author); inbox.put("counter", operation.counter);
                     inbox.put("received_at", Instant.now().toString()); inbox.put("applied_at", Instant.now().toString());
@@ -865,7 +1607,7 @@ final class LocalLibrary extends SQLiteOpenHelper {
                     next.put("author_id", operation.author); next.put("last_counter", operation.counter); next.put("updated_at", Instant.now().toString());
                     db.insertWithOnConflict("library_operation_frontiers", null, next, SQLiteDatabase.CONFLICT_REPLACE);
                 }
-                if (localAuthor.equals(operation.author)) {
+                if (localAuthor.equals(operation.author) || localClassificationAuthor.equals(operation.author)) {
                     ContentValues acknowledged = new ContentValues(); acknowledged.put("state", "acknowledged");
                     db.update("library_operations", acknowledged, "op_id=?", new String[]{operation.id});
                 }

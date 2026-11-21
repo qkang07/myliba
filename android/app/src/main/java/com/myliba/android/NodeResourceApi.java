@@ -43,13 +43,26 @@ final class NodeResourceApi {
     }
     private static Result json(int status,Object value)throws Exception{byte[] bytes=value.toString().getBytes(StandardCharsets.UTF_8);return new Result(status,"application/json; charset=utf-8",new ByteArrayInputStream(bytes),bytes.length);}
     private static Result error(int status,String message)throws Exception{return json(status,new JSONObject().put("error",message));}
+    private static Result error(int status,String code,String message)throws Exception{return json(status,new JSONObject().put("error",message).put("code",code));}
     private static int integer(String raw,int fallback,int min,int max){try{int value=Integer.parseInt(raw);return Math.max(min,Math.min(max,value));}catch(Exception ex){return fallback;}}
     private static String kind(LocalLibrary.Item item){return LibraryStore.kind(item.name,item.mime);}
-    private JSONObject resource(LocalLibrary.Item item)throws Exception{
-        return new JSONObject().put("id",id(item.uri)).put("fileId",item.logicalFileId).put("resourceRef",id(item.uri)).put("name",item.name).put("path",item.path)
+    private JSONObject resource(LocalLibrary.Item item,boolean includeIndexes)throws Exception{
+        JSONObject result=new JSONObject().put("id",id(item.uri)).put("fileId",item.logicalFileId).put("resourceRef",id(item.uri)).put("name",item.name).put("path",item.path)
             .put("size",item.size).put("contentSize",item.size).put("modified",Instant.ofEpochMilli(item.modified).toString())
             .put("kind",kind(item)).put("available",true).put("versionId",item.revisionId).put("folderId",item.folderId==null?"":item.folderId)
             .put("tags",new JSONArray(db.tags(item.uri))).put("attributeTags",new JSONArray());
+        if(includeIndexes){JSONArray directIndexes=new JSONArray();for(LocalLibrary.IndexNode node:db.directIndexes(item.uri))directIndexes.put(indexReference(node));result.put("directIndexes",directIndexes);}
+        return result;
+    }
+    private static JSONObject indexReference(LocalLibrary.IndexNode node)throws Exception{return new JSONObject().put("id",node.id).put("name",node.name).put("path",node.path);}
+    private JSONObject indexNode(LocalLibrary.IndexNode node)throws Exception{
+        JSONArray ancestors=new JSONArray();for(LocalLibrary.IndexNode ancestor:db.indexAncestors(node.id))ancestors.put(new JSONObject().put("id",ancestor.id).put("name",ancestor.name));
+        return new JSONObject().put("id",node.id).put("parentId",node.parentId==null?JSONObject.NULL:node.parentId).put("name",node.name).put("ancestors",ancestors).put("hasChildren",node.hasChildren).put("version",node.version).put("count",node.count);
+    }
+    private static String indexGeneration(List<LocalLibrary.IndexNode> nodes)throws Exception{
+        MessageDigest digest=MessageDigest.getInstance("SHA-256");
+        for(LocalLibrary.IndexNode node:nodes){for(String value:new String[]{node.id,node.parentId==null?"":node.parentId,node.name,node.version,Integer.toString(node.count)}){digest.update(value.getBytes(StandardCharsets.UTF_8));digest.update((byte)0);}}
+        StringBuilder result=new StringBuilder();for(byte value:digest.digest())result.append(String.format(Locale.ROOT,"%02x",value&255));return result.toString();
     }
     private static LocalFilters filters(Uri uri){
         LocalFilters f=new LocalFilters();f.query=uri.getQueryParameter("q")==null?"":uri.getQueryParameter("q");
@@ -61,14 +74,17 @@ final class NodeResourceApi {
         return f;
     }
     private static JSONObject body(byte[] data)throws Exception{if(data.length>2<<20)throw new IOException("request too large");return data.length==0?new JSONObject():new JSONObject(new String(data,StandardCharsets.UTF_8));}
-    private static List<String> ids(JSONArray array)throws Exception{List<String> result=new ArrayList<>();if(array!=null)for(int i=0;i<array.length();i++)result.add(array.getString(i));return result;}
+    private static List<String> ids(JSONArray array)throws JSONException{List<String> result=new ArrayList<>();if(array!=null)for(int i=0;i<array.length();i++)result.add(array.getString(i));return result;}
     private static String header(JSONObject headers,String name){for(Iterator<String> keys=headers.keys();keys.hasNext();){String key=keys.next();if(key.equalsIgnoreCase(name)){Object value=headers.opt(key);return value instanceof JSONArray?((JSONArray)value).optString(0,""):value instanceof String?(String)value:"";}}return "";}
     private List<String> uris(JSONArray array)throws Exception{List<String> result=new ArrayList<>();for(String encoded:ids(array)){LocalLibrary.Item item=item(encoded);if(item!=null)result.add(item.uri);}return result;}
+    private List<String> logicalFileIds(JSONArray array)throws JSONException{List<String> result=new ArrayList<>();for(String encoded:ids(array)){LocalLibrary.Item item=item(encoded);if(item==null)throw new IllegalStateException("文件不存在");result.add(item.logicalFileId);}return result;}
 
     Result handle(String method,String rawPath,byte[] requestBody,JSONObject requestHeaders)throws Exception{
         Uri uri=Uri.parse(rawPath);String path=uri.getPath();
         if(path==null||!path.startsWith("/api/")||path.contains("..")||path.contains("\\"))return error(403,"远程接口不允许访问");
         String[] parts=path.substring(1).split("/");
+        if(parts.length==3&&"library".equals(parts[1])&&"indexes".equals(parts[2])&&"GET".equals(method))return indexes(uri);
+        if(parts.length==3&&"library".equals(parts[1])&&"index-memberships".equals(parts[2])&&"POST".equals(method))return indexMemberships(requestBody);
         if(parts.length==5&&"library".equals(parts[1])&&"read".equals(parts[2])&&"GET".equals(method))return libraryRead(parts,requestHeaders,path,uri);
         if(parts.length==3&&"transfers".equals(parts[1])&&"browse".equals(parts[2])&&"GET".equals(method))return transferBrowse(uri);
         if(parts.length==3&&"transfers".equals(parts[1])&&"file".equals(parts[2]))return transferFile(method,uri,requestBody);
@@ -78,7 +94,7 @@ final class NodeResourceApi {
         if(parts.length==2&&"resources".equals(parts[1])&&"GET".equals(method))return page(uri,false);
         if(parts.length==3&&"resources".equals(parts[1])&&"selection".equals(parts[2])&&"GET".equals(method))return page(uri,true);
         if(parts.length==3&&"resources".equals(parts[1])&&"GET".equals(method)){
-            LocalLibrary.Item found=item(parts[2]);return found==null?error(404,"资源不存在"):json(200,resource(found));
+            LocalLibrary.Item found=item(parts[2]);return found==null?error(404,"资源不存在"):json(200,resource(found,true));
         }
         if(parts.length==4&&"resources".equals(parts[1])){
             LocalLibrary.Item found=item(parts[2]);if(found==null)return error(404,"资源不存在");
@@ -89,6 +105,7 @@ final class NodeResourceApi {
             }
             if("tag-suggestions".equals(parts[3])&&"GET".equals(method))return json(200,new JSONObject().put("suggestions",new JSONArray()));
             if("video-info".equals(parts[3])&&"GET".equals(method))return videoInfo(found);
+            if("indexes".equals(parts[3])&&"GET".equals(method)){JSONArray items=new JSONArray();for(LocalLibrary.IndexNode node:db.directIndexes(found.uri))items.put(indexReference(node));return json(200,new JSONObject().put("items",items));}
         }
         if(parts.length==2&&"folders".equals(parts[1])&&"GET".equals(method)){
             JSONArray folders=new JSONArray();int grouped=0,total=0;for(LocalLibrary.Root root:db.roots())total+=root.count;
@@ -112,6 +129,30 @@ final class NodeResourceApi {
         if(parts.length==2&&"tag-batch-suggestions".equals(parts[1])&&"GET".equals(method))return json(200,new JSONObject().put("suggestions",new JSONArray()).put("scanned",0));
         if(parts.length==2&&"cloud".equals(parts[1]))return error(404,"手机资源节点的云库功能独立配置");
         return mutate(method,parts,requestBody);
+    }
+
+    private Result indexes(Uri uri)throws Exception{
+        String parent=uri.getQueryParameter("parentId"),query=uri.getQueryParameter("q");int limit=integer(uri.getQueryParameter("limit"),100,1,200),offset=integer(uri.getQueryParameter("cursor"),0,0,Integer.MAX_VALUE);
+        List<LocalLibrary.IndexNode> all=db.allIndexes(),matching;
+        if(query!=null&&!query.trim().isEmpty()){
+            String needle=query.trim().toLowerCase(Locale.ROOT);matching=new ArrayList<>();for(LocalLibrary.IndexNode node:all)if(node.name.toLowerCase(Locale.ROOT).contains(needle)||node.path.toLowerCase(Locale.ROOT).contains(needle))matching.add(node);
+        }else{
+            if(parent!=null&&!parent.isEmpty()){boolean found=false;for(LocalLibrary.IndexNode node:all)if(parent.equals(node.id)){found=true;break;}if(!found)return error(404,"indexNotFound","索引不存在");}
+            matching=db.indexChildren(parent==null||parent.isEmpty()?null:parent);
+        }
+        JSONArray items=new JSONArray();int end=Math.min(matching.size(),offset+limit);if(offset>matching.size())offset=matching.size();for(int i=offset;i<end;i++)items.put(indexNode(matching.get(i)));
+        String next=end<matching.size()?Integer.toString(end):"";return json(200,new JSONObject().put("items",items).put("nextCursor",next).put("generation",indexGeneration(all)));
+    }
+
+    private Result indexMemberships(byte[] data)throws Exception{
+        JSONObject input;try{input=body(data);}catch(Exception ex){return error(400,"invalidMemberships","索引归属内容无效");}
+        try{
+            List<String> fileIds=ids(input.optJSONArray("fileIds"));if(fileIds.isEmpty()&&input.optJSONArray("ids")!=null)fileIds=logicalFileIds(input.optJSONArray("ids"));
+            return json(200,new JSONObject(db.changeIndexMembershipsByFileIds(input.optString("requestId"),fileIds,ids(input.optJSONArray("addIndexIds")),ids(input.optJSONArray("removeIndexIds")))));
+        }
+        catch(IllegalArgumentException ex){return error(400,"invalidMemberships",ex.getMessage());}
+        catch(IllegalStateException ex){String message=ex.getMessage();if("requestIdConflict".equals(message))return error(409,"requestIdConflict","requestId 已用于不同操作");if("索引不存在".equals(message))return error(404,"indexNotFound",message);if("文件不存在".equals(message))return error(404,"fileNotFound","文件不存在或无权整理");return error(409,"classificationConflict",message==null?"索引归属冲突":message);}
+        catch(JSONException ex){return error(400,"invalidMemberships","索引归属内容无效");}
     }
 
     private Result transferBrowse(Uri uri)throws Exception{
@@ -251,7 +292,7 @@ final class NodeResourceApi {
     private Result page(Uri uri,boolean selection)throws Exception{
         int limit=integer(uri.getQueryParameter("limit"),48,1,1000),offset=integer(uri.getQueryParameter("offset"),0,0,Integer.MAX_VALUE);
         LocalLibrary.Page page=db.search(filters(uri),limit,offset);JSONArray items=new JSONArray();
-        for(LocalLibrary.Item item:page.items)items.put(selection?new JSONObject().put("id",id(item.uri)).put("kind",kind(item)).put("available",true):resource(item));
+        for(LocalLibrary.Item item:page.items)items.put(selection?new JSONObject().put("id",id(item.uri)).put("kind",kind(item)).put("available",true):resource(item,false));
         return json(200,new JSONObject().put("items",items).put("total",page.total).put("limit",limit).put("offset",offset));
     }
     private Result file(LocalLibrary.Item item,JSONObject headers,Uri uri)throws Exception{

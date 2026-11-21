@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS library_operations (
 	kind TEXT NOT NULL,
 	payload_json TEXT NOT NULL,
 	created_at TEXT NOT NULL,
-	state TEXT NOT NULL CHECK(state IN ('pending','sent','acknowledged','failed')),
+	state TEXT NOT NULL CHECK(state IN ('pending','sent','acknowledged','failed','held')),
 	error TEXT NOT NULL DEFAULT '',
 	UNIQUE(author_id,counter)
 );
@@ -360,6 +360,8 @@ CREATE TABLE IF NOT EXISTS library_release_log (
 
 -- Legacy mutations remain the only writable classification API until P3.
 -- The triggers materialize the same classification against logical file IDs.
+-- Once a library is active, classification changes only through index
+-- operations; legacy table writes must not touch the frozen projection.
 CREATE TRIGGER IF NOT EXISTS library_alias_after_resource_insert
 AFTER INSERT ON resources BEGIN
 	INSERT OR IGNORE INTO library_files(file_id,created_at,updated_at)
@@ -367,23 +369,31 @@ AFTER INSERT ON resources BEGIN
 	INSERT OR IGNORE INTO library_resource_aliases(resource_id,file_id,imported_at)
 	VALUES(NEW.id,CASE WHEN NEW.file_id<>'' THEN NEW.file_id ELSE NEW.id END,NEW.first_seen_at);
 END;
-CREATE TRIGGER IF NOT EXISTS library_folder_after_insert
-AFTER INSERT ON resource_folders BEGIN
+DROP TRIGGER IF EXISTS library_folder_after_insert;
+CREATE TRIGGER library_folder_after_insert
+AFTER INSERT ON resource_folders
+WHEN COALESCE((SELECT mode FROM classification_library_state LIMIT 1),'shadow')<>'active' BEGIN
 	INSERT INTO library_file_folders(file_id,folder_id,updated_at)
 	SELECT a.file_id,NEW.folder_id,datetime('now') FROM library_resource_aliases a WHERE a.resource_id=NEW.resource_id
 	ON CONFLICT(file_id) DO UPDATE SET folder_id=excluded.folder_id,updated_at=excluded.updated_at;
 END;
-CREATE TRIGGER IF NOT EXISTS library_folder_before_delete
-BEFORE DELETE ON resource_folders BEGIN
+DROP TRIGGER IF EXISTS library_folder_before_delete;
+CREATE TRIGGER library_folder_before_delete
+BEFORE DELETE ON resource_folders
+WHEN COALESCE((SELECT mode FROM classification_library_state LIMIT 1),'shadow')<>'active' BEGIN
 	DELETE FROM library_file_folders WHERE file_id=(SELECT file_id FROM library_resource_aliases WHERE resource_id=OLD.resource_id);
 END;
-CREATE TRIGGER IF NOT EXISTS library_tag_after_insert
-AFTER INSERT ON resource_tags BEGIN
+DROP TRIGGER IF EXISTS library_tag_after_insert;
+CREATE TRIGGER library_tag_after_insert
+AFTER INSERT ON resource_tags
+WHEN COALESCE((SELECT mode FROM classification_library_state LIMIT 1),'shadow')<>'active' BEGIN
 	INSERT OR IGNORE INTO library_file_tags(file_id,tag_id,created_at)
 	SELECT a.file_id,NEW.tag_id,NEW.created_at FROM library_resource_aliases a WHERE a.resource_id=NEW.resource_id;
 END;
-CREATE TRIGGER IF NOT EXISTS library_tag_before_delete
-BEFORE DELETE ON resource_tags BEGIN
+DROP TRIGGER IF EXISTS library_tag_before_delete;
+CREATE TRIGGER library_tag_before_delete
+BEFORE DELETE ON resource_tags
+WHEN COALESCE((SELECT mode FROM classification_library_state LIMIT 1),'shadow')<>'active' BEGIN
 	DELETE FROM library_file_tags WHERE file_id=(SELECT file_id FROM library_resource_aliases WHERE resource_id=OLD.resource_id) AND tag_id=OLD.tag_id;
 END;
 `)
@@ -391,6 +401,12 @@ END;
 		return err
 	}
 	if err := importUnifiedLibraryBaseline(db); err != nil {
+		return err
+	}
+	if err := migrateClassificationIndexSchema(db); err != nil {
+		return err
+	}
+	if err := migrateClassificationOperationsSchema(db); err != nil {
 		return err
 	}
 	return createSearchRevisionTriggers(db)
@@ -454,13 +470,15 @@ func importUnifiedLibraryBaseline(db *sql.DB) error {
 		FROM resources r JOIN library_resource_aliases a ON a.resource_id=r.id`); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`INSERT OR REPLACE INTO library_file_folders(file_id,folder_id,updated_at)
-		SELECT a.file_id,rf.folder_id,datetime('now') FROM resource_folders rf JOIN library_resource_aliases a ON a.resource_id=rf.resource_id`); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(`INSERT OR IGNORE INTO library_file_tags(file_id,tag_id,created_at)
-		SELECT a.file_id,rt.tag_id,rt.created_at FROM resource_tags rt JOIN library_resource_aliases a ON a.resource_id=rt.resource_id`); err != nil {
-		return err
+	if classificationModeTx(tx) != "active" {
+		if _, err = tx.Exec(`INSERT OR REPLACE INTO library_file_folders(file_id,folder_id,updated_at)
+			SELECT a.file_id,rf.folder_id,datetime('now') FROM resource_folders rf JOIN library_resource_aliases a ON a.resource_id=rf.resource_id`); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO library_file_tags(file_id,tag_id,created_at)
+			SELECT a.file_id,rt.tag_id,rt.created_at FROM resource_tags rt JOIN library_resource_aliases a ON a.resource_id=rt.resource_id`); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

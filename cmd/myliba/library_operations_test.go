@@ -18,43 +18,6 @@ func renameEnvelope(opID, author string, counter int64, previous, name string, c
 	return libraryOperationEnvelope{OpID: opID, AuthorID: author, Counter: counter, Kind: "folder.rename", Payload: raw}
 }
 
-func TestLegacyFolderIdentityKeepsSourcesSeparate(t *testing.T) {
-	first := legacyFolderIdentity("phone-a", "", "Travel")
-	if first == "" || first != legacyFolderIdentity("phone-a", "", " travel ") {
-		t.Fatal("name-only legacy folder identity is not stable")
-	}
-	if first == legacyFolderIdentity("phone-b", "", "Travel") || first == legacyFolderIdentity("phone-a", "source-folder", "Travel") {
-		t.Fatal("legacy folder identities merged different sources")
-	}
-	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "legacy.db"))
-	if err != nil { t.Fatal(err) }
-	defer db.Close()
-	if err := migrate(db); err != nil { t.Fatal(err) }
-	snapshots := []legacySnapshot{
-		{hash: cloudHash([]byte("a")), author: "phone-a", objectID: "file-a", fileID: "file-a", revisionID: "v1", folderID: first, folderName: "Travel", tagsJSON: "[]", catalogAt: "2026-01-01T00:00:00Z", known: true},
-		{hash: cloudHash([]byte("b")), author: "phone-b", objectID: "file-b", fileID: "file-b", revisionID: "v1", folderID: legacyFolderIdentity("phone-b", "", "Travel"), folderName: "Travel", tagsJSON: "[]", catalogAt: "2026-01-01T00:00:00Z", known: true},
-	}
-	for i := 0; i < 2; i++ { if err := importLegacySnapshots(db, snapshots); err != nil { t.Fatal(err) } }
-	var imported, identities int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM library_legacy_snapshots`).Scan(&imported); err != nil { t.Fatal(err) }
-	if err := db.QueryRow(`SELECT COUNT(DISTINCT folder_id) FROM library_legacy_folder_identities`).Scan(&identities); err != nil { t.Fatal(err) }
-	if imported != 2 || identities != 2 { t.Fatalf("repeat import merged or duplicated folders: snapshots=%d identities=%d", imported, identities) }
-	app := &server{db: db}
-	listing := httptest.NewRecorder()
-	app.listLegacyFolders(listing, httptest.NewRequest("GET", "/api/library/legacy-folders", nil))
-	if listing.Code != 200 || !strings.Contains(listing.Body.String(), `"count":1`) { t.Fatalf("legacy folder list: %d %s", listing.Code, listing.Body.String()) }
-	request := httptest.NewRequest("POST", "/api/library/legacy-folders/merge", strings.NewReader(`{"folderIds":["`+snapshots[0].folderID+`","`+snapshots[1].folderID+`"],"name":"Travel"}`))
-	merged := httptest.NewRecorder()
-	app.mergeLegacyFolders(merged, request)
-	if merged.Code != 200 { t.Fatalf("legacy merge: %d %s", merged.Code, merged.Body.String()) }
-	var moved, operations int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM library_file_folder_state WHERE file_id IN ('file-a','file-b')`).Scan(&moved); err != nil { t.Fatal(err) }
-	if err := db.QueryRow(`SELECT COUNT(*) FROM library_operations WHERE kind='folder.move'`).Scan(&operations); err != nil { t.Fatal(err) }
-	if moved != 2 || operations != 1 { t.Fatalf("merge lacked durable operation: moved=%d operations=%d", moved, operations) }
-	listing = httptest.NewRecorder();app.listLegacyFolders(listing, httptest.NewRequest("GET", "/api/library/legacy-folders", nil))
-	if strings.Contains(listing.Body.String(), snapshots[0].folderID) || strings.Contains(listing.Body.String(), snapshots[1].folderID) { t.Fatal("merged identities still require confirmation") }
-}
-
 func applyRename(t *testing.T, db *sql.DB, op libraryOperationEnvelope) {
 	t.Helper()
 	tx, err := db.Begin()

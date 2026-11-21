@@ -104,6 +104,9 @@ func (s *server) listFolders(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createFolder(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	name, ok := readFolderName(w, r)
 	if !ok {
 		return
@@ -131,6 +134,9 @@ func (s *server) createFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) renameFolder(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	name, ok := readFolderName(w, r)
 	if !ok {
 		return
@@ -180,6 +186,9 @@ func (s *server) renameFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deleteFolder(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "无法删除文件夹")
@@ -251,6 +260,9 @@ func (s *server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) moveResourcesToFolder(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	var input struct {
 		IDs      []string `json:"ids"`
 		FolderID string   `json:"folderId"`
@@ -349,6 +361,9 @@ func (s *server) moveResourcesToFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) assignRootToFolder(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	var input struct {
 		RootID string `json:"rootId"`
 	}

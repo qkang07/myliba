@@ -394,7 +394,7 @@ func TestCloudStoreRejectsSameAuthorFormatDowngrade(t *testing.T) {
 		MaxCatalogFormat int `json:"maxCatalogFormat"`
 		MinWriterFormat  int `json:"minWriterFormat"`
 	}
-	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &capabilities) != nil || capabilities.MaxCatalogFormat != 4 || capabilities.MinWriterFormat != 4 {
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &capabilities) != nil || capabilities.MaxCatalogFormat != 5 || capabilities.MinWriterFormat != 4 {
 		t.Fatalf("upgraded writer capabilities: %d %s", response.Code, response.Body.String())
 	}
 }

@@ -62,6 +62,11 @@ export interface CloudFilters {
   grouped?: boolean;
   cloudCopy?: boolean;
   readable?: boolean;
+  browseId?: string;
+  browseMode?: "direct" | "subtree";
+  indexFilters?: Array<{ id: string; mode: "direct" | "subtree" }>;
+  needsOrganizing?: boolean;
+  facetParentId?: string;
 }
 
 type LibraryType = "image" | "video" | "audio" | "document" | "other";
@@ -165,6 +170,11 @@ export async function loadLibraryPage(scope: LibraryScope, filters: CollectionFi
     grouped: cloud?.grouped,
     cloudCopy: cloud?.cloudCopy,
     readable: cloud?.readable,
+    browseId: cloud?.browseId,
+    browseMode: cloud?.browseMode,
+    indexFilters: cloud?.indexFilters,
+    needsOrganizing: cloud?.needsOrganizing,
+    facetParentId: cloud?.facetParentId,
     sort: librarySort(filters.sort),
     cursor,
     limit: page.limit,

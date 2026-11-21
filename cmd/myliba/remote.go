@@ -718,6 +718,12 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "library" && parts[2] == "search":
 		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "library" && parts[2] == "indexes":
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "library" && parts[2] == "classification-status":
+		return method == http.MethodGet
+	case len(parts) == 4 && parts[1] == "library" && parts[2] == "indexes":
+		return method == http.MethodGet
 	case len(parts) == 3 && parts[1] == "library" && parts[2] == "offline-index":
 		return method == http.MethodGet
 	case len(parts) == 4 && parts[1] == "library" && parts[2] == "snapshots" && parts[3] == "status":
@@ -728,10 +734,6 @@ func allowedRemoteRequest(method, rawURI string) bool {
 		return method == http.MethodPost
 	case len(parts) == 5 && parts[1] == "library" && parts[2] == "read" && (parts[4] == "file" || parts[4] == "thumbnail" || parts[4] == "video-preview"):
 		return method == http.MethodGet
-	case len(parts) == 3 && parts[1] == "library" && parts[2] == "legacy-folders":
-		return method == http.MethodGet
-	case len(parts) == 4 && parts[1] == "library" && parts[2] == "legacy-folders" && parts[3] == "merge":
-		return method == http.MethodPost
 	case len(parts) == 3 && parts[1] == "library" && parts[2] == "members":
 		return method == http.MethodGet
 	case len(parts) == 4 && parts[1] == "library" && parts[2] == "members" && parts[3] == "rejoin":

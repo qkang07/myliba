@@ -40,6 +40,11 @@ func (c *cloudClient) librarySnapshotStatus(w http.ResponseWriter, _ *http.Reque
 	writeJSON(w, 200, map[string]any{"items": items})
 }
 
+// snapshotMaxShardItems bounds one snapshot shard defensively. Long-running
+// authors may exceed any absolute counter; limits live on per-shard item
+// count, encrypted bytes and decompressed bytes instead (§8.1).
+const snapshotMaxShardItems = 1000
+
 type librarySnapshotEnvelope struct {
 	SchemaVersion int    `json:"schemaVersion"`
 	AuthorID      string `json:"authorId"`
@@ -89,7 +94,7 @@ func decodeLibrarySnapshot(snapshot librarySnapshotEnvelope) ([]libraryOperation
 	if start == 0 {
 		start = 1
 	}
-	if snapshot.AuthorID == "" || start < 1 || snapshot.Frontier < start || snapshot.Frontier > 100000 || !validCloudHash(snapshot.Checksum) || len(snapshot.OperationsB64) > cloudMaxRecordSize {
+	if snapshot.AuthorID == "" || start < 1 || snapshot.Frontier < start || snapshot.Frontier-start+1 > snapshotMaxShardItems || !validCloudHash(snapshot.Checksum) || len(snapshot.OperationsB64) > cloudMaxRecordSize {
 		return nil, errors.New("invalid snapshot header")
 	}
 	compressed, err := base64.StdEncoding.DecodeString(snapshot.OperationsB64)
@@ -175,7 +180,7 @@ func (c *cloudClient) publishOperationSnapshots() error {
 		if published > 0 && !c.runtime.disk.valid("catalog", latestHash) {
 			published = 0
 		}
-		if frontier < 1 || frontier <= published || frontier > 100000 {
+		if frontier < 1 || frontier <= published {
 			continue
 		}
 		operations := make([]libraryOperationEnvelope, 0, frontier)
@@ -197,7 +202,7 @@ func (c *cloudClient) publishOperationSnapshots() error {
 				if encodeErr != nil {
 					return encodeErr
 				}
-				record := cloudRecord{Format: 4, LibraryID: c.libraryID(), ObjectID: "library-snapshot/" + author, RevisionID: newID(), AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{}}
+				record := cloudRecord{Format: c.catalogWriterFormat(), LibraryID: c.libraryID(), ObjectID: "library-snapshot/" + author, RevisionID: newID(), AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{}}
 				record, err = c.sealManifest(record, cloudManifest{Snapshot: &snapshot})
 				if err != nil {
 					return err

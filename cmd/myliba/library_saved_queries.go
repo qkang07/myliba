@@ -1,10 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -12,16 +15,20 @@ import (
 // librarySavedQuery stores conditions rather than a result snapshot, so a
 // query always reflects the current cloud and device index projection.
 type librarySavedQueryFilters struct {
-	Scope     string   `json:"scope"`
-	Lifecycle string   `json:"lifecycle,omitempty"`
-	Query     string   `json:"query"`
-	FolderID  string   `json:"folderId"`
-	Tags      []string `json:"tags"`
-	Sort      string   `json:"sort"`
-	Type      string   `json:"type,omitempty"`
-	Grouped   *bool    `json:"grouped,omitempty"`
-	CloudCopy *bool    `json:"cloudCopy,omitempty"`
-	Readable  *bool    `json:"readable,omitempty"`
+	Scope           string                  `json:"scope"`
+	Lifecycle       string                  `json:"lifecycle,omitempty"`
+	Query           string                  `json:"query"`
+	FolderID        string                  `json:"folderId"`
+	Tags            []string                `json:"tags"`
+	Sort            string                  `json:"sort"`
+	Type            string                  `json:"type,omitempty"`
+	Grouped         *bool                   `json:"grouped,omitempty"`
+	CloudCopy       *bool                   `json:"cloudCopy,omitempty"`
+	Readable        *bool                   `json:"readable,omitempty"`
+	BrowseID        string                  `json:"browseId,omitempty"`
+	BrowseMode      string                  `json:"browseMode,omitempty"`
+	IndexFilters    []libraryIndexCondition `json:"indexFilters,omitempty"`
+	NeedsOrganizing *bool                   `json:"needsOrganizing,omitempty"`
 }
 
 type librarySavedQuery struct {
@@ -37,12 +44,25 @@ type librarySavedQueryInput struct {
 	Filters librarySavedQueryFilters `json:"filters"`
 }
 
+func savedQueryClassificationFilter(filters librarySavedQueryFilters) libraryClassificationSearch {
+	result := libraryClassificationSearch{Filters: append([]libraryIndexCondition(nil), filters.IndexFilters...)}
+	if filters.BrowseID != "" {
+		result.Browse = &libraryIndexCondition{ID: filters.BrowseID, Mode: filters.BrowseMode}
+	}
+	if filters.NeedsOrganizing != nil {
+		result.NeedsOrganizing = strconv.FormatBool(*filters.NeedsOrganizing)
+	}
+	return result
+}
+
 func normalizeLibrarySavedQuery(input *librarySavedQueryInput) error {
 	input.Name = strings.TrimSpace(input.Name)
 	input.Filters.Scope = strings.TrimSpace(input.Filters.Scope)
 	input.Filters.Lifecycle = strings.TrimSpace(input.Filters.Lifecycle)
 	input.Filters.Query = strings.TrimSpace(input.Filters.Query)
 	input.Filters.FolderID = strings.TrimSpace(input.Filters.FolderID)
+	input.Filters.BrowseID = strings.TrimSpace(input.Filters.BrowseID)
+	input.Filters.BrowseMode = strings.TrimSpace(input.Filters.BrowseMode)
 	if input.Name == "" || utf8.RuneCountInString(input.Name) > 80 || utf8.RuneCountInString(input.Filters.Query) > 200 || len(input.Filters.Tags) > 20 {
 		return errors.New("查询名称或筛选条件无效")
 	}
@@ -83,6 +103,30 @@ func normalizeLibrarySavedQuery(input *librarySavedQueryInput) error {
 		}
 	}
 	input.Filters.Tags = tags
+	classificationValues := url.Values{}
+	if input.Filters.BrowseID != "" {
+		classificationValues.Set("browseId", input.Filters.BrowseID)
+		classificationValues.Set("browseMode", input.Filters.BrowseMode)
+	} else if input.Filters.BrowseMode != "" {
+		return errors.New("浏览范围缺少索引")
+	}
+	for _, condition := range input.Filters.IndexFilters {
+		classificationValues.Add("indexFilter", condition.Mode+":"+condition.ID)
+	}
+	if input.Filters.NeedsOrganizing != nil {
+		classificationValues.Set("needsOrganizing", strconv.FormatBool(*input.Filters.NeedsOrganizing))
+	}
+	classification, err := parseClassificationSearch(classificationValues)
+	if err != nil {
+		return err
+	}
+	input.Filters.BrowseID = ""
+	input.Filters.BrowseMode = ""
+	if classification.Browse != nil {
+		input.Filters.BrowseID = classification.Browse.ID
+		input.Filters.BrowseMode = classification.Browse.Mode
+	}
+	input.Filters.IndexFilters = classification.Filters
 	return nil
 }
 
@@ -97,6 +141,23 @@ func (s *server) readLibrarySavedQuery(w http.ResponseWriter, r *http.Request) (
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "查询内容无效")
+		return input, false
+	}
+	classificationFilter := savedQueryClassificationFilter(input.Filters)
+	if (classificationFilter.Browse != nil || len(classificationFilter.Filters) != 0) && (s.cloud == nil || s.cloud.runtime == nil) {
+		writeError(w, http.StatusServiceUnavailable, "分类索引尚未初始化")
+		return input, false
+	}
+	if classificationFilter.Browse != nil || len(classificationFilter.Filters) != 0 {
+		err := validateClassificationSearch(s.db, s.cloud.libraryID(), classificationFilter)
+		if err == nil {
+			return input, true
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "分类索引不存在")
+		} else {
+			writeError(w, 500, "无法校验分类索引筛选")
+		}
 		return input, false
 	}
 	return input, true

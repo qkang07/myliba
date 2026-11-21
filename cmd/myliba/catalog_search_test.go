@@ -452,6 +452,20 @@ func TestCatalogMergeDevicesNamesAndVersions(t *testing.T) {
 	if err != nil || len(protected) != 0 {
 		t.Fatalf("old public index exposed protected upload: %+v %v", protected, err)
 	}
+	privateIndex := fileIndexView{FileID: "same-file", RevisionID: "v1", Name: "same-name.txt", Modified: modified, Original: indexedContent{Size: 4}, ContentSize: 4, OrganizationKnown: true, Protected: true}
+	privateRecord := cloudRecord{Format: 4, LibraryID: client.libraryID(), ObjectID: "private-copy", RevisionID: "v1", AuthorID: "device-private", CreatedAt: "2026-11-02T03:00:00Z", BlockIDs: []string{}}
+	privateRecord, err = client.sealManifest(privateRecord, cloudManifest{IndexOnly: true, LocalIndex: &privateIndex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateRaw, _ := json.Marshal(privateRecord)
+	if err = runtime.disk.put("catalog", cloudHash(privateRaw), bytes.NewReader(privateRaw), cloudMaxRecordSize); err != nil {
+		t.Fatal(err)
+	}
+	protected, err = client.mergeCatalogSearch([]cloudFileView{{FileID: "same-file", ID: "public-copy", Name: "same-name.txt", CatalogCreatedAt: "2026-11-02T04:00:00Z"}}, false)
+	if err != nil || len(protected) != 0 {
+		t.Fatalf("public replica exposed logical file protected by another source: %+v %v", protected, err)
+	}
 }
 
 func TestAppliedClassificationOverridesOldManifestIncludingEmpty(t *testing.T) {

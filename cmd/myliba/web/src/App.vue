@@ -76,6 +76,8 @@ import {
   getResourceSelection,
   getCollections,
   getLibrarySavedQueries,
+  getLibraryIndex,
+  getLibraryIndexes,
   getFolders,
   createFolder,
   renameFolder,
@@ -107,6 +109,7 @@ import {
   type CloudFile,
   type CollectionFilters,
   type LibrarySavedQuery,
+  type ClassificationIndex,
   type LibrarySearchPage,
   type SmartCollection,
   type ResourceSort,
@@ -121,7 +124,7 @@ import {
   type HubResourceNode,
 } from "./api";
 import { librarySort, loadLibraryPage, resourceSort, type CloudFilters, type LibraryItem, type LibraryScope } from "./libraryScope";
-import { lockedOfflineIndex, offlineIndexStatus, saveOfflineIndex, unlockOfflineIndex } from "./libraryOffline";
+import { lockedOfflineIndex, offlineClassificationChildren, offlineClassificationPath, offlineClassificationSearch, offlineIndexStatus, saveOfflineIndex, unlockOfflineIndex } from "./libraryOffline";
 
 const remoteMode = ref(false);
 const authenticated = ref(true);
@@ -150,6 +153,19 @@ const cloudGrouped = ref<"" | "true" | "false">("");
 const cloudCopy = ref<"" | "true" | "false">("");
 const cloudReadable = ref<"" | "true" | "false">("");
 const libraryCoverage = ref<LibrarySearchPage["coverage"] | null>(null);
+const libraryIndexBrowserOpen = ref(false);
+const libraryIndexChildren = ref<ClassificationIndex[]>([]);
+const libraryIndexPath = ref<Array<{ id: string; name: string }>>([]);
+const libraryIndexFacets = ref<LibrarySearchPage["facets"]["indexes"]>([]);
+const libraryIndexLoading = ref(false);
+const libraryIndexSearchQuery = ref("");
+const libraryIndexSearchResults = ref<ClassificationIndex[]>([]);
+const libraryIndexSearchCursor = ref("");
+const libraryIndexSearching = ref(false);
+const libraryBrowseMode = ref<"direct" | "subtree">("subtree");
+const libraryIndexFilters = ref<Array<{ id: string; mode: "direct" | "subtree" }>>([]);
+const libraryIndexFilterNames = ref<Record<string, string>>({});
+const libraryOrganizingFilter = ref<"" | "true" | "false">("");
 const libraryOfflineMode = ref(false);
 const offlineStatus = ref<{ nodeId: string; libraryId: string; syncedAt: string; count: number } | null>(null);
 const failedThumbnailIDs = ref(new Set<string>());
@@ -312,12 +328,20 @@ function currentFilters(): CollectionFilters {
 }
 
 function cloudFilters(): CloudFilters {
-  return {
+  const filters: CloudFilters = {
     lifecycle: cloudLifecycle.value,
     grouped: cloudGrouped.value === "" ? undefined : cloudGrouped.value === "true",
     cloudCopy: cloudCopy.value === "" ? undefined : cloudCopy.value === "true",
     readable: cloudReadable.value === "" ? undefined : cloudReadable.value === "true",
   };
+  if (libraryIndexBrowserOpen.value) {
+    filters.browseId = libraryIndexPath.value.at(-1)?.id;
+    filters.browseMode = libraryBrowseMode.value;
+    filters.indexFilters = libraryIndexFilters.value;
+    filters.needsOrganizing = libraryOrganizingFilter.value === "" ? undefined : libraryOrganizingFilter.value === "true";
+    filters.facetParentId = filters.browseId || "";
+  }
+  return filters;
 }
 
 function effectiveAttributes(filters: CollectionFilters): string[] {
@@ -363,7 +387,7 @@ const activeCollection = computed<{ id: string; name: string } | undefined>(() =
 });
 const pageTitle = computed(() => {
   if (activeCollection.value) return activeCollection.value.name;
-  if (isLibraryScope.value) return query.value.trim() || selectedTags.value.length || selectedKind.value ? "筛选结果" : scope.value === "cloud" ? "云库文件" : "全部文件";
+  if (isLibraryScope.value) return libraryIndexPath.value.at(-1)?.name || (query.value.trim() || selectedTags.value.length || selectedKind.value || libraryIndexFilters.value.length || libraryOrganizingFilter.value ? "筛选结果" : scope.value === "cloud" ? "云库文件" : "全部文件");
   if (selectedTags.value.length > 1) return `标签筛选（${selectedTags.value.length}）`;
   if (selectedTags.value.length === 1) return `标签：${selectedTags.value[0]}`;
   if (unorganizedOnly.value) return "未添加标签";
@@ -380,7 +404,7 @@ const previewPosition = computed(() => previewIndex.value < 0 ? 1 : previewIndex
 const previewTotal = computed(() => Math.max(total.value, resources.value.length));
 const canPreviewPrevious = computed(() => previewIndex.value > 0);
 const canPreviewNext = computed(() => previewIndex.value >= 0 && (previewIndex.value < resources.value.length - 1 || hasMore.value));
-const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || reachableOnly.value || activeAttributeKeys.value.length || selectedRootID.value));
+const isFiltered = computed(() => Boolean(query.value.trim() || selectedTags.value.length || unorganizedOnly.value || reachableOnly.value || activeAttributeKeys.value.length || selectedRootID.value || (isLibraryScope.value && (libraryIndexPath.value.length || libraryIndexFilters.value.length || libraryOrganizingFilter.value))));
 const libraryScopeLabel = computed(() => remoteMode.value
   ? resourceNodes.value.find((node) => node.id === selectedResourceNodeID.value)?.name || "当前设备"
   : "本机资源库");
@@ -683,6 +707,7 @@ async function loadResources(append = false) {
       libraryCursor.value = result.nextCursor;
       libraryNodeId.value = result.nodeId;
       libraryCoverage.value = result.coverage;
+      libraryIndexFacets.value = result.facets.indexes || [];
       libraryOfflineMode.value = result.offline;
       if (!result.offline && offlineStatus.value && result.libraryId !== offlineStatus.value.libraryId) lockLocalIndex();
     }
@@ -712,6 +737,7 @@ function changeScope(next: LibraryScope) {
   tagFilterOpen.value = false;
   batchSuggestionsOpen.value = false;
   resetCloudFilters();
+  resetLibraryIndexFilters();
   selectedCloudQueryID.value = "";
   clearSelection();
   libraryItems.value = [];
@@ -730,6 +756,141 @@ function resetCloudFilters() {
   cloudCopy.value = "";
   cloudReadable.value = "";
   selectedKind.value = "";
+}
+
+function resetLibraryIndexFilters() {
+  libraryIndexBrowserOpen.value = false;
+  libraryIndexChildren.value = [];
+  libraryIndexPath.value = [];
+  libraryIndexFacets.value = [];
+  libraryBrowseMode.value = "subtree";
+  libraryIndexFilters.value = [];
+  libraryIndexFilterNames.value = {};
+	libraryIndexSearchQuery.value = "";
+	libraryIndexSearchResults.value = [];
+	libraryIndexSearchCursor.value = "";
+  libraryOrganizingFilter.value = "";
+}
+
+async function loadLibraryIndexChildren(parentId = libraryIndexPath.value.at(-1)?.id) {
+  if (!isLibraryScope.value || !libraryIndexBrowserOpen.value) return;
+  libraryIndexLoading.value = true;
+  try {
+    const result = await getLibraryIndexes(parentId);
+    libraryIndexChildren.value = result.items;
+  } catch (error) {
+    const offlineItems = offlineClassificationChildren(parentId || "");
+    if (offlineItems) libraryIndexChildren.value = offlineItems;
+    else showError(error);
+  } finally {
+    libraryIndexLoading.value = false;
+  }
+}
+
+async function toggleLibraryIndexBrowser() {
+  if (libraryIndexBrowserOpen.value) {
+    resetLibraryIndexFilters();
+    await loadResources();
+    return;
+  }
+  libraryIndexBrowserOpen.value = true;
+  await Promise.all([loadLibraryIndexChildren(), loadResources()]);
+}
+
+async function openLibraryIndex(index: ClassificationIndex) {
+  libraryIndexPath.value = [...index.ancestors.map(item => ({ id: item.id, name: item.name })), { id: index.id, name: index.name }];
+  libraryIndexChildren.value = [];
+  libraryCursor.value = "";
+  await Promise.all([loadLibraryIndexChildren(index.id), loadResources()]);
+}
+
+async function navigateLibraryIndex(position: number) {
+  libraryIndexPath.value = position < 0 ? [] : libraryIndexPath.value.slice(0, position + 1);
+  libraryIndexChildren.value = [];
+  libraryCursor.value = "";
+  await Promise.all([loadLibraryIndexChildren(), loadResources()]);
+}
+
+async function searchLibraryIndexNodes(append = false) {
+	const query = libraryIndexSearchQuery.value.trim();
+	if (!query) {
+		libraryIndexSearchResults.value = [];
+		libraryIndexSearchCursor.value = "";
+		return;
+	}
+	libraryIndexSearching.value = true;
+	try {
+		const result = await getLibraryIndexes(undefined, query, append ? libraryIndexSearchCursor.value : "");
+		libraryIndexSearchResults.value = append ? [...libraryIndexSearchResults.value, ...result.items] : result.items;
+		libraryIndexSearchCursor.value = result.nextCursor;
+	} catch (error) {
+		const offlineItems = offlineClassificationSearch(query);
+		if (offlineItems) {
+			libraryIndexSearchResults.value = offlineItems;
+			libraryIndexSearchCursor.value = "";
+		} else showError(error);
+	} finally {
+		libraryIndexSearching.value = false;
+	}
+}
+
+async function addLibraryIndexFilterFromSearch(index: ClassificationIndex) {
+	if (libraryIndexFilterMode(index.id)) return;
+	if (libraryIndexFilters.value.length >= 20) { showError(new Error("最多同时使用 20 个索引条件")); return; }
+	const path = [...index.ancestors.map(item => ({ id: item.id, name: item.name })), { id: index.id, name: index.name }];
+	libraryIndexFilters.value = [...libraryIndexFilters.value, { id: index.id, mode: "subtree" }];
+	libraryIndexFilterNames.value = { ...libraryIndexFilterNames.value, [index.id]: libraryIndexPathLabel(path) };
+	await loadResources();
+}
+
+function libraryIndexCount(id: string): number {
+  return libraryIndexFacets.value.find(item => item.id === id)?.count || 0;
+}
+
+function libraryIndexFilterMode(id: string): "direct" | "subtree" | "" {
+  return libraryIndexFilters.value.find(filter => filter.id === id)?.mode || "";
+}
+
+function libraryIndexFilterLabel(id: string): string {
+  return libraryIndexFilterNames.value[id] || id;
+}
+
+function libraryIndexPathLabel(path: Array<{ id: string; name: string }>): string {
+  return path.map(item => item.name).join(" / ");
+}
+
+async function cycleLibraryIndexFilter(path: Array<{ id: string; name: string }>) {
+  const node = path.at(-1);
+  if (!node) return;
+  const existing = libraryIndexFilters.value.find(filter => filter.id === node.id);
+  if (!existing) {
+    if (libraryIndexFilters.value.length >= 20) { showError(new Error("最多同时使用 20 个索引条件")); return; }
+    libraryIndexFilters.value = [...libraryIndexFilters.value, { id: node.id, mode: "subtree" }];
+    libraryIndexFilterNames.value = { ...libraryIndexFilterNames.value, [node.id]: libraryIndexPathLabel(path) };
+  } else if (existing.mode === "subtree") {
+    existing.mode = "direct";
+  } else {
+    libraryIndexFilters.value = libraryIndexFilters.value.filter(filter => filter.id !== node.id);
+  }
+  await loadResources();
+}
+
+function removeLibraryIndexFilter(id: string) {
+  libraryIndexFilters.value = libraryIndexFilters.value.filter(filter => filter.id !== id);
+  void loadResources();
+}
+
+async function resolveLibraryIndexFilterNames() {
+  for (const filter of libraryIndexFilters.value) {
+    if (libraryIndexFilterNames.value[filter.id]) continue;
+    try {
+      const index = await getLibraryIndex(filter.id);
+      libraryIndexFilterNames.value = { ...libraryIndexFilterNames.value, [filter.id]: libraryIndexPathLabel([...index.ancestors, { id: index.id, name: index.name }]) };
+    } catch {
+      const offlinePath = offlineClassificationPath(filter.id);
+      if (offlinePath) libraryIndexFilterNames.value = { ...libraryIndexFilterNames.value, [filter.id]: libraryIndexPathLabel(offlinePath) };
+    }
+  }
 }
 
 function searchLibrary(initialQuery = "") {
@@ -978,6 +1139,7 @@ function resetFolderFilters() {
   libraryCoverage.value = null;
   libraryOfflineMode.value = false;
   resetCloudFilters();
+  resetLibraryIndexFilters();
   selectedCollectionID.value = "";
   selectedCloudQueryID.value = "";
   selectedTags.value = [];
@@ -1164,6 +1326,7 @@ function chooseAll() {
   unorganizedOnly.value = false;
   reachableOnly.value = false;
   resetCloudFilters();
+  if (isLibraryScope.value) resetLibraryIndexFilters();
   query.value = "";
   void loadResources();
 }
@@ -1249,12 +1412,18 @@ function cloudQueryFilters(): LibrarySavedQuery["filters"] {
     grouped: cloudGrouped.value === "" ? undefined : cloudGrouped.value === "true",
     cloudCopy: cloudCopy.value === "" ? undefined : cloudCopy.value === "true",
     readable: cloudReadable.value === "" ? undefined : cloudReadable.value === "true",
+    browseId: libraryIndexPath.value.at(-1)?.id,
+    browseMode: libraryIndexPath.value.length ? libraryBrowseMode.value : undefined,
+    indexFilters: libraryIndexFilters.value.length ? [...libraryIndexFilters.value] : undefined,
+    needsOrganizing: libraryOrganizingFilter.value === "" ? undefined : libraryOrganizingFilter.value === "true",
     sort: librarySort(sortOrder.value),
   };
 }
 
 function cloudQueryMatches(filters: LibrarySavedQuery["filters"]): boolean {
   const tri = (value: "" | "true" | "false") => value === "" ? undefined : value === "true";
+  const currentIndexFilters = [...libraryIndexFilters.value].sort((left, right) => left.id.localeCompare(right.id) || left.mode.localeCompare(right.mode));
+  const savedIndexFilters = [...(filters.indexFilters || [])].sort((left, right) => left.id.localeCompare(right.id) || left.mode.localeCompare(right.mode));
   return (filters.scope === "cloud" ? "cloud" : "all") === scope.value
     && filters.query === query.value.trim()
     && (filters.lifecycle || "active") === cloudLifecycle.value
@@ -1262,12 +1431,27 @@ function cloudQueryMatches(filters: LibrarySavedQuery["filters"]): boolean {
     && tri(cloudGrouped.value) === filters.grouped
     && tri(cloudCopy.value) === filters.cloudCopy
     && tri(cloudReadable.value) === filters.readable
+    && (filters.browseId || "") === (libraryIndexPath.value.at(-1)?.id || "")
+    && (!(filters.browseId || libraryIndexPath.value.length) || (filters.browseMode || "subtree") === libraryBrowseMode.value)
+    && filters.needsOrganizing === (libraryOrganizingFilter.value === "" ? undefined : libraryOrganizingFilter.value === "true")
+    && JSON.stringify(savedIndexFilters) === JSON.stringify(currentIndexFilters)
     && librarySort(sortOrder.value) === filters.sort
     && filters.tags.length === selectedTags.value.length
     && filters.tags.every((tag) => selectedTags.value.includes(tag));
 }
 
-function applyCloudQuery(saved: LibrarySavedQuery) {
+async function applyCloudQuery(saved: LibrarySavedQuery) {
+  let savedPath: Array<{ id: string; name: string }> = [];
+  if (saved.filters.browseId) {
+    try {
+      const index = await getLibraryIndex(saved.filters.browseId);
+      savedPath = [...index.ancestors.map(item => ({ id: item.id, name: item.name })), { id: index.id, name: index.name }];
+    } catch (error) {
+      const offlinePath = offlineClassificationPath(saved.filters.browseId);
+      if (!offlinePath) { showError(error); return; }
+      savedPath = offlinePath;
+    }
+  }
   if (detailResourceID.value) closeDetail();
   closeCollectionEditor();
   if (debounceTimer) clearTimeout(debounceTimer);
@@ -1286,6 +1470,12 @@ function applyCloudQuery(saved: LibrarySavedQuery) {
   cloudGrouped.value = saved.filters.grouped === undefined ? "" : String(saved.filters.grouped) as "true" | "false";
   cloudCopy.value = saved.filters.cloudCopy === undefined ? "" : String(saved.filters.cloudCopy) as "true" | "false";
   cloudReadable.value = saved.filters.readable === undefined ? "" : String(saved.filters.readable) as "true" | "false";
+  resetLibraryIndexFilters();
+  libraryIndexBrowserOpen.value = Boolean(saved.filters.browseId || saved.filters.indexFilters?.length || saved.filters.needsOrganizing !== undefined);
+  libraryIndexPath.value = savedPath;
+  libraryBrowseMode.value = saved.filters.browseMode || "subtree";
+  libraryIndexFilters.value = [...(saved.filters.indexFilters || [])];
+  libraryOrganizingFilter.value = saved.filters.needsOrganizing === undefined ? "" : saved.filters.needsOrganizing ? "true" : "false";
   sortOrder.value = resourceSort(saved.filters.sort);
   libraryItems.value = [];
   libraryCursor.value = "";
@@ -1295,6 +1485,8 @@ function applyCloudQuery(saved: LibrarySavedQuery) {
   total.value = 0;
   clearSelection();
   void nextTick(() => { suppressQueryWatch = false; });
+  if (libraryIndexBrowserOpen.value) void loadLibraryIndexChildren();
+  void resolveLibraryIndexFilterNames();
   void loadResources();
 }
 
@@ -1743,6 +1935,7 @@ function clearRemoteSession() {
   libraryOfflineMode.value = false;
   offlineStatus.value = null;
   resetCloudFilters();
+  resetLibraryIndexFilters();
   roots.value = [];
   tags.value = [];
   attributeCatalog.value = [];
@@ -2259,7 +2452,60 @@ onBeforeUnmount(() => {
           <label v-if="isLibraryScope">副本<select v-model="cloudCopy" @change="loadResources()"><option value="">全部</option><option value="true">有云库副本</option><option value="false">仅设备来源</option></select></label>
           <label v-if="isLibraryScope">可读<select v-model="cloudReadable" @change="loadResources()"><option value="">全部</option><option value="true">可读</option><option value="false">暂不可读</option></select></label>
           <label>排序<select v-model="sortOrder" @change="loadResources()"><option value="modified_desc">最近修改</option><option value="modified_asc">最早修改</option><option value="name_asc">名称 A-Z</option><option value="name_desc">名称 Z-A</option><option value="size_desc">{{ isLibraryScope ? '最近入库' : '文件最大' }}</option></select></label>
+          <button v-if="isLibraryScope" class="library-index-toggle" type="button" :class="{ active: libraryIndexBrowserOpen }" :aria-expanded="libraryIndexBrowserOpen" @click="toggleLibraryIndexBrowser"><FolderOpen :size="14" />分类索引<ChevronDown :size="13" /></button>
         </div>
+
+        <section v-if="isLibraryScope && libraryIndexBrowserOpen" class="library-index-browser" aria-label="分类索引浏览">
+          <div class="library-index-heading">
+            <nav aria-label="索引路径">
+              <button type="button" :class="{ active: !libraryIndexPath.length }" @click="navigateLibraryIndex(-1)">全部索引</button>
+              <template v-for="(item, position) in libraryIndexPath" :key="item.id">
+                <ChevronRight :size="12" />
+                <button type="button" :class="{ active: position === libraryIndexPath.length - 1 }" @click="navigateLibraryIndex(position)">{{ item.name }}</button>
+              </template>
+            </nav>
+            <div class="library-index-options">
+              <button v-if="libraryIndexPath.length" type="button" class="library-index-filter-toggle" :class="{ active: libraryIndexFilterMode(libraryIndexPath.at(-1)?.id || '') }" :title="libraryIndexFilterMode(libraryIndexPath.at(-1)?.id || '') === 'subtree' ? '改为仅本层' : libraryIndexFilterMode(libraryIndexPath.at(-1)?.id || '') === 'direct' ? '移除筛选' : '把当前索引添加为筛选条件'" @click="cycleLibraryIndexFilter(libraryIndexPath)">
+                <Check v-if="libraryIndexFilterMode(libraryIndexPath.at(-1)?.id || '')" :size="12" /><Plus v-else :size="12" />筛选本层
+              </button>
+              <label v-if="libraryIndexPath.length">范围<select v-model="libraryBrowseMode" @change="loadResources()"><option value="subtree">包含下级</option><option value="direct">仅本层</option></select></label>
+              <label>整理状态<select v-model="libraryOrganizingFilter" @change="loadResources()"><option value="">全部</option><option value="true">待整理</option><option value="false">已整理</option></select></label>
+            </div>
+          </div>
+          <form class="library-index-search" role="search" @submit.prevent="searchLibraryIndexNodes(false)">
+            <Search :size="14" />
+            <input v-model="libraryIndexSearchQuery" type="search" placeholder="按名称或完整路径查找任意索引" aria-label="查找分类索引" @input="libraryIndexSearchResults = []; libraryIndexSearchCursor = ''" />
+            <button type="submit" :disabled="libraryIndexSearching || !libraryIndexSearchQuery.trim()"><LoaderCircle v-if="libraryIndexSearching" class="spin" :size="13" /><span v-else>查找</span></button>
+          </form>
+          <div v-if="libraryIndexSearchResults.length" class="library-index-search-results" aria-label="索引搜索结果">
+            <div v-for="item in libraryIndexSearchResults" :key="item.id" class="library-index-search-result">
+              <button type="button" :title="libraryIndexPathLabel([...item.ancestors, { id: item.id, name: item.name }])" @click="openLibraryIndex(item)"><FolderOpen :size="13" /><span>{{ libraryIndexPathLabel([...item.ancestors, { id: item.id, name: item.name }]) }}</span></button>
+              <button type="button" class="library-index-filter-toggle" :class="{ active: libraryIndexFilterMode(item.id) }" :disabled="Boolean(libraryIndexFilterMode(item.id))" @click="addLibraryIndexFilterFromSearch(item)"><Check v-if="libraryIndexFilterMode(item.id)" :size="12" /><Plus v-else :size="12" />{{ libraryIndexFilterMode(item.id) ? '已添加' : '添加条件' }}</button>
+            </div>
+            <button v-if="libraryIndexSearchCursor" type="button" class="library-index-search-more" :disabled="libraryIndexSearching" @click="searchLibraryIndexNodes(true)">加载更多</button>
+          </div>
+          <p v-else-if="libraryIndexSearchQuery.trim() && !libraryIndexSearching" class="library-index-search-empty">输入名称或路径后点击查找，可直接浏览或添加为交集条件。</p>
+          <div v-if="libraryIndexFilters.length" class="library-index-chips" aria-label="附加索引条件">
+            <span>同时满足</span>
+            <span v-for="filter in libraryIndexFilters" :key="filter.id" class="library-index-chip">
+              <span class="library-index-chip-name" :title="libraryIndexFilterLabel(filter.id)">{{ libraryIndexFilterLabel(filter.id) }}</span>
+              <select v-model="filter.mode" :aria-label="'条件范围 ' + libraryIndexFilterLabel(filter.id)" @change="loadResources()"><option value="subtree">含下级</option><option value="direct">仅本层</option></select>
+              <button type="button" :aria-label="'移除条件 ' + libraryIndexFilterLabel(filter.id)" @click="removeLibraryIndexFilter(filter.id)"><X :size="12" /></button>
+            </span>
+          </div>
+          <div class="library-index-list">
+            <span v-if="libraryIndexLoading" class="library-index-empty"><LoaderCircle class="spin" :size="14" />正在读取索引…</span>
+            <div v-for="item in libraryIndexChildren" v-else :key="item.id" class="library-index-item">
+              <button type="button" @click="openLibraryIndex(item)">
+                <span><FolderOpen :size="14" />{{ item.name }}</span><small>{{ libraryIndexCount(item.id) }}</small><ChevronRight :size="13" />
+              </button>
+              <button type="button" class="library-index-filter-toggle" :class="{ active: libraryIndexFilterMode(item.id) }" :title="libraryIndexFilterMode(item.id) === 'subtree' ? '改为仅本层' : libraryIndexFilterMode(item.id) === 'direct' ? '移除筛选' : '添加筛选（含下级）'" @click="cycleLibraryIndexFilter([...item.ancestors, { id: item.id, name: item.name }])">
+                <Check v-if="libraryIndexFilterMode(item.id)" :size="12" /><Plus v-else :size="12" />{{ libraryIndexFilterMode(item.id) === 'subtree' ? '含下级' : libraryIndexFilterMode(item.id) === 'direct' ? '本层' : '筛选' }}
+              </button>
+            </div>
+            <span v-if="!libraryIndexLoading && !libraryIndexChildren.length" class="library-index-empty">此层没有下级索引</span>
+          </div>
+        </section>
 
         <div v-if="isLibraryScope" class="library-tools">
           <span v-if="libraryOfflineMode" class="library-pill library-pill-amber" title="设备不可达，正在使用本浏览器加密保存的目录元数据；连接设备后才能打开或修改文件。">离线元数据</span>

@@ -163,6 +163,16 @@ func (c *cloudClient) libraryID() string {
 	return cloudHash(c.key[:])
 }
 
+// catalogWriterFormat follows the library's classification mode: after the
+// format-5 switch the Hub rejects every older new write, including receipts,
+// snapshots and device indexes.
+func (c *cloudClient) catalogWriterFormat() int {
+	if c.runtime != nil && c.runtime.db != nil && classificationMode(c.runtime.db, c.libraryID()) == "active" {
+		return 5
+	}
+	return 4
+}
+
 func (c *cloudClient) authorEpoch() int64 {
 	if c.runtime == nil || c.runtime.db == nil {
 		return 0
@@ -258,6 +268,22 @@ func cloudRecordAAD(record cloudRecord) []byte {
 			CreatedAt  string   `json:"createdAt"`
 			BlockIDs   []string `json:"blockIds"`
 		}{record.Format, record.LibraryID, record.ObjectID, record.RevisionID, record.AuthorID, record.CreatedAt, record.BlockIDs})
+		return raw
+	}
+	if record.Format == 5 {
+		// Format 5 binds the writer epoch into the AAD, including epoch=0, so
+		// both ends must serialize the identical field order byte-for-byte.
+		raw, _ := json.Marshal(struct {
+			Format      int      `json:"format"`
+			KeepHistory bool     `json:"keepHistory"`
+			LibraryID   string   `json:"libraryId"`
+			ObjectID    string   `json:"objectId"`
+			RevisionID  string   `json:"revisionId"`
+			AuthorID    string   `json:"authorId"`
+			AuthorEpoch int64    `json:"authorEpoch"`
+			CreatedAt   string   `json:"createdAt"`
+			BlockIDs    []string `json:"blockIds"`
+		}{record.Format, record.KeepHistory, record.LibraryID, record.ObjectID, record.RevisionID, record.AuthorID, record.AuthorEpoch, record.CreatedAt, record.BlockIDs})
 		return raw
 	}
 	raw, _ := json.Marshal(struct {
@@ -789,7 +815,7 @@ func (c *cloudClient) uploadFile(ctx context.Context, objectID, path string, his
 	taskID = c.createTransferTask("upload", fileID, revisionID, objectID, "", initial.Size())
 	c.setTransferState(taskID, transferReading, "")
 	record := cloudRecord{
-		Format: 4, KeepHistory: history, LibraryID: c.libraryID(), ObjectID: objectID, RevisionID: revisionID,
+		Format: c.catalogWriterFormat(), KeepHistory: history, LibraryID: c.libraryID(), ObjectID: objectID, RevisionID: revisionID,
 		AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{},
 	}
 	manifest := cloudManifest{

@@ -13,7 +13,7 @@ final class LibraryStore {
         List<String> tags=new ArrayList<>();
     }
     static final class Group {
-        final String id,name; final int count; final boolean passwordProtected; LocalFilters filters;
+        final String id,name; final int count; final boolean passwordProtected; LocalFilters filters; boolean preserveStructure=true;
         Group(String id,String name,int count){this(id,name,count,false);}
         Group(String id,String name,int count,boolean passwordProtected){this.id=id;this.name=name;this.count=count;this.passwordProtected=passwordProtected;}
     }
@@ -24,6 +24,7 @@ final class LibraryStore {
     static final class Meta {
         String filterKey;
         List<Group> roots=new ArrayList<>(),folders=new ArrayList<>(),collections=new ArrayList<>();
+        List<LocalLibrary.IndexNode> indexes=new ArrayList<>();
         List<Facet> tags=new ArrayList<>(),attributes=new ArrayList<>();int total,unfiled;boolean online=true;
     }
     static final class Page { List<Entry> items=new ArrayList<>();int total; }
@@ -32,7 +33,8 @@ final class LibraryStore {
         m.filterKey=filters.serialize();
         String folder=filters.folderId;
         if(!remote){
-            for(LocalLibrary.Root r:local.roots()){m.roots.add(new Group(r.uri,r.name,r.count));m.total+=r.count;}
+            for(LocalLibrary.Root r:local.roots()){Group g=new Group(r.uri,r.name,r.count);g.preserveStructure=r.preserveStructure;m.roots.add(g);m.total+=r.count;}
+            m.indexes.addAll(local.indexChildren(null));
             for(LocalLibrary.Folder f:local.folders())m.folders.add(new Group(f.id,f.name,f.count));
             for(LocalLibrary.Collection c:local.collections()){Group g=new Group(c.id,c.name,0);g.filters=c.filters;m.collections.add(g);}
             for(LocalLibrary.Attribute t:local.tagCatalog(folder))m.tags.add(new Facet(t.key,t.label,t.count));
@@ -83,6 +85,12 @@ final class LibraryStore {
         client.json(id==null?"POST":"PUT","/api/collections"+(id==null?"":"/"+RemoteClient.enc(id)),RemoteClient.object("name",clean(name,64),"filters",remoteFilters(f)));
     }
     void deleteCollection(String id)throws Exception{if(!remote)local.removeCollection(id);else client.json("DELETE","/api/collections/"+RemoteClient.enc(id),null);}
+    LocalLibrary.IndexNode createIndex(String parentId,String name){if(remote)throw new IllegalStateException("远端索引编辑将在 format 5 启用后开放");return local.createIndex(parentId,name);}
+    LocalLibrary.IndexNode updateIndex(LocalLibrary.IndexNode node,String name,String parentId){if(remote)throw new IllegalStateException("远端索引编辑将在 format 5 启用后开放");return local.updateIndex(node.id,name,parentId,node.version);}
+    void deleteIndex(LocalLibrary.IndexNode node){if(remote)throw new IllegalStateException("远端索引编辑将在 format 5 启用后开放");local.deleteIndex(node.id,node.version);}
+    void changeIndexMemberships(List<String> ids,List<String> add,List<String> remove){if(remote)throw new IllegalStateException("远端索引编辑将在 format 5 启用后开放");local.changeIndexMemberships(ids,add,remove);}
+    List<LocalLibrary.IndexNode> directIndexes(String id){if(remote)return Collections.emptyList();return local.directIndexes(id);}
+    List<LocalLibrary.IndexNode> allIndexes(){if(remote)return Collections.emptyList();return local.allIndexes();}
     static String clean(String s,int max){String v=s.trim();if(v.isEmpty()||v.length()>max)throw new IllegalArgumentException("请输入 1–"+max+" 个字符");return v;}
     static JSONObject remoteFilters(LocalFilters f){return RemoteClient.object("query",f.query,"tags",new JSONArray(f.tags),"attributes",new JSONArray(f.attributes),"rootId",f.rootUri,"folderId",f.folderId,"unorganized",f.unorganized,"sort",f.sort,"kind","");}
     static LocalFilters fromRemote(JSONObject value)throws Exception{JSONObject copy=new JSONObject(value.toString());copy.put("rootUri",copy.optString("rootId"));LocalFilters f=LocalFilters.parse(copy.toString());String kind=copy.optString("kind");if(!kind.isEmpty()&&!f.attributes.contains("type:"+kind))f.attributes.add("type:"+kind);return f;}

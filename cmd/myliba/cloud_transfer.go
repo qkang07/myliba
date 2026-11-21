@@ -248,7 +248,7 @@ func (c *cloudClient) uploadOriginalStream(ctx context.Context, taskID, fileID, 
 		return fail(transferBlocked, "无法初始化加密")
 	}
 	record := cloudRecord{
-		Format: 4, KeepHistory: history, LibraryID: c.libraryID(), ObjectID: objectID, RevisionID: revisionID,
+		Format: c.catalogWriterFormat(), KeepHistory: history, LibraryID: c.libraryID(), ObjectID: objectID, RevisionID: revisionID,
 		AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{},
 	}
 	manifest := cloudManifest{

@@ -38,8 +38,9 @@ type cloudDisk struct {
 	upgrades  map[string]time.Time
 	// A storage node admits catalog writes only after the Hub has committed
 	// the identical immutable record. Local clients and the Hub leave this nil.
-	catalogAdmission func(context.Context, string) error
-	roots            []cloudDiskRoot
+	catalogAdmission        func(context.Context, string) error
+	catalogCapabilityLookup func(context.Context, string, string) (hubClassificationCapabilities, error)
+	roots                   []cloudDiskRoot
 }
 
 type cloudDiskRoot struct {
@@ -441,7 +442,26 @@ func (d *cloudDisk) catalogCapabilities(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"maxCatalogFormat": 4, "minWriterFormat": minimum, "logicalFileIdentity": true})
+	payload := map[string]any{"maxCatalogFormat": 5, "minWriterFormat": minimum, "logicalFileIdentity": true}
+	if libraryID != "" && d.catalogCapabilityLookup != nil {
+		caps, err := d.catalogCapabilityLookup(r.Context(), libraryID, authorID)
+		if err != nil {
+			http.Error(w, "Hub catalog capabilities unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if caps.MinWriterFormat > minimum {
+			minimum = caps.MinWriterFormat
+		}
+		payload["maxCatalogFormat"] = caps.MaxCatalogFormat
+		payload["minWriterFormat"] = minimum
+		payload["logicalFileIdentity"] = caps.LogicalFileIdentity
+		payload["writerEpoch"] = caps.WriterEpoch
+		payload["writerRetired"] = caps.WriterRetired
+		payload["hubWriterGate"] = true
+		payload["libraryMinWriterFormat"] = caps.LibraryMinWriterFormat
+		payload["classificationMode"] = caps.ClassificationMode
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (d *cloudDisk) recordUpgradeLocked(record cloudRecord) {
@@ -539,7 +559,7 @@ func validateCloudRecord(data []byte) error {
 	}
 	if !validCloudHash(record.LibraryID) || record.ObjectID == "" || len(record.ObjectID) > 128 ||
 		record.RevisionID == "" || len(record.RevisionID) > 128 || record.AuthorID == "" || len(record.AuthorID) > 128 ||
-		record.Format > 4 || record.CreatedAt == "" || len(record.BlockIDs) > 10000 || record.AuthorEpoch < 0 || record.AuthorEpoch > 1<<40 {
+		record.Format > 5 || record.CreatedAt == "" || len(record.BlockIDs) > 10000 || record.AuthorEpoch < 0 || record.AuthorEpoch > 1<<40 {
 		return errors.New("invalid catalog record")
 	}
 	if _, err := time.Parse(time.RFC3339Nano, record.CreatedAt); err != nil {

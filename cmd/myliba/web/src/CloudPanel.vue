@@ -2,8 +2,8 @@
 import { onBeforeUnmount, ref, watch } from "vue";
 import { Cloud, RefreshCw, Upload, X } from "@lucide/vue";
 import {
-  diagnoseCloudPeer, executeLibraryCleanup, getCloudFiles, getCloudRecovery, getCloudRecoveryStatus, getCloudTransfers, getFileNameConflicts, getFolderConflicts, getLegacyFolders, getLibraryCleanupPlan, getLibraryMembers, getLibrarySyncStatus, getRenameConflicts, getRevisionConflicts, importCloudRecovery, mergeLegacyFolders, rejoinLibraryMember, renameLibraryFile, resolveFolderConflict, resolveRenameConflict, retireLibraryMember, selectLibraryCurrentRevision, selfAttestCloudRecovery, speedTestCloudPeer, uploadResourceToCloud,
-  type CloudPeerDiagnosis, type CloudRecoveryStatus, type CloudSpeedTest, type CloudTransferTask, type CloudView, type FileNameConflict, type FolderConflict, type LegacyFolderGroup, type LibraryCleanupPlan, type LibraryMember, type LibrarySyncStatus, type RenameConflict, type Resource, type RevisionConflict,
+  diagnoseCloudPeer, executeLibraryCleanup, getCloudFiles, getCloudRecovery, getCloudRecoveryStatus, getCloudTransfers, getFileNameConflicts, getFolderConflicts, getLibraryCleanupPlan, getLibraryMembers, getLibrarySyncStatus, getRenameConflicts, getRevisionConflicts, importCloudRecovery, rejoinLibraryMember, renameLibraryFile, resolveFolderConflict, resolveRenameConflict, retireLibraryMember, selectLibraryCurrentRevision, selfAttestCloudRecovery, speedTestCloudPeer, uploadResourceToCloud,
+  type CloudPeerDiagnosis, type CloudRecoveryStatus, type CloudSpeedTest, type CloudTransferTask, type CloudView, type FileNameConflict, type FolderConflict, type LibraryCleanupPlan, type LibraryMember, type LibrarySyncStatus, type RenameConflict, type Resource, type RevisionConflict,
 } from "./api";
 
 defineProps<{ resources: Resource[]; remote: boolean }>();
@@ -28,9 +28,6 @@ const folderConflicts = ref<FolderConflict[]>([]);
 const renameConflicts = ref<RenameConflict[]>([]);
 const fileNameConflicts = ref<FileNameConflict[]>([]);
 const revisionConflicts = ref<RevisionConflict[]>([]);
-const legacyFoldersOpen = ref(false);
-const legacyFolders = ref<LegacyFolderGroup[]>([]);
-const selectedLegacyFolders = ref<string[]>([]);
 const membersOpen = ref(false);
 const members = ref<LibraryMember[]>([]);
 const transfersOpen = ref(false);
@@ -50,11 +47,6 @@ async function refresh() {
   }
   catch (cause) { error.value = cause instanceof Error ? cause.message : "无法读取云库"; }
 }
-async function loadLegacyFolders() {
-  legacyFoldersOpen.value = true;
-  try { legacyFolders.value = (await getLegacyFolders()).items; error.value = ""; }
-  catch (cause) { error.value = cause instanceof Error ? cause.message : "无法读取旧文件夹"; }
-}
 async function loadMembers() {
   membersOpen.value = true;
   try { members.value = (await getLibraryMembers()).items; error.value = ""; }
@@ -68,17 +60,6 @@ async function retireMember(nodeId: string) {
 async function rejoinMember() {
   try { await rejoinLibraryMember(); await loadMembers(); }
   catch (cause) { error.value = cause instanceof Error ? cause.message : "无法重新加入"; }
-}
-async function mergeSelectedLegacyFolders() {
-  const selected = legacyFolders.value.filter(folder => selectedLegacyFolders.value.includes(folder.id));
-  if (selected.length < 2) return;
-  const name = window.prompt("合并后的文件夹名称", selected[0].name)?.trim();
-  if (!name) return;
-  try {
-    await mergeLegacyFolders(selected.map(folder => folder.id), name);
-    selectedLegacyFolders.value = [];
-    await Promise.all([loadLegacyFolders(), refresh()]);
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : "无法合并旧文件夹"; }
 }
 async function show() {
   open.value = true;
@@ -307,18 +288,8 @@ onBeforeUnmount(() => { if (timer) clearInterval(timer); });
 		  </div>
           <div class="cloud-heading"><strong>资源库管理</strong></div>
           <div class="cloud-search-filters">
-            <button class="button button-secondary" type="button" @click="loadLegacyFolders">旧文件夹身份</button>
             <button class="button button-secondary" type="button" @click="loadMembers">资源库成员</button>
             <button class="button button-secondary" type="button" @click="showTransfers">传输任务</button>
-          </div>
-          <div v-if="legacyFoldersOpen" class="cloud-saved-queries">
-            <p>同名旧文件夹按来源保持独立，选择两个或更多可合并。</p>
-            <p v-if="!legacyFolders.length">没有待合并的旧文件夹。</p>
-            <label v-for="folder in legacyFolders" :key="folder.id" class="hub-profile-row">
-              <input v-model="selectedLegacyFolders" type="checkbox" :value="folder.id" />
-              <span :title="folder.id">{{ folder.name }} · {{ folder.count }} 个文件 · 来源 {{ folder.sources.join("、") }}</span>
-            </label>
-            <button class="button button-secondary" type="button" :disabled="selectedLegacyFolders.length < 2" @click="mergeSelectedLegacyFolders">合并选中项</button>
           </div>
           <div v-if="membersOpen" class="cloud-saved-queries">
             <p>退役设备重新加入时按新成员处理。</p>

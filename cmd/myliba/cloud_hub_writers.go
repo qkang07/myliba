@@ -47,7 +47,7 @@ func newCatalogWriterRegistry(dir string) (*catalogWriterRegistry, error) {
 		if len(parts) != 2 || !validCloudHash(parts[0]) || parts[1] == "" || len(parts[1]) > 128 {
 			return nil, errors.New("invalid Hub catalog writer key")
 		}
-		if state.MinFormat < 3 || state.MinFormat > 4 || state.Epoch < 0 {
+		if state.MinFormat < 3 || state.MinFormat > 5 || state.Epoch < 0 {
 			return nil, errors.New("invalid Hub catalog writer state")
 		}
 		r.writers[key] = state
@@ -236,14 +236,22 @@ func (c *cloudHub) writerRoutes(mux *http.ServeMux, authorize func(http.Handler)
 		}
 		c.pruneMu.Lock()
 		defer c.pruneMu.Unlock()
+		previous, existed := c.writers.writerState(input.LibraryID, input.AuthorID)
+		if existed && !previous.Retired && previous.Epoch == input.Epoch {
+			writeJSON(w, 200, map[string]any{"rejoined": true, "alreadyRejoined": true, "epoch": input.Epoch})
+			return
+		}
 		if !c.writers.rejoin(input.LibraryID, input.AuthorID, input.Epoch) {
 			http.Error(w, "writer is not retired or epoch is not higher", 409)
 			return
 		}
 		if err := c.writers.saveLocked(); err != nil {
-			state := c.writers.writers[input.LibraryID+"\x00"+input.AuthorID]
-			state.Retired = true
-			c.writers.writers[input.LibraryID+"\x00"+input.AuthorID] = state
+			key := input.LibraryID + "\x00" + input.AuthorID
+			if existed {
+				c.writers.writers[key] = previous
+			} else {
+				delete(c.writers.writers, key)
+			}
 			http.Error(w, "cannot persist writer rejoin", 500)
 			return
 		}

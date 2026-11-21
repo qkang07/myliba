@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,12 +19,150 @@ type searchResponse struct {
 	Facets     struct {
 		Folders []libraryFolderFacet `json:"folders"`
 		Tags    []libraryTagFacet    `json:"tags"`
+		Indexes []libraryIndexFacet  `json:"indexes"`
 	} `json:"facets"`
 	Coverage struct {
 		LastCatalogAt       string            `json:"lastCatalogAt"`
 		Sources             []string          `json:"sources"`
 		SourceLastCatalogAt map[string]string `json:"sourceLastCatalogAt"`
 	} `json:"coverage"`
+}
+
+func TestLibrarySearchClassificationScopeFacetsKeywordAndCursor(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "classification-search.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if err = migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	runtime := testCloudRuntime(t, t.TempDir(), "")
+	runtime.db = db
+	client, err := newCloudClient(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish := func(id, name string) {
+		t.Helper()
+		index := fileIndexView{FileID: id, RevisionID: "v1", Name: name, Modified: "2026-11-10T00:00:00Z", Original: indexedContent{Size: 4, Local: []indexedLocation{{NodeID: "phone", ResourceRef: id}}}, ContentSize: 4, OrganizationKnown: true}
+		record := cloudRecord{Format: 4, LibraryID: client.libraryID(), ObjectID: id, RevisionID: "v1", AuthorID: "phone", CreatedAt: "2026-11-10T00:00:00Z", BlockIDs: []string{}}
+		record, err = client.sealManifest(record, cloudManifest{IndexOnly: true, LocalIndex: &index})
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(record)
+		if err = runtime.disk.put("catalog", cloudHash(raw), bytes.NewReader(raw), cloudMaxRecordSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []struct{ id, name string }{{"f1", "one.txt"}, {"f2", "two.txt"}, {"f3", "three.txt"}, {"f4", "four.txt"}} {
+		publish(file.id, file.name)
+	}
+	libraryID := client.libraryID()
+	stamp := now()
+	if _, err = db.Exec(`INSERT INTO classification_nodes(library_id,index_id,parent_id,name,name_key,origin,created_at,updated_at) VALUES
+		(?, 'photos', NULL, '照片', '照片', 'manual', ?, ?),
+		(?, 'trips', 'photos', '远行', '远行', 'manual', ?, ?),
+		(?, 'favorites', NULL, '收藏', '收藏', 'manual', ?, ?),
+		(?, 'empty', NULL, '空索引', '空索引', 'manual', ?, ?);
+		INSERT INTO classification_memberships(library_id,file_id,index_id,has_manual,has_automatic,updated_at) VALUES
+		(?, 'f1', 'photos', 1, 0, ?),
+		(?, 'f2', 'trips', 0, 1, ?),
+		(?, 'f3', 'trips', 1, 0, ?),
+		(?, 'f3', 'favorites', 1, 0, ?)`,
+		libraryID, stamp, stamp, libraryID, stamp, stamp, libraryID, stamp, stamp, libraryID, stamp, stamp,
+		libraryID, stamp, libraryID, stamp, libraryID, stamp, libraryID, stamp); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = rebuildClassificationAncestors(tx, libraryID); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	search := func(query string) (searchResponse, int, string) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		client.searchLibrary(response, httptest.NewRequest("GET", "/api/library/search?"+query, nil))
+		var result searchResponse
+		if response.Code == 200 {
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return result, response.Code, response.Body.String()
+	}
+	assertIDs := func(result searchResponse, wanted ...string) {
+		t.Helper()
+		actual := make([]string, 0, len(result.Items))
+		for _, file := range result.Items {
+			actual = append(actual, file.FileID)
+		}
+		if strings.Join(actual, ",") != strings.Join(wanted, ",") {
+			t.Fatalf("files = %v, want %v", actual, wanted)
+		}
+	}
+	direct, status, body := search("browseId=photos&browseMode=direct")
+	if status != 200 || direct.Total != 1 {
+		t.Fatalf("direct browse: %d %s", status, body)
+	}
+	assertIDs(direct, "f1")
+	subtree, status, body := search("browseId=photos&browseMode=subtree")
+	if status != 200 || subtree.Total != 3 {
+		t.Fatalf("subtree browse: %d %s", status, body)
+	}
+	assertIDs(subtree, "f1", "f3", "f2")
+	intersection, status, body := search("indexFilter=subtree%3Aphotos&indexFilter=direct%3Afavorites")
+	if status != 200 || intersection.Total != 1 {
+		t.Fatalf("index intersection: %d %s", status, body)
+	}
+	assertIDs(intersection, "f3")
+	unorganized, status, body := search("needsOrganizing=true")
+	if status != 200 || unorganized.Total != 2 {
+		t.Fatalf("needs organizing: %d %s", status, body)
+	}
+	assertIDs(unorganized, "f4", "f2")
+	keyword, status, body := search("query=%E8%BF%9C%E8%A1%8C&readable=false")
+	if status != 200 || keyword.Total != 2 {
+		t.Fatalf("classification keyword fallback: %d %s", status, body)
+	}
+	assertIDs(keyword, "f3", "f2")
+	facets, status, body := search("facetParentId=")
+	if status != 200 || len(facets.Facets.Indexes) != 3 {
+		t.Fatalf("root index facets: %d %s", status, body)
+	}
+	wantedCounts := map[string]int{"photos": 3, "favorites": 1, "empty": 0}
+	for _, facet := range facets.Facets.Indexes {
+		if facet.Mode != "subtree" || wantedCounts[facet.ID] != facet.Count {
+			t.Fatalf("index facet mismatch: %+v", facets.Facets.Indexes)
+		}
+		delete(wantedCounts, facet.ID)
+	}
+	if len(wantedCounts) != 0 {
+		t.Fatalf("missing index facets: %v", wantedCounts)
+	}
+	first, status, body := search("browseId=photos&limit=1")
+	if status != 200 || first.NextCursor == "" {
+		t.Fatalf("classification cursor setup: %d %s", status, body)
+	}
+	if _, err = db.Exec(`INSERT INTO classification_memberships(library_id,file_id,index_id,has_manual,has_automatic,updated_at) VALUES(?, 'f4', 'photos', 1, 0, ?)`, libraryID, now()); err != nil {
+		t.Fatal(err)
+	}
+	_, status, body = search("browseId=photos&limit=1&cursor=" + first.NextCursor)
+	if status != 409 || !strings.Contains(body, "cursorExpired") {
+		t.Fatalf("classification cursor was not invalidated: %d %s", status, body)
+	}
+	_, status, _ = search("browseId=missing")
+	if status != 404 {
+		t.Fatalf("missing classification index status = %d", status)
+	}
 }
 
 func TestLibrarySearchSQLFacetsCoverageAndPagination(t *testing.T) {

@@ -89,6 +89,9 @@ func (s *server) applyLogicalClassification(w http.ResponseWriter, fileID, kind 
 }
 
 func (s *server) addLogicalFileTag(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	fileID := strings.TrimSpace(r.PathValue("fileId"))
 	var input struct {
 		Name string `json:"name"`
@@ -108,6 +111,9 @@ func (s *server) addLogicalFileTag(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) removeLogicalFileTag(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	fileID, name := strings.TrimSpace(r.PathValue("fileId")), strings.TrimSpace(r.PathValue("tag"))
 	if name == "" || len([]rune(name)) > 40 {
 		writeError(w, 400, "标签无效")
@@ -120,6 +126,9 @@ func (s *server) removeLogicalFileTag(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) moveLogicalFile(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	fileID := strings.TrimSpace(r.PathValue("fileId"))
 	var input struct {
 		FolderName string `json:"folderName"`

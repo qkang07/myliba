@@ -45,13 +45,29 @@ func TestCloudLibraryReadTicketPinsRevisionAndPurpose(t *testing.T) {
 	client := &cloudClient{runtime: &cloudRuntime{id: "query"}}
 	copy(client.key[:], []byte("0123456789abcdef0123456789abcdef"))
 	path := "/api/cloud/files/object/versions/v1/file"
-	token, err := client.signLibraryReadTicket(libraryReadTicket{FileID:"logical",RevisionID:"v1",Purpose:"original",NodeID:"query",ResourceRef:"object",Path:path})
-	if err != nil { t.Fatal(err) }
-	record := cloudRecord{ObjectID:"object",RevisionID:"v1"}
-	manifest := cloudManifest{FileID:"logical"}
-	request := httptest.NewRequest("GET",path+"?libraryRead=1",nil);request.SetPathValue("revision","v1");request.Header.Set("X-Myliba-Library-Read",token)
-	if !client.authorizeCloudLibraryRead(httptest.NewRecorder(),request,record,manifest,"original") { t.Fatal("valid read rejected") }
-	if client.authorizeCloudLibraryRead(httptest.NewRecorder(),request,record,manifest,"thumbnail") { t.Fatal("cross-purpose read accepted") }
-	request.SetPathValue("revision","v2")
-	if client.authorizeCloudLibraryRead(httptest.NewRecorder(),request,record,manifest,"original") { t.Fatal("cross-revision read accepted") }
+	token, err := client.signLibraryReadTicket(libraryReadTicket{FileID: "logical", RevisionID: "v1", Purpose: "original", NodeID: "query", ResourceRef: "object", Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := cloudRecord{ObjectID: "object", RevisionID: "v1"}
+	manifest := cloudManifest{FileID: "logical"}
+	request := httptest.NewRequest("GET", path+"?libraryRead=1", nil)
+	request.SetPathValue("revision", "v1")
+	request.Header.Set("X-Myliba-Library-Read", token)
+	if !client.authorizeCloudLibraryRead(httptest.NewRecorder(), request, record, manifest, "original") {
+		t.Fatal("valid read rejected")
+	}
+	if client.authorizeCloudLibraryRead(httptest.NewRecorder(), request, record, manifest, "thumbnail") {
+		t.Fatal("cross-purpose read accepted")
+	}
+	protectedResponse := httptest.NewRecorder()
+	protectedManifest := manifest
+	protectedManifest.Protected = true
+	if client.authorizeCloudLibraryRead(protectedResponse, request, record, protectedManifest, "original") || protectedResponse.Code != 423 {
+		t.Fatalf("protected file accepted an already-issued read ticket: %d %s", protectedResponse.Code, protectedResponse.Body.String())
+	}
+	request.SetPathValue("revision", "v2")
+	if client.authorizeCloudLibraryRead(httptest.NewRecorder(), request, record, manifest, "original") {
+		t.Fatal("cross-revision read accepted")
+	}
 }

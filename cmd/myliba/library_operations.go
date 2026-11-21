@@ -63,7 +63,7 @@ func (c *cloudClient) publishLibraryReceipt() error {
 	if previous == digest {
 		return nil
 	}
-	record := cloudRecord{Format: 4, LibraryID: c.libraryID(), ObjectID: "library-receipt/" + c.runtime.id, RevisionID: newID(), AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{}}
+	record := cloudRecord{Format: c.catalogWriterFormat(), LibraryID: c.libraryID(), ObjectID: "library-receipt/" + c.runtime.id, RevisionID: newID(), AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{}}
 	record, err = c.sealManifest(record, cloudManifest{Receipt: &receipt})
 	if err != nil {
 		return err
@@ -446,6 +446,9 @@ func (s *server) libraryFolderConflicts(w http.ResponseWriter, _ *http.Request) 
 // selected folder becomes a new operation; it does not silently pick the last
 // received candidate.
 func (s *server) libraryResolveFolderConflict(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	fileID := strings.TrimSpace(r.PathValue("fileId"))
 	var input struct {
 		FolderName string `json:"folderName"`
@@ -547,6 +550,9 @@ func (s *server) libraryFolderRenameConflicts(w http.ResponseWriter, _ *http.Req
 // becomes a new rename operation from the currently applied name, so every node
 // converges instead of keeping divergent candidates.
 func (s *server) libraryResolveFolderRenameConflict(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	anchor := strings.TrimSpace(r.PathValue("anchor"))
 	var input struct {
 		FolderName string `json:"folderName"`
@@ -620,8 +626,25 @@ func (c *cloudClient) publishPendingOperations() error {
 	}
 	if err := rows.Err(); err != nil { rows.Close(); return err }
 	rows.Close()
+	active := classificationMode(c.runtime.db, c.libraryID()) == "active"
 	for _, op := range pending {
-		record := cloudRecord{Format: 4, LibraryID: c.libraryID(), ObjectID: "library-operation/" + op.AuthorID + "/" + fmt.Sprint(op.Counter), RevisionID: op.OpID, AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{}}
+		// Classification operations stay local until the library switch; the
+		// dedicated author keeps them from stalling the legacy frontier.
+		if knownClassificationOperationKind(op.Kind) && !active {
+			continue
+		}
+		if active && legacyClassificationOperationKind(op.Kind) {
+			// Out-of-boundary legacy writes from before the switch are archived
+			// as-is into this device's migration inbox instead of published.
+			if _, err = c.runtime.db.Exec(`INSERT OR IGNORE INTO library_legacy_held_operations(op_id,author_id,counter,kind,payload_json,seen_at) VALUES(?,?,?,?,?,?)`, op.OpID, op.AuthorID, op.Counter, op.Kind, string(op.Payload), now()); err != nil {
+				return err
+			}
+			if _, err = c.runtime.db.Exec(`UPDATE library_operations SET state='held',error='' WHERE op_id=?`, op.OpID); err != nil {
+				return err
+			}
+			continue
+		}
+		record := cloudRecord{Format: c.catalogWriterFormat(), LibraryID: c.libraryID(), ObjectID: "library-operation/" + op.AuthorID + "/" + fmt.Sprint(op.Counter), RevisionID: op.OpID, AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: now(), BlockIDs: []string{}}
 		record, err = c.sealManifest(record, cloudManifest{Operation: &op})
 		if err != nil {
 			return err
@@ -748,6 +771,11 @@ func (c *cloudClient) applyRemoteOperations() error {
 	})
 	for _, incoming := range received {
 		op := incoming.operation
+		// Shadow libraries keep remote classification operations on hold; they
+		// are consumed only after the format-5 switch activates the library.
+		if knownClassificationOperationKind(op.Kind) && classificationMode(c.runtime.db, c.libraryID()) != "active" {
+			continue
+		}
 		tx, err := c.runtime.db.Begin()
 		if err != nil {
 			return err
@@ -784,7 +812,27 @@ func (c *cloudClient) applyRemoteOperations() error {
 			continue
 		}
 		if err == nil && op.Counter == frontier+1 {
-			err = materializeLibraryOperation(tx, op)
+			if knownClassificationOperationKind(op.Kind) {
+				err = receiveClassificationOperation(tx, c.libraryID(), c.runtime.id, op)
+				if errors.Is(err, errClassificationPending) {
+					tx.Rollback() // Predecessors not observed yet: retry later.
+					continue
+				}
+				if errors.Is(err, errClassificationQuarantine) {
+					tx.Rollback()
+					if _, quarantineErr := c.runtime.db.Exec(`INSERT INTO library_operation_quarantine(op_id,author_id,counter,kind,reason,seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(op_id) DO NOTHING`, op.OpID, op.AuthorID, op.Counter, op.Kind, err.Error(), now()); quarantineErr != nil {
+						return quarantineErr
+					}
+					continue
+				}
+			} else if legacyClassificationOperationKind(op.Kind) && classificationModeTx(tx) == "active" {
+				// A late legacy grouping write from an unupgraded author: keep
+				// the record and the author's counter continuity, but do not
+				// let it overwrite the activated projection (§9.2).
+				_, err = tx.Exec(`INSERT OR IGNORE INTO library_legacy_held_operations(op_id,author_id,counter,kind,payload_json,seen_at) VALUES(?,?,?,?,?,?)`, op.OpID, op.AuthorID, op.Counter, op.Kind, string(op.Payload), now())
+			} else {
+				err = materializeLibraryOperation(tx, op)
+			}
 			if err == nil {
 				_, err = tx.Exec(`INSERT INTO library_operation_inbox(op_id,author_id,counter,received_at,applied_at) VALUES(?,?,?,?,?)`, op.OpID, op.AuthorID, op.Counter, now(), now())
 			}
@@ -793,9 +841,10 @@ func (c *cloudClient) applyRemoteOperations() error {
 			}
 		}
 		if err == nil {
-			var localAuthor string
+			var localAuthor, classificationAuthor string
 			_ = tx.QueryRow(`SELECT value FROM library_operation_identity WHERE key='author'`).Scan(&localAuthor)
-			if localAuthor == op.AuthorID {
+			_ = tx.QueryRow(`SELECT value FROM library_operation_identity WHERE key='classification-author'`).Scan(&classificationAuthor)
+			if localAuthor == op.AuthorID || (classificationAuthor != "" && classificationAuthor == op.AuthorID) {
 				_, err = tx.Exec(`UPDATE library_operations SET state='acknowledged' WHERE op_id=?`, op.OpID)
 			}
 		}
@@ -947,8 +996,18 @@ func knownLibraryOperationKind(kind string) bool {
 	case "folder.create", "folder.rename", "folder.delete", "folder.move", "tag.add", "tag.remove", "file.trash", "file.restore", "file.delete", "file.rename", "file.version.select", "member.retire", "member.join":
 		return true
 	default:
-		return false
+		return knownClassificationOperationKind(kind)
 	}
+}
+
+// legacyClassificationOperationKind marks pre-switch grouping writes. Once the
+// library is active they are archived for review, never materialized (§9.2).
+func legacyClassificationOperationKind(kind string) bool {
+	switch kind {
+	case "folder.create", "folder.rename", "folder.delete", "folder.move", "tag.add", "tag.remove":
+		return true
+	}
+	return false
 }
 
 func materializeLibraryOperation(tx *sql.Tx, op libraryOperationEnvelope) error {

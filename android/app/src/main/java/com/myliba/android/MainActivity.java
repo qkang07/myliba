@@ -301,6 +301,7 @@ public final class MainActivity extends Activity {
         batchDock.setBackgroundColor(PAPER);batchDock.setPadding(ui.d(16),ui.d(9),ui.d(16),ui.d(10));
         LinearLayout top=ui.row();top.addView(ui.iconButton("x","退出选择",()->{selecting=false;selected.clear();updateResults();}));top.addView(ui.text("已选 "+selected.size()+" 项",14,INK,true),ui.weight());TextView all=ui.chip("全选结果",false,this::selectAll);top.addView(all);batchDock.addView(top);
         LinearLayout actions=ui.row();TextView tags=ui.button("编辑标签",true,this::batchTags);TextView move=ui.button("归入文件夹",false,()->moveSheet(new ArrayList<>(selected)));tags.setEnabled(!selected.isEmpty()&&!busy);move.setEnabled(!selected.isEmpty()&&!busy);tags.setAlpha(selected.isEmpty()?.45f:1);move.setAlpha(selected.isEmpty()?.45f:1);actions.addView(tags,new LinearLayout.LayoutParams(0,ui.d(46),1));LinearLayout.LayoutParams mp=new LinearLayout.LayoutParams(0,ui.d(46),1);mp.leftMargin=ui.d(10);actions.addView(move,mp);batchDock.addView(actions,ui.top(6));
+        if(!home){TextView indexes=ui.button("加入索引",false,()->indexMembershipSheet(new ArrayList<>(selected)));indexes.setEnabled(!selected.isEmpty()&&!busy);indexes.setAlpha(selected.isEmpty()?.45f:1);batchDock.addView(indexes,ui.top(6));}
         if(!home){TextView trash=ui.button("移入回收站",false,()->{List<String> ids=new ArrayList<>(selected);confirm("回收选中的文件？","将隐藏这 "+ids.size()+" 个文件；原件和分类保留，可从本机回收站恢复。",()->mutate(localStore,()->db.trashUris(ids),"已移入回收站",null));});trash.setEnabled(!selected.isEmpty()&&!busy);trash.setAlpha(selected.isEmpty()?.45f:1);batchDock.addView(trash,ui.top(6));}
     }
     private void batchTags(){
@@ -338,11 +339,12 @@ public final class MainActivity extends Activity {
         EditText searchFiles=new EditText(this);searchFiles.setSingleLine(true);searchFiles.setTextSize(14);searchFiles.setHint("搜索文件名、文件夹或标签");sheet.body.addView(searchFiles,ui.top(8));
         final boolean[] allSources={true},trashed={false};final int[] sortIndex={0};final String[] sortKeys={"name_asc","name_desc","modified_desc","modified_asc","ingested_desc","ingested_asc"};final String[] sortLabels={"名称顺序","名称倒序","最近修改","最早修改","最近入库","最早入库"};
         final String[] folderId={""};final LinkedHashSet<String> tags=new LinkedHashSet<>();final JSONObject[] facets={null};
+        final String[] browseId={""},browseName={""},browseMode={"subtree"},organizing={""};final ArrayList<String> browseIds=new ArrayList<>(),browseNames=new ArrayList<>();final LinkedHashMap<String,String> indexFilters=new LinkedHashMap<>(),indexFilterNames=new LinkedHashMap<>();
         final String[] deviceId={""};final JSONArray[] sources={null};final JSONObject[] sourceTimes={null},sourceFrontiers={null};final JSONArray[] offlineSources={null},unindexedSources={null};
         final int[] typeIndex={0},groupIndex={0},copyIndex={0},readIndex={0};
         final String[] typeKeys={"","image","video","audio","document","other"},typeLabels={"全部","图片","视频","音频","文档","其他"};
         final String[] stateKeys={"","true","false"},groupLabels={"全部","已归组","未归组"},copyLabels={"全部","有云库副本","仅设备来源"},readLabels={"全部","可读","暂不可读"};
-        Runnable[] reset={null};
+        Runnable[] reset={null},refreshLabels={null};
         TextView scopeButton=ui.button("范围：全部来源",false,()->{allSources[0]=!allSources[0];reset[0].run();});sheet.body.addView(scopeButton,ui.top(8));
         TextView lifecycleButton=ui.button("资源库",false,()->{trashed[0]=!trashed[0];reset[0].run();});sheet.body.addView(lifecycleButton,ui.top(5));
         TextView deviceButton=ui.button("来源设备：全部",false,()->{MobileUi.Sheet picker=ui.sheet("来源设备","显示已有文件位置或应用回执的节点");picker.body.addView(ui.item("cloud","所有设备",null,()->{deviceId[0]="";picker.close();reset[0].run();}));JSONArray options=sources[0];if(options!=null)for(int i=0;i<options.length();i++){String node=options.optString(i);if(node.isEmpty())continue;picker.body.addView(ui.item("cloud",node,sourceCoverageLabel(node,sourceTimes[0],sourceFrontiers[0],offlineSources[0],unindexedSources[0]),()->{deviceId[0]=node;allSources[0]=true;picker.close();reset[0].run();}),ui.top(5));}picker.show();});sheet.body.addView(deviceButton,ui.top(5));
@@ -353,7 +355,49 @@ public final class MainActivity extends Activity {
         TextView readButton=ui.button("当前可读：全部",false,()->{readIndex[0]=(readIndex[0]+1)%stateKeys.length;reset[0].run();});sheet.body.addView(readButton,ui.top(5));
         TextView folderButton=ui.button("文件夹：全部",false,()->{MobileUi.Sheet picker=ui.sheet("筛选文件夹","按去重后的逻辑文件统计");picker.body.addView(ui.item("folder","全部文件夹","清除文件夹筛选",()->{folderId[0]="";picker.close();reset[0].run();}));JSONArray options=facets[0]==null?null:facets[0].optJSONArray("folders");if(options!=null)for(int i=0;i<options.length();i++){JSONObject option=options.optJSONObject(i);if(option==null)continue;picker.body.addView(ui.item("folder",option.optString("name"),option.optInt("count")+" 个文件",()->{folderId[0]=option.optString("id");picker.close();reset[0].run();}),ui.top(5));}picker.show();});sheet.body.addView(folderButton,ui.top(5));
         TextView tagButton=ui.button("标签：全部",false,()->{MobileUi.Sheet picker=ui.sheet("筛选标签","选择多个标签时，文件必须同时包含这些标签");picker.body.addView(ui.item("tag","清除标签筛选","显示全部标签",()->{tags.clear();picker.close();reset[0].run();}));JSONArray options=facets[0]==null?null:facets[0].optJSONArray("tags");if(options!=null)for(int i=0;i<options.length();i++){JSONObject option=options.optJSONObject(i);if(option==null)continue;String name=option.optString("name");picker.body.addView(ui.item("tag",name+(tags.contains(name)?" ✓":""),option.optInt("count")+" 个文件",()->{if(!tags.add(name))tags.remove(name);picker.close();reset[0].run();}),ui.top(5));}picker.show();});sheet.body.addView(tagButton,ui.top(5));
-        sheet.body.addView(ui.button("常用查询",false,()->{MobileUi.Sheet picker=ui.sheet("常用查询","只保存条件，应用时重新检索当前索引");TextView loadingQueries=ui.text("正在读取…",12,MUTED,false);picker.body.addView(loadingQueries);picker.show();io.execute(()->{try{JSONArray saved=current.client.array("/api/library/queries");runOnUiThread(()->{if(destroyed||!picker.dialog.isShowing())return;picker.body.removeAllViews();if(saved.length()==0)picker.body.addView(ui.text("还没有保存的查询",12,MUTED,false));for(int i=0;i<saved.length();i++){JSONObject item=saved.optJSONObject(i);if(item==null)continue;JSONObject filters=item.optJSONObject("filters");if(filters==null)continue;String savedId=item.optString("id"),savedName=item.optString("name");LinearLayout row=ui.row();row.addView(ui.item("search",savedName,null,()->{String savedScope=filters.optString("scope","all");allSources[0]=!"cloud".equals(savedScope);trashed[0]="trashed".equals(filters.optString("lifecycle"));deviceId[0]=savedScope.startsWith("device:")?savedScope.substring(7):"";folderId[0]=filters.optString("folderId");tags.clear();JSONArray savedTags=filters.optJSONArray("tags");if(savedTags!=null)for(int j=0;j<savedTags.length();j++)tags.add(savedTags.optString(j));sortIndex[0]=Math.max(0,Arrays.asList(sortKeys).indexOf(filters.optString("sort")));typeIndex[0]=Math.max(0,Arrays.asList(typeKeys).indexOf(filters.optString("type")));groupIndex[0]=filters.has("grouped")?(filters.optBoolean("grouped")?1:2):0;copyIndex[0]=filters.has("cloudCopy")?(filters.optBoolean("cloudCopy")?1:2):0;readIndex[0]=filters.has("readable")?(filters.optBoolean("readable")?1:2):0;picker.close();searchFiles.setText(filters.optString("query"));reset[0].run();}),new LinearLayout.LayoutParams(0,-2,1));row.addView(ui.button("删除",false,()->{io.execute(()->{try{current.client.json("DELETE","/api/library/queries/"+RemoteClient.enc(savedId),null);runOnUiThread(()->{if(!destroyed){picker.close();toast("已删除常用查询");}});}catch(Exception ex){runOnUiThread(()->{if(!destroyed)toast("删除失败："+message(ex));});}});}),ui.top(2));picker.body.addView(row,ui.top(6));}});}catch(Exception ex){runOnUiThread(()->{if(!destroyed&&picker.dialog.isShowing())loadingQueries.setText("读取失败："+message(ex));});}});}),ui.top(8));
+        TextView indexButton=ui.button("分类索引：全部",false,()->{MobileUi.Sheet picker=ui.sheet("分类索引",browseId[0].isEmpty()?"选择根索引":"继续选择下级索引，或逐级返回");picker.body.addView(ui.item("folder","全部索引","清除当前索引范围",()->{browseIds.clear();browseNames.clear();browseId[0]="";browseName[0]="";picker.close();reset[0].run();}));if(!browseIds.isEmpty())picker.body.addView(ui.item("back","返回上一级",browseNames.size()>1?browseNames.get(browseNames.size()-2):"全部索引",()->{browseIds.remove(browseIds.size()-1);browseNames.remove(browseNames.size()-1);browseId[0]=browseIds.isEmpty()?"":browseIds.get(browseIds.size()-1);browseName[0]=browseNames.isEmpty()?"":browseNames.get(browseNames.size()-1);picker.close();reset[0].run();}),ui.top(5));JSONArray options=facets[0]==null?null:facets[0].optJSONArray("indexes");if(options!=null)for(int i=0;i<options.length();i++){JSONObject option=options.optJSONObject(i);if(option==null)continue;String id=option.optString("id"),name=option.optString("name");picker.body.addView(ui.item("folder",name,option.optInt("count")+" 个文件 · 包含下级",()->{browseIds.add(id);browseNames.add(name);browseId[0]=id;browseName[0]=name;picker.close();reset[0].run();}),ui.top(5));}if(options==null||options.length()==0)picker.body.addView(ui.text("此层没有下级索引",12,MUTED,false),ui.top(7));picker.show();});sheet.body.addView(indexButton,ui.top(5));
+        TextView indexModeButton=ui.button("索引范围：包含下级",false,()->{if(browseId[0].isEmpty()){toast("请先选择分类索引");return;}browseMode[0]="direct".equals(browseMode[0])?"subtree":"direct";reset[0].run();});sheet.body.addView(indexModeButton,ui.top(5));
+        TextView indexFilterButton=ui.button("附加索引条件：0",false,()->{MobileUi.Sheet picker=ui.sheet("附加索引条件","多个条件取交集；先在分类索引中定位节点，再加入条件");if(!browseId[0].isEmpty())picker.body.addView(ui.item("plus",indexFilters.containsKey(browseId[0])?"切换当前节点条件范围":"加入当前节点条件",browseName[0].isEmpty()?browseId[0]:browseName[0],()->{String id=browseId[0];if(!indexFilters.containsKey(id)){indexFilters.put(id,"subtree");indexFilterNames.put(id,browseNames.isEmpty()?(browseName[0].isEmpty()?id:browseName[0]):TextUtils.join(" / ",browseNames));}else if("subtree".equals(indexFilters.get(id)))indexFilters.put(id,"direct");else{indexFilters.remove(id);indexFilterNames.remove(id);}picker.close();reset[0].run();}));for(String id:new ArrayList<>(indexFilters.keySet()))picker.body.addView(ui.item("folder",indexFilterNames.get(id),"direct".equals(indexFilters.get(id))?"仅本层 · 点击移除":"包含下级 · 点击移除",()->{indexFilters.remove(id);indexFilterNames.remove(id);picker.close();reset[0].run();}),ui.top(5));if(!indexFilters.isEmpty())picker.body.addView(ui.item("trash","清除全部附加条件",null,()->{indexFilters.clear();indexFilterNames.clear();picker.close();reset[0].run();}),ui.top(8));picker.show();});sheet.body.addView(indexFilterButton,ui.top(5));
+        TextView organizingButton=ui.button("整理状态：全部",false,()->{organizing[0]=organizing[0].isEmpty()?"true":"true".equals(organizing[0])?"false":"";reset[0].run();});sheet.body.addView(organizingButton,ui.top(5));
+        sheet.body.addView(ui.button("常用查询",false,()->{
+            MobileUi.Sheet picker=ui.sheet("常用查询","只保存条件，应用时重新检索当前索引");
+            TextView loadingQueries=ui.text("正在读取…",12,MUTED,false);picker.body.addView(loadingQueries);picker.show();
+            io.execute(()->{try{
+                JSONArray saved=current.client.array("/api/library/queries");
+                runOnUiThread(()->{
+                    if(destroyed||!picker.dialog.isShowing())return;
+                    picker.body.removeAllViews();
+                    if(saved.length()==0)picker.body.addView(ui.text("还没有保存的查询",12,MUTED,false));
+                    for(int i=0;i<saved.length();i++){
+                        JSONObject item=saved.optJSONObject(i);if(item==null)continue;
+                        JSONObject filters=item.optJSONObject("filters");if(filters==null)continue;
+                        String savedId=item.optString("id"),savedName=item.optString("name");LinearLayout row=ui.row();
+                        row.addView(ui.item("search",savedName,null,()->{
+                            String savedScope=filters.optString("scope","all");allSources[0]=!"cloud".equals(savedScope);trashed[0]="trashed".equals(filters.optString("lifecycle"));deviceId[0]=savedScope.startsWith("device:")?savedScope.substring(7):"";folderId[0]=filters.optString("folderId");
+                            tags.clear();JSONArray savedTags=filters.optJSONArray("tags");if(savedTags!=null)for(int j=0;j<savedTags.length();j++)tags.add(savedTags.optString(j));
+                            sortIndex[0]=Math.max(0,Arrays.asList(sortKeys).indexOf(filters.optString("sort")));typeIndex[0]=Math.max(0,Arrays.asList(typeKeys).indexOf(filters.optString("type")));groupIndex[0]=filters.has("grouped")?(filters.optBoolean("grouped")?1:2):0;copyIndex[0]=filters.has("cloudCopy")?(filters.optBoolean("cloudCopy")?1:2):0;readIndex[0]=filters.has("readable")?(filters.optBoolean("readable")?1:2):0;
+                            browseIds.clear();browseNames.clear();browseId[0]=filters.optString("browseId");browseName[0]="";browseMode[0]=filters.optString("browseMode","subtree");organizing[0]=filters.has("needsOrganizing")?String.valueOf(filters.optBoolean("needsOrganizing")):"";
+                            indexFilters.clear();indexFilterNames.clear();JSONArray savedIndexFilters=filters.optJSONArray("indexFilters");if(savedIndexFilters!=null)for(int j=0;j<savedIndexFilters.length();j++){JSONObject filter=savedIndexFilters.optJSONObject(j);if(filter!=null){String id=filter.optString("id");if(!id.isEmpty()){indexFilters.put(id,filter.optString("mode","subtree"));indexFilterNames.put(id,id);}}}
+                            final String restoredBrowseId=browseId[0];final ArrayList<String> restoredFilterIds=new ArrayList<>(indexFilters.keySet());
+                            picker.close();searchFiles.setText(filters.optString("query"));reset[0].run();
+                            if(!restoredBrowseId.isEmpty()||!restoredFilterIds.isEmpty())io.execute(()->{
+                                JSONObject restoredBrowse=null;LinkedHashMap<String,String> restoredNames=new LinkedHashMap<>();
+                                if(!restoredBrowseId.isEmpty())try{restoredBrowse=current.client.json("GET","/api/library/indexes/"+RemoteClient.enc(restoredBrowseId),null);}catch(Exception ex){AppLog.info("Saved query browse path: "+ex.getMessage());}
+                                for(String id:restoredFilterIds)try{restoredNames.put(id,classificationPath(current.client.json("GET","/api/library/indexes/"+RemoteClient.enc(id),null)));}catch(Exception ex){AppLog.info("Saved query index filter path: "+ex.getMessage());}
+                                final JSONObject resolvedBrowse=restoredBrowse;
+                                runOnUiThread(()->{
+                                    if(destroyed||!sheet.dialog.isShowing())return;
+                                    if(resolvedBrowse!=null&&restoredBrowseId.equals(browseId[0])){browseIds.clear();browseNames.clear();appendClassificationPath(resolvedBrowse,browseIds,browseNames);browseName[0]=browseNames.isEmpty()?"":browseNames.get(browseNames.size()-1);}
+                                    for(Map.Entry<String,String> entry:restoredNames.entrySet())if(indexFilters.containsKey(entry.getKey()))indexFilterNames.put(entry.getKey(),entry.getValue());
+                                    refreshLabels[0].run();
+                                });
+                            });
+                        }),new LinearLayout.LayoutParams(0,-2,1));
+                        row.addView(ui.button("删除",false,()->{io.execute(()->{try{current.client.json("DELETE","/api/library/queries/"+RemoteClient.enc(savedId),null);runOnUiThread(()->{if(!destroyed){picker.close();toast("已删除常用查询");}});}catch(Exception ex){runOnUiThread(()->{if(!destroyed)toast("删除失败："+message(ex));});}});}),ui.top(2));picker.body.addView(row,ui.top(6));
+                    }
+                });
+            }catch(Exception ex){runOnUiThread(()->{if(!destroyed&&picker.dialog.isShowing())loadingQueries.setText("读取失败："+message(ex));});}});
+        }),ui.top(8));
         sheet.body.addView(ui.button("保存当前条件",false,()->prompt("保存常用查询","查询名称","",name->{
             String scope=allSources[0]?(deviceId[0].isEmpty()?"all":"device:"+deviceId[0]):"cloud";
             io.execute(()->{try{
@@ -362,33 +406,13 @@ public final class MainActivity extends Activity {
                 if(groupIndex[0]>0)filters.put("grouped",groupIndex[0]==1);
                 if(copyIndex[0]>0)filters.put("cloudCopy",copyIndex[0]==1);
                 if(readIndex[0]>0)filters.put("readable",readIndex[0]==1);
+                if(!browseId[0].isEmpty())filters.put("browseId",browseId[0]).put("browseMode",browseMode[0]);
+                if(!indexFilters.isEmpty()){JSONArray savedFilters=new JSONArray();for(Map.Entry<String,String> filter:indexFilters.entrySet())savedFilters.put(new JSONObject().put("id",filter.getKey()).put("mode",filter.getValue()));filters.put("indexFilters",savedFilters);}
+                if(!organizing[0].isEmpty())filters.put("needsOrganizing","true".equals(organizing[0]));
                 current.client.json("POST","/api/library/queries",new JSONObject().put("name",name).put("filters",filters));
                 runOnUiThread(()->{if(!destroyed)toast("已保存常用查询");});
             }catch(Exception ex){runOnUiThread(()->{if(!destroyed)toast("保存失败："+message(ex));});}});
         })),ui.top(5));
-        sheet.body.addView(ui.button("旧文件夹身份",false,()->{
-            MobileUi.Sheet picker=ui.sheet("旧文件夹身份","同名旧文件夹按来源保持独立，请明确选择要合并的实体");
-            TextView status=ui.text("正在读取…",12,MUTED,false);picker.body.addView(status);picker.show();
-            io.execute(()->{try{
-                if(!current.client.selectedNodeId.isEmpty())current.client.selectNode(current.client.selectedNodeId);
-                JSONArray groups=current.client.json("GET","/api/library/legacy-folders",null).optJSONArray("items");
-                runOnUiThread(()->{if(destroyed||!picker.dialog.isShowing())return;picker.body.removeAllViews();
-                    if(groups==null||groups.length()==0){picker.body.addView(ui.text("没有待合并的旧文件夹",12,MUTED,false));return;}
-                    HashSet<String> selected=new HashSet<>();HashMap<String,String> names=new HashMap<>();
-                    TextView chosen=ui.text("已选 0 项",12,MUTED,false);picker.body.addView(chosen);
-                    for(int i=0;i<groups.length();i++){JSONObject group=groups.optJSONObject(i);if(group==null)continue;
-                        String id=group.optString("id"),name=group.optString("name");names.put(id,name);
-                        picker.body.addView(ui.item("folder",name+" · "+group.optInt("count")+" 个文件",group.optJSONArray("sources")+" · "+id,()->{if(!selected.add(id))selected.remove(id);chosen.setText("已选 "+selected.size()+" 项："+android.text.TextUtils.join("、",selected));}),ui.top(5));
-                    }
-                    picker.body.addView(ui.button("合并选中项",false,()->{if(selected.size()<2){toast("请至少选择两个旧文件夹");return;}
-                        String proposed=names.get(selected.iterator().next());prompt("合并旧文件夹","目标文件夹名称",proposed==null?"":proposed,name->{if(name.trim().isEmpty())return;
-                            io.execute(()->{try{current.client.json("POST","/api/library/legacy-folders/merge",new JSONObject().put("folderIds",new JSONArray(selected)).put("name",name.trim()));
-                                runOnUiThread(()->{if(!destroyed){picker.close();toast("已合并旧文件夹");reset[0].run();}});
-                            }catch(Exception ex){runOnUiThread(()->{if(!destroyed)toast("合并失败："+message(ex));});}});
-                        });}),ui.top(8));
-                });
-            }catch(Exception ex){runOnUiThread(()->{if(!destroyed&&picker.dialog.isShowing())status.setText("读取失败："+message(ex));});}});
-        }),ui.top(5));
         TextView state=ui.text("正在检索…",12,MUTED,false);sheet.body.addView(state,ui.top(10));
         LinearLayout rows=ui.col();sheet.body.addView(rows,ui.top(6));
         final String queryNode=current.client.selectedNodeId;
@@ -396,10 +420,11 @@ public final class MainActivity extends Activity {
         Runnable[] load={null};
         load[0]=()->{
             if(loading[0]||destroyed||!sheet.dialog.isShowing())return;
-            loading[0]=true;int version=request[0];String next=cursor[0],query=searchFiles.getText().toString().trim();String wantedFolder=folderId[0],sort=sortKeys[sortIndex[0]],scope=allSources[0]?(deviceId[0].isEmpty()?"all":"device:"+deviceId[0]):"cloud";String wantedType=typeKeys[typeIndex[0]],wantedGroup=stateKeys[groupIndex[0]],wantedCopy=stateKeys[copyIndex[0]],wantedRead=stateKeys[readIndex[0]];List<String> wantedTags=new ArrayList<>(tags);state.setText("正在检索…");
+            loading[0]=true;int version=request[0];String next=cursor[0],query=searchFiles.getText().toString().trim();String wantedFolder=folderId[0],sort=sortKeys[sortIndex[0]],scope=allSources[0]?(deviceId[0].isEmpty()?"all":"device:"+deviceId[0]):"cloud";String wantedType=typeKeys[typeIndex[0]],wantedGroup=stateKeys[groupIndex[0]],wantedCopy=stateKeys[copyIndex[0]],wantedRead=stateKeys[readIndex[0]],wantedBrowse=browseId[0],wantedBrowseMode=browseMode[0],wantedOrganizing=organizing[0];List<String> wantedTags=new ArrayList<>(tags);Map<String,String> wantedIndexFilters=new LinkedHashMap<>(indexFilters);state.setText("正在检索…");
             io.execute(()->{try{
-                String path="/api/library/search?scope="+Uri.encode(scope)+"&lifecycle="+(trashed[0]?"trashed":"active")+"&limit=50&query="+Uri.encode(query)+"&sort="+sort+(wantedFolder.isEmpty()?"":"&folderId="+Uri.encode(wantedFolder))+(wantedType.isEmpty()?"":"&type="+wantedType)+(wantedGroup.isEmpty()?"":"&grouped="+wantedGroup)+(wantedCopy.isEmpty()?"":"&cloudCopy="+wantedCopy)+(wantedRead.isEmpty()?"":"&readable="+wantedRead);
+                String path="/api/library/search?scope="+Uri.encode(scope)+"&lifecycle="+(trashed[0]?"trashed":"active")+"&limit=50&query="+Uri.encode(query)+"&sort="+sort+(wantedFolder.isEmpty()?"":"&folderId="+Uri.encode(wantedFolder))+(wantedType.isEmpty()?"":"&type="+wantedType)+(wantedGroup.isEmpty()?"":"&grouped="+wantedGroup)+(wantedCopy.isEmpty()?"":"&cloudCopy="+wantedCopy)+(wantedRead.isEmpty()?"":"&readable="+wantedRead)+(wantedBrowse.isEmpty()?"":"&browseId="+Uri.encode(wantedBrowse)+"&browseMode="+wantedBrowseMode)+(wantedOrganizing.isEmpty()?"":"&needsOrganizing="+wantedOrganizing)+"&facetParentId="+Uri.encode(wantedBrowse);
                 for(String tag:wantedTags)path+="&tag="+Uri.encode(tag);
+                for(Map.Entry<String,String> filter:wantedIndexFilters.entrySet())path+="&indexFilter="+Uri.encode(filter.getValue()+":"+filter.getKey());
                 if(!next.isEmpty())path+="&cursor="+Uri.encode(next);
                 LibrarySearchCache cache=new LibrarySearchCache(this);LibraryOfflineIndex offlineIndex=new LibraryOfflineIndex(this);JSONObject result;boolean usedCache=false;
                 try{if(next.startsWith("offline:"))throw new IOException("offline index page");if(!queryNode.isEmpty()&&!queryNode.equals(current.client.selectedNodeId))current.client.selectNode(queryNode);result=current.client.json("GET",path,null);if(next.isEmpty()){cache.save(current.client.base,queryNode,path,result);io.execute(()->{try{if(!queryNode.isEmpty()&&!queryNode.equals(current.client.selectedNodeId))current.client.selectNode(queryNode);offlineIndex.sync(current.client,queryNode);}catch(Exception ex){AppLog.info("Offline index refresh: "+ex.getMessage());}finally{offlineIndex.close();}});}}
@@ -436,10 +461,20 @@ public final class MainActivity extends Activity {
                 });
             }catch(Exception ex){runOnUiThread(()->{if(destroyed||!sheet.dialog.isShowing()||version!=request[0])return;loading[0]=false;if(!next.isEmpty()&&ex instanceof RemoteClient.Failure&&((RemoteClient.Failure)ex).status==409){reset[0].run();return;}state.setText("检索失败："+message(ex));});}});
         };
-        reset[0]=()->{request[0]++;cursor[0]="";loading[0]=false;more[0]=null;rows.removeAllViews();scopeButton.setText(allSources[0]?"范围：全部来源":"范围：仅云库");lifecycleButton.setText(trashed[0]?"回收站":"资源库");deviceButton.setText("来源设备："+(deviceId[0].isEmpty()?"全部":deviceId[0]));sortButton.setText("排序："+sortLabels[sortIndex[0]]);typeButton.setText("类型："+typeLabels[typeIndex[0]]);groupButton.setText("归组："+groupLabels[groupIndex[0]]);copyButton.setText("云库副本："+copyLabels[copyIndex[0]]);readButton.setText("当前可读："+readLabels[readIndex[0]]);folderButton.setText("文件夹："+(folderId[0].isEmpty()?"全部":folderId[0]));tagButton.setText("标签："+(tags.isEmpty()?"全部":TextUtils.join("、",tags)));load[0].run();};
+        refreshLabels[0]=()->{
+            scopeButton.setText(allSources[0]?"范围：全部来源":"范围：仅云库");lifecycleButton.setText(trashed[0]?"回收站":"资源库");deviceButton.setText("来源设备："+(deviceId[0].isEmpty()?"全部":deviceId[0]));sortButton.setText("排序："+sortLabels[sortIndex[0]]);typeButton.setText("类型："+typeLabels[typeIndex[0]]);groupButton.setText("归组："+groupLabels[groupIndex[0]]);copyButton.setText("云库副本："+copyLabels[copyIndex[0]]);readButton.setText("当前可读："+readLabels[readIndex[0]]);folderButton.setText("文件夹："+(folderId[0].isEmpty()?"全部":folderId[0]));tagButton.setText("标签："+(tags.isEmpty()?"全部":TextUtils.join("、",tags)));indexButton.setText("分类索引："+(browseIds.isEmpty()?(browseId[0].isEmpty()?"全部":"已保存索引"):TextUtils.join(" / ",browseNames)));indexModeButton.setText("索引范围："+("direct".equals(browseMode[0])?"仅本层":"包含下级"));
+            ArrayList<String> summaries=new ArrayList<>();for(Map.Entry<String,String> filter:indexFilters.entrySet()){String name=indexFilterNames.get(filter.getKey());summaries.add((name==null?filter.getKey():name)+("direct".equals(filter.getValue())?"（仅本层）":"（含下级）"));}indexFilterButton.setText(summaries.isEmpty()?"附加索引条件：0":"附加索引条件："+TextUtils.join("；",summaries));
+            organizingButton.setText("整理状态："+(organizing[0].isEmpty()?"全部":"true".equals(organizing[0])?"待整理":"已整理"));
+        };
+        reset[0]=()->{request[0]++;cursor[0]="";loading[0]=false;more[0]=null;rows.removeAllViews();refreshLabels[0].run();load[0].run();};
         searchFiles.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int st,int c,int a){}public void afterTextChanged(Editable e){}public void onTextChanged(CharSequence s,int st,int before,int count){handler.removeCallbacks(reset[0]);handler.postDelayed(reset[0],250);}});
         sheet.show();reset[0].run();
     }
+    private static void appendClassificationPath(JSONObject node,List<String> ids,List<String> names){
+        JSONArray ancestors=node.optJSONArray("ancestors");if(ancestors!=null)for(int i=0;i<ancestors.length();i++){JSONObject ancestor=ancestors.optJSONObject(i);if(ancestor==null)continue;String id=ancestor.optString("id"),name=ancestor.optString("name");if(!id.isEmpty()&&!name.isEmpty()){ids.add(id);names.add(name);}}
+        String id=node.optString("id"),name=node.optString("name");if(!id.isEmpty()&&!name.isEmpty()){ids.add(id);names.add(name);}
+    }
+    private static String classificationPath(JSONObject node){ArrayList<String> ids=new ArrayList<>(),names=new ArrayList<>();appendClassificationPath(node,ids,names);return names.isEmpty()?node.optString("id"):TextUtils.join(" / ",names);}
     private void cloudClassificationSheet(LibraryStore current,String queryNode,JSONObject file,Runnable refresh){
         String fileId=file.optString("fileId",file.optString("id"));MobileUi.Sheet sheet=ui.sheet("整理文件",file.optString("name"));
         sheet.body.addView(ui.item("cloud","修改显示名称",file.optString("name"),()->prompt("修改显示名称","不会修改来源设备上的文件名",file.optString("name"),name->{if(name.trim().isEmpty())return;sheet.close();editCloudClassification(current,queryNode,fileId,"PUT","name",new JSONObjectValue("fileName",name.trim()),refresh);})),ui.top(7));
@@ -621,6 +656,16 @@ public final class MainActivity extends Activity {
         if(home)body.addView(ui.item("cloud","搜索全部来源","搜索已同步的设备索引和云库文件",this::cloudFilesSheet),ui.top(8));
         if(!home&&meta.filterKey!=null&&meta.roots.isEmpty())body.addView(ui.item("plus","添加来源目录","选择允许资源库扫描的手机目录",this::pickTree),ui.top(8));
 
+        if(!home){
+            section(body,"索引","新建索引",()->indexPrompt(null,null));
+            body.addView(ui.text("同一文件可加入多个索引；目录生成的索引也可自由改名和移动。",12,MUTED,false),ui.top(5));
+            for(LocalLibrary.IndexNode index:meta.indexes){
+                LinearLayout row=ui.item("folder",index.name,index.count+" 项资源"+(index.hasChildren?" · 含下级":""),()->indexMenu(index));
+                body.addView(row,ui.top(8));
+            }
+            if(meta.indexes.isEmpty())body.addView(ui.text("还没有索引，可先建立整理结构。",12,MUTED,false),ui.top(8));
+        }
+
         section(body,"我的文件夹","新建文件夹",()->folderPrompt(null));
         body.addView(ui.text("为资源分组，原文件保留在原位置。",12,MUTED,false),ui.top(5));
         for(LibraryStore.Group folder:meta.folders){
@@ -711,6 +756,29 @@ public final class MainActivity extends Activity {
         }));sheet.show();input.requestFocus();
     }
     private void folderPrompt(LibraryStore.Group g){prompt(g==null?"新建文件夹":"重命名文件夹","文件夹名称",g==null?"":g.name,value->{LibraryStore s=store();mutate(s,()->s.saveFolder(g==null?null:g.id,value),"文件夹已保存",null);});}
+	private void indexPrompt(LocalLibrary.IndexNode parent,LocalLibrary.IndexNode editing){
+		String title=editing==null?(parent==null?"新建索引":"在“"+parent.name+"”下新建索引"):"重命名索引";
+		prompt(title,"索引名称",editing==null?"":editing.name,value->{LibraryStore target=localStore;mutate(target,()->{if(editing==null)target.createIndex(parent==null?null:parent.id,value);else target.updateIndex(editing,value,editing.parentId);},editing==null?"索引已创建":"索引已重命名",null);});
+	}
+	private void indexMenu(LocalLibrary.IndexNode node){
+		MobileUi.Sheet sheet=ui.sheet(node.name,node.path+(node.count>0?" · "+node.count+" 项资源":" · 空索引"));
+		sheet.body.addView(ui.item("plus","新建子索引","在当前索引下建立一层",()->{sheet.close();indexPrompt(node,null);}));
+		sheet.body.addView(ui.item("edit","重命名",null,()->{sheet.close();indexPrompt(null,node);}),ui.top(7));
+		sheet.body.addView(ui.item("folder","调整上级","索引归属和文件位置不变",()->{sheet.close();indexMoveSheet(node);}),ui.top(7));
+		section(sheet.body,"下级索引",null,null);TextView loadingChildren=ui.text("正在读取…",12,MUTED,false);sheet.body.addView(loadingChildren,ui.top(8));
+		sheet.body.addView(ui.item("trash","删除空索引","有文件或子索引时不能删除",()->{sheet.close();confirm("删除“"+node.name+"”？","仅删除空索引，文件和物理位置不受影响。",()->mutate(localStore,()->localStore.deleteIndex(node),"索引已删除",null));}),ui.top(14));
+		sheet.show();
+		io.execute(()->{try{List<LocalLibrary.IndexNode> children=db.indexChildren(node.id);runOnUiThread(()->{if(destroyed||!sheet.dialog.isShowing())return;sheet.body.removeView(loadingChildren);if(children.isEmpty())sheet.body.addView(ui.text("没有下级索引",12,MUTED,false),ui.top(8));else for(LocalLibrary.IndexNode child:children){LinearLayout row=ui.item("folder",child.name,child.count+" 项资源",()->{sheet.close();indexMenu(child);});sheet.body.addView(row,ui.top(7));}});}catch(Exception ex){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing())loadingChildren.setText("读取失败："+message(ex));});}});
+	}
+	private void indexMoveSheet(LocalLibrary.IndexNode node){
+		MobileUi.Sheet sheet=ui.sheet("调整上级",node.path);TextView loading=ui.text("正在读取索引…",12,MUTED,false);sheet.body.addView(loading);sheet.show();
+		io.execute(()->{try{List<LocalLibrary.IndexNode> options=db.allIndexes();runOnUiThread(()->{if(destroyed||!sheet.dialog.isShowing())return;sheet.body.removeAllViews();sheet.body.addView(ui.item("folder","顶层索引",node.parentId==null?"当前上级":"移动到顶层",()->{sheet.close();mutate(localStore,()->localStore.updateIndex(node,node.name,null),"索引层级已更新",null);}));for(LocalLibrary.IndexNode option:options){if(option.id.equals(node.id)||option.path.startsWith(node.path+" / "))continue;sheet.body.addView(ui.item("folder",option.path,option.id.equals(node.parentId)?"当前上级":"设为上级",()->{sheet.close();mutate(localStore,()->localStore.updateIndex(node,node.name,option.id),"索引层级已更新",null);}),ui.top(6));}});}catch(Exception ex){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing()){sheet.body.removeAllViews();sheet.body.addView(ui.text("读取失败："+message(ex),12,RED,false));}});}});
+	}
+	private void indexMembershipSheet(List<String> ids){
+		if(ids.isEmpty())return;if(home){toast("共享库索引写入将在 format 5 启用后开放");return;}
+		MobileUi.Sheet sheet=ui.sheet("编辑索引归属",ids.size()+" 个文件 · 可加入多个索引");TextView loading=ui.text("正在读取索引…",12,MUTED,false);sheet.body.addView(loading);sheet.show();
+		io.execute(()->{try{List<LocalLibrary.IndexNode> all=localStore.allIndexes();List<LocalLibrary.IndexNode> direct=ids.size()==1?localStore.directIndexes(ids.get(0)):Collections.emptyList();runOnUiThread(()->{if(destroyed||!sheet.dialog.isShowing())return;sheet.body.removeAllViews();if(ids.size()==1){section(sheet.body,"已加入",null,null);if(direct.isEmpty())sheet.body.addView(ui.text("尚未加入任何索引",12,MUTED,false),ui.top(7));for(LocalLibrary.IndexNode node:direct)sheet.body.addView(ui.item("x",node.path,"点击从此索引移除",()->{sheet.close();mutate(localStore,()->localStore.changeIndexMemberships(ids,Collections.emptyList(),Collections.singletonList(node.id)),"已从索引移除",null);}),ui.top(6));}section(sheet.body,"加入索引","新建",()->{sheet.close();indexPrompt(null,null);});if(all.isEmpty())sheet.body.addView(ui.text("还没有索引，请先新建。",12,MUTED,false),ui.top(8));for(LocalLibrary.IndexNode node:all)sheet.body.addView(ui.item("folder",node.path,node.count+" 项资源",()->{sheet.close();mutate(localStore,()->localStore.changeIndexMemberships(ids,Collections.singletonList(node.id),Collections.emptyList()),"已加入索引",null);}),ui.top(6));});}catch(Exception ex){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing()){sheet.body.removeAllViews();sheet.body.addView(ui.text("读取失败："+message(ex),12,RED,false));}});}});
+	}
     private void folderMenu(LibraryStore.Group g){LibraryStore target=store();if(target!=null&&target.remote&&g.passwordProtected){busy=true;io.execute(()->{try{boolean unlocked=target.folderUnlocked(g.id);runOnUiThread(()->{busy=false;if(destroyed)return;if(unlocked)showFolderMenu(g,target);else folderPasswordPrompt(g.id,false);});}catch(Exception e){runOnUiThread(()->{busy=false;if(!destroyed)toast(message(e));});}});return;}showFolderMenu(g,target);}
     private void showFolderMenu(LibraryStore.Group g,LibraryStore target){MobileUi.Sheet s=ui.sheet(g.name,g.count+" 个文件");s.body.addView(ui.item("edit","重命名",null,()->{s.close();folderPrompt(g);}));if(target!=null&&target.remote)s.body.addView(ui.item("shield",g.passwordProtected?"修改文件夹密码":"设置文件夹密码","限制远程资源访问",()->{s.close();folderPasswordPrompt(g.id,true);}));if(target!=null&&target.remote&&g.passwordProtected)s.body.addView(ui.item("shield","取消文件夹密码",null,()->{s.close();confirm("取消文件夹密码？",g.name,()->mutate(target,()->target.setFolderPassword(g.id,""),"文件夹密码已取消",null));}));s.body.addView(ui.item("trash","删除文件夹","其中的文件会回到“未分入文件夹”，原文件不受影响",()->{s.close();confirm("删除“"+g.name+"”？","只移除虚拟文件夹，文件和标签会保留。",()->{LibraryStore st=store();mutate(st,()->st.deleteFolder(g.id),"文件夹已删除",()->{if(f().folderId.equals(g.id))f().folderId="unfiled";});});}));s.show();}
     private void saveCollection(LibraryStore.Group g){LocalFilters snapshot=g==null?f().copy():g.filters.copy();prompt(g==null?"保存为常用查询":"重命名查询","例如：旅行图片",g==null?"":g.name,name->{LibraryStore s=store();mutate(s,()->s.saveCollection(g==null?null:g.id,name,snapshot),"常用查询已保存",null);});}
@@ -721,7 +789,8 @@ public final class MainActivity extends Activity {
         body.addView(ui.text("扫描已授权的手机目录，收录其中的原文件。",12,MUTED,false),ui.top(5));
         for(LocalLibrary.Root root:managementRoots){
             LibraryStore.Group group=new LibraryStore.Group(root.uri,root.name,root.count);
-            body.addView(ui.item("folder",shortPath(root.name),root.count+" 个文件",()->rootMenu(group)),ui.top(8));
+            group.preserveStructure=root.preserveStructure;
+            body.addView(ui.item("folder",shortPath(root.name),root.count+" 个文件",()->rootIndexMenu(group)),ui.top(8));
         }
         renderStorageDirectories(body);
         section(body,"Hub 连接",null,null);
@@ -861,13 +930,45 @@ public final class MainActivity extends Activity {
         if(receipts>0)sheet.footer.addView(ui.button("查看节点回执（"+receipts+"）",false,()->{sheet.close();receiptSheet();}),ui.top(9));
         boolean retired;String memberNode=ResourceNodeService.ensureID(this);try(LocalLibrary library=new LocalLibrary(this)){retired=library.retiredMember(memberNode);}
         if(retired)sheet.footer.addView(ui.button("重新加入资源库（新作者 epoch）",false,()->{state.setText("正在从 Hub 完整引导…");io.execute(()->{try{
-            new LocalIndexPublisher(this).sync(settings.getString("hub",""),savedToken,memberNode);
-            try(LocalLibrary library=new LocalLibrary(this)){library.rejoinMember(memberNode);}
+            LocalIndexPublisher publisher=new LocalIndexPublisher(this);publisher.sync(settings.getString("hub",""),savedToken,memberNode);
+            long nextEpoch;try(LocalLibrary library=new LocalLibrary(this)){nextEpoch=library.rejoinEpoch(memberNode);}
+            publisher.rejoinWriter(settings.getString("hub",""),savedToken,memberNode,nextEpoch);
+            try(LocalLibrary library=new LocalLibrary(this)){library.rejoinMember(memberNode,nextEpoch);}
             LocalIndexJobService.schedule(this,true);runOnUiThread(()->{if(!destroyed){sheet.close();toast("已创建新作者 epoch，等待同步");}});
         }catch(Exception ex){runOnUiThread(()->{if(!destroyed)state.setText("重新加入失败："+message(ex));});}});}),ui.top(9));
-        if(indexSync.isChecked())sheet.footer.addView(ui.button("立即同步索引",false,()->{LocalIndexJobService.schedule(this,true);toast("已请求系统执行索引同步");}),ui.top(9));
+        if(indexSync.isChecked()){
+            sheet.footer.addView(ui.button("立即同步索引",false,()->{LocalIndexJobService.schedule(this,true);toast("已请求系统执行索引同步");}),ui.top(9));
+            if(settings.getBoolean("index_enabled",false)&&hubStore!=null&&hubStore.remote)sheet.footer.addView(ui.button("分类索引同步状态",false,()->{sheet.close();classificationStatusSheet();}),ui.top(9));
+        }
         if(ResourceNodeService.running)sheet.footer.addView(ui.button("停止资源节点",false,()->{stopService(new Intent(this,ResourceNodeService.class));sheet.close();handler.postDelayed(this::render,350);}),ui.top(9));
         sheet.show();
+    }
+    private void classificationStatusSheet(){
+        SharedPreferences settings=getSharedPreferences(ResourceNodeService.PREFS,MODE_PRIVATE);
+        if(!settings.getBoolean("index_enabled",false)){toast("请先保存并启用索引同步");return;}
+        if(hubStore==null||!hubStore.remote){toast("请先连接可查询统一资源库的节点");return;}
+        String keyText;try{keyText=CloudSecretStore.read(settings,"index_key");LocalIndexCrypto.key(keyText);}catch(Exception ex){toast("无法读取索引密钥："+message(ex));return;}
+        String expectedLibrary;try{expectedLibrary=LocalIndexCrypto.hash(LocalIndexCrypto.key(keyText));}catch(Exception impossible){toast("索引密钥无效");return;}
+        MobileUi.Sheet sheet=ui.sheet("分类索引同步","新库直接使用多级分类索引和 catalog format 5，不需要执行版本切换或迁移旧分类。");
+        TextView state=ui.text("正在读取查询节点与 Hub 状态…",13,MUTED,false);sheet.body.addView(state);sheet.show();
+        loadClassificationStatus(sheet,state,expectedLibrary);
+    }
+    private void loadClassificationStatus(MobileUi.Sheet sheet,TextView state,String expectedLibrary){
+        RemoteClient client=hubStore==null?null:hubStore.client;if(client==null){state.setText("查询节点连接已关闭");state.setTextColor(RED);return;}
+        io.execute(()->{try{
+            JSONObject status=client.json("GET","/api/library/classification-status",null);
+            runOnUiThread(()->{if(destroyed||!sheet.dialog.isShowing())return;renderClassificationStatus(sheet,state,status,expectedLibrary);});
+        }catch(Exception ex){runOnUiThread(()->{if(!destroyed&&sheet.dialog.isShowing()){state.setText("读取分类同步状态失败："+message(ex));state.setTextColor(RED);sheet.footer.removeAllViews();sheet.footer.addView(ui.button("重试",false,()->loadClassificationStatus(sheet,state,expectedLibrary)));}});}});
+    }
+    private void renderClassificationStatus(MobileUi.Sheet sheet,TextView state,JSONObject status,String expectedLibrary){
+        sheet.footer.removeAllViews();String library=status.optString("libraryId"),mode=status.optString("mode");int format=status.optInt("catalogFormat");JSONObject hub=status.optJSONObject("hub");
+        if(!expectedLibrary.equals(library)){state.setText("当前查询节点使用另一文集。\n手机文集 "+expectedLibrary.substring(0,12)+"… · 查询节点 "+(library.length()>=12?library.substring(0,12)+"…":library));state.setTextColor(RED);sheet.footer.addView(ui.button("关闭",false,sheet::close));return;}
+        boolean connected=hub!=null&&hub.optBoolean("connected");String hubMode=connected?hub.optString("classificationMode","unknown"):"offline";int hubFormat=connected?hub.optInt("maxCatalogFormat"):0;
+        state.setText("本机模式 "+mode+" · catalog format "+format+"\n索引 "+status.optInt("nodeCount")+" 个 · 直接归属 "+status.optInt("membershipCount")+" 条 · 待发操作 "+status.optInt("pendingOperations")+" 条\nHub "+(connected?(hubMode+" · 最高 format "+hubFormat):"当前不可达")+("legacy".equals(hubMode)?"\n首次 format 5 同步会建立文集格式门槛。":""));
+        state.setTextColor("active".equals(mode)&&format==5?GREEN:RED);
+        sheet.footer.addView(ui.button("立即同步",true,()->{LocalIndexJobService.schedule(this,true);toast("已请求系统执行索引同步");sheet.close();}),ui.top(8));
+        sheet.footer.addView(ui.button("刷新状态",false,()->loadClassificationStatus(sheet,state,expectedLibrary)),ui.top(8));
+        sheet.footer.addView(ui.button("关闭",false,sheet::close),ui.top(8));
     }
     private void cloudStorageSheet(){
         android.content.SharedPreferences settings=getSharedPreferences(CloudStorageService.PREFS,MODE_PRIVATE);
@@ -944,6 +1045,15 @@ public final class MainActivity extends Activity {
     private LinearLayout scrollBody(){ScrollView scroll=new ScrollView(this);scroll.setVerticalScrollBarEnabled(false);LinearLayout body=ui.col();body.setPadding(ui.d(20),0,ui.d(20),ui.d(24));scroll.addView(body);content.addView(scroll,new LinearLayout.LayoutParams(-1,-1));return body;}
     private void section(LinearLayout parent,String label,String action,Runnable run){LinearLayout row=ui.row();row.addView(ui.text(label,15,INK,true),ui.weight());if(action!=null){TextView t=ui.text(action,12,GREEN,true);ui.pad(t,4,8);if(run!=null)t.setOnClickListener(v->run.run());row.addView(t);}parent.addView(row,ui.top(24));}
     private void rootMenu(LibraryStore.Group g){MobileUi.Sheet s=ui.sheet(g.name,g.count+" 个已索引文件");s.body.addView(ui.item("refresh","重新扫描","读取新增或已修改的文件",()->{s.close();scan(Uri.parse(g.id));}));s.body.addView(ui.item("trash","移除索引目录","移除本地索引和标签，原文件仍保留",()->{s.close();confirm("移除这个目录？","此目录的本地索引和标签将删除，原文件不受影响。",()->mutate(localStore,()->{db.removeRoot(g.id);try{getContentResolver().releasePersistableUriPermission(Uri.parse(g.id),Intent.FLAG_GRANT_READ_URI_PERMISSION);}catch(SecurityException ignored){}},"已移除目录",()->{if(localFilters.rootUri.equals(g.id))localFilters.rootUri="";}));}));s.show();}
+    private void rootIndexMenu(LibraryStore.Group g){
+        MobileUi.Sheet s=ui.sheet(g.name,g.count+" 个已索引文件");
+        s.body.addView(ui.item("refresh","重新扫描","读取新增或已修改的文件",()->{s.close();scan(Uri.parse(g.id));}));
+        s.body.addView(ui.item("folder",g.preserveStructure?"目录结构索引：已开启":"目录结构索引：已关闭",g.preserveStructure?"新文件按实际父目录自动加入索引":"只收录文件位置，不自动建立索引",()->{
+            s.close();boolean enabled=!g.preserveStructure;db.setRootPreserveStructure(g.id,enabled);toast(enabled?"已开启；重新扫描后为未处理文件建立目录索引":"已关闭；已有索引和归属保留");loadSettingsMetadata();if(enabled)scan(Uri.parse(g.id));
+        }),ui.top(8));
+        s.body.addView(ui.item("trash","移除索引目录","移除本地文件列表；分类事实与原文件保留",()->{s.close();confirm("移除这个目录？","此目录的本地文件列表将删除，已同步的逻辑身份和索引归属保留，原文件不受影响。",()->mutate(localStore,()->{db.removeRoot(g.id);try{getContentResolver().releasePersistableUriPermission(Uri.parse(g.id),Intent.FLAG_GRANT_READ_URI_PERMISSION);}catch(SecurityException ignored){}},"已移除目录",()->{if(localFilters.rootUri.equals(g.id))localFilters.rootUri="";}));}),ui.top(8));
+        s.show();
+    }
     private void addClearablePassword(LinearLayout parent,EditText field,int top){
         LinearLayout row=ui.row();row.setGravity(Gravity.CENTER_VERTICAL);
         row.addView(field,new LinearLayout.LayoutParams(0,-2,1));
@@ -1061,6 +1171,7 @@ public final class MainActivity extends Activity {
         section(sheet.body,"手动标签","添加",()->tagPrompt(Collections.singletonList(e.id),()->refreshDetail(sheet,s,e)));
         if(e.tags.isEmpty())sheet.body.addView(ui.text("加一个标签，下次更容易找到。",12,MUTED,false),ui.top(9));else{MobileUi.Flow flow=ui.new Flow();for(String t:e.tags)flow.addView(ui.chip(t+"  ×",true,()->confirm("移除标签“"+t+"”？",e.name,()->mutate(s,()->s.removeTag(Collections.singletonList(e.id),t),"标签已移除",()->refreshDetail(sheet,s,e)))));sheet.body.addView(flow,ui.top(10));}
         sheet.body.addView(ui.item("folder","归入文件夹",folderName(e.folderId),()->{sheet.close();moveSheet(Collections.singletonList(e.id));}),ui.top(20));
+        if(!s.remote)sheet.body.addView(ui.item("folder","编辑索引归属","可加入多个索引，原文件位置不变",()->{sheet.close();indexMembershipSheet(Collections.singletonList(e.id));}),ui.top(10));
         if(s.remote){sheet.body.addView(ui.item("spark","获取建议标签","根据服务端的资源信息获取建议",()->suggestTags(sheet,s,e)),ui.top(10));}
         TextView open=ui.button("全屏预览",true,()->{sheet.close();openPreview(e);});open.setEnabled(e.available);open.setAlpha(e.available?1:.45f);sheet.footer.addView(open,ui.top(8));
         if(s.remote)sheet.footer.addView(ui.button("下载原文件",false,()->download(s,e)),ui.top(8));

@@ -99,6 +99,9 @@ func (s *server) serveLibraryRead(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 409, "来源文件版本已变化")
 			return
 		}
+		if s.rejectProtectedLibraryRead(w, currentFile) {
+			return
+		}
 		r.SetPathValue("id", resource)
 		switch asset {
 		case "file":
@@ -124,6 +127,9 @@ func (s *server) serveLibraryRead(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "来源文件版本已变化")
 		return
 	}
+	if s.rejectProtectedLibraryRead(w, currentFile) {
+		return
+	}
 	r.SetPathValue("id", resource)
 	switch asset {
 	case "file":
@@ -142,6 +148,15 @@ func (c *cloudClient) authorizeCloudLibraryRead(w http.ResponseWriter, r *http.R
 	fileID := manifest.FileID
 	if fileID == "" {
 		fileID = record.ObjectID
+	}
+	protected, protectionErr := c.protectedLibraryFileIDs()
+	if protectionErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "无法确认文件保护状态")
+		return false
+	}
+	if manifest.Protected || protected[fileID] {
+		writeError(w, http.StatusLocked, "文件已由来源保护，读取权限已撤回")
+		return false
 	}
 	ticket, err := c.verifyLibraryReadTicket(r.Header.Get("X-Myliba-Library-Read"), r.URL.Path, purpose, c.runtime.id, record.ObjectID)
 	if err != nil && purpose == "thumbnail" {
@@ -295,6 +310,15 @@ func (c *cloudClient) openLibraryStreamSession(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusForbidden, "读取凭据无效或已过期")
 		return
 	}
+	protected, protectionErr := c.protectedLibraryFileIDs()
+	if protectionErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "无法确认文件保护状态")
+		return
+	}
+	if protected[fileID] {
+		writeError(w, http.StatusLocked, "文件已由来源保护，读取权限已撤回")
+		return
+	}
 	token, err := c.signLibraryStreamSession(libraryStreamSession{FileID: ticket.FileID, RevisionID: ticket.RevisionID, NodeID: ticket.NodeID, ResourceRef: ticket.ResourceRef, Scope: input.Scope, PathPrefix: prefix})
 	if err != nil {
 		writeError(w, 500, "无法签发流媒体会话")
@@ -303,6 +327,28 @@ func (c *cloudClient) openLibraryStreamSession(w http.ResponseWriter, r *http.Re
 	expires := time.Now().Add(libraryStreamTTL)
 	http.SetCookie(w, &http.Cookie{Name: libraryStreamCookieName, Value: token, Path: "/api", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: int(libraryStreamTTL.Seconds())})
 	writeJSON(w, http.StatusOK, map[string]any{"token": token, "scope": input.Scope, "expires": expires.Unix()})
+}
+
+func (s *server) rejectProtectedLibraryRead(w http.ResponseWriter, fileID string) bool {
+	localProtected, err := s.logicalFileProtected(fileID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "无法确认文件保护状态")
+		return true
+	}
+	sharedProtected := false
+	if s.cloud != nil {
+		protected, protectionErr := s.cloud.protectedLibraryFileIDs()
+		if protectionErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "无法确认共享保护状态")
+			return true
+		}
+		sharedProtected = protected[fileID]
+	}
+	if localProtected || sharedProtected {
+		writeError(w, http.StatusLocked, "文件已由来源保护，读取权限已撤回")
+		return true
+	}
+	return false
 }
 
 func ticketResourceForPrefix(prefix string) string {

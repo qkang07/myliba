@@ -491,26 +491,69 @@ export interface LibrarySearchPage {
   peerStatus?: Record<string, CloudPeerStatus>;
   directEndpoint: string;
   lan?: string[];
-  facets: { folders: Array<{ id: string; name: string; count: number }>; tags: Array<{ name: string; count: number }> };
+  facets: { folders: Array<{ id: string; name: string; count: number }>; tags: Array<{ name: string; count: number }>; indexes: Array<{ id: string; name: string; mode: "subtree"; count: number }> };
 }
 
-export interface LegacyFolderGroup { id: string; name: string; sources: string[]; count: number }
+export interface ClassificationIndex {
+  id: string;
+  parentId: string;
+  name: string;
+  ancestors: Array<{ id: string; parentId: string; name: string }>;
+  hasChildren: boolean;
+  version: string;
+  count: number;
+}
+
+export function getLibraryIndexes(parentId?: string, query = "", cursor = "") {
+	const params = new URLSearchParams({ limit: "200" });
+	if (parentId) params.set("parentId", parentId);
+	if (query.trim()) params.set("q", query.trim());
+	if (cursor) params.set("cursor", cursor);
+  return request<{ items: ClassificationIndex[]; nextCursor: string; generation: string }>(`/api/library/indexes?${params}`);
+}
+
+export function getLibraryIndex(id: string) {
+  return request<ClassificationIndex>(`/api/library/indexes/${encodeURIComponent(id)}`);
+}
+
 export interface LibraryMember { nodeId: string; epoch: number; state: "active" | "retired"; updatedAt: string; lastReceiptAt: string }
 export function getLibraryMembers() { return request<{ items: LibraryMember[] }>("/api/library/members"); }
 export function retireLibraryMember(nodeId: string) { return request<{ nodeId: string; epoch: number; state: string }>(`/api/library/members/${encodeURIComponent(nodeId)}/retire`, { method: "POST" }); }
 export function rejoinLibraryMember() { return request<{ nodeId: string; epoch: number; state: string }>("/api/library/members/rejoin", { method: "POST" }); }
-export interface LibraryOfflineIndexPage { items: Array<CloudFile & { lifecycle: "active" | "trashed" }>; total: number; nextCursor: string; generation: string; libraryId: string; nodeId: string; syncedAt: string }
+export interface LibraryOfflineIndexPage {
+  items: Array<CloudFile & { lifecycle: "active" | "trashed"; indexes: Array<{ indexId: string; manual: boolean }> }>;
+  total: number;
+  nextCursor: string;
+  generation: string;
+  classificationVersion: number;
+	classificationNodeTotal: number;
+  libraryId: string;
+  nodeId: string;
+  syncedAt: string;
+}
 export function getLibraryOfflineIndex(cursor = "") {
   const params = new URLSearchParams({ scope: "all", limit: "200" });
   if (cursor) params.set("cursor", cursor);
   return request<LibraryOfflineIndexPage>(`/api/library/offline-index?${params}`);
 }
-export function getLegacyFolders() { return request<{ items: LegacyFolderGroup[] }>("/api/library/legacy-folders"); }
-export function mergeLegacyFolders(folderIds: string[], name: string) {
-  return request<{ folderId: string; name: string; files: number }>("/api/library/legacy-folders/merge", { method: "POST", body: JSON.stringify({ folderIds, name }) });
+
+export interface LibraryOfflineClassificationPage {
+	total: number;
+	nextCursor: string;
+	generation: string;
+	classificationVersion: number;
+	classificationEncoding: "gzip+base64+json";
+	classificationPayload: string;
+	libraryId: string;
+	nodeId: string;
 }
 
-export function searchLibraryFiles(input: { query?: string; scope?: string; lifecycle?: "active" | "trashed"; folderId?: string; tags?: string[]; type?: "image" | "video" | "audio" | "document" | "other"; grouped?: boolean; cloudCopy?: boolean; readable?: boolean; sort?: "name_asc" | "name_desc" | "modified_desc" | "modified_asc" | "ingested_desc" | "ingested_asc"; cursor?: string; limit?: number }) {
+export function getLibraryOfflineClassification(generation: string, cursor = "") {
+	const params = new URLSearchParams({ scope: "all", section: "classification", generation, limit: "500" });
+	if (cursor) params.set("cursor", cursor);
+	return request<LibraryOfflineClassificationPage>(`/api/library/offline-index?${params}`);
+}
+export function searchLibraryFiles(input: { query?: string; scope?: string; lifecycle?: "active" | "trashed"; folderId?: string; tags?: string[]; type?: "image" | "video" | "audio" | "document" | "other"; grouped?: boolean; cloudCopy?: boolean; readable?: boolean; browseId?: string; browseMode?: "direct" | "subtree"; indexFilters?: Array<{ id: string; mode: "direct" | "subtree" }>; needsOrganizing?: boolean; facetParentId?: string; sort?: "name_asc" | "name_desc" | "modified_desc" | "modified_asc" | "ingested_desc" | "ingested_asc"; cursor?: string; limit?: number }) {
   const params = new URLSearchParams();
   params.set("scope", input.scope || "all");
   if (input.lifecycle) params.set("lifecycle", input.lifecycle);
@@ -520,6 +563,13 @@ export function searchLibraryFiles(input: { query?: string; scope?: string; life
   if (input.grouped !== undefined) params.set("grouped", String(input.grouped));
   if (input.cloudCopy !== undefined) params.set("cloudCopy", String(input.cloudCopy));
   if (input.readable !== undefined) params.set("readable", String(input.readable));
+  if (input.browseId) {
+    params.set("browseId", input.browseId);
+    params.set("browseMode", input.browseMode || "subtree");
+  }
+  for (const filter of input.indexFilters || []) params.append("indexFilter", `${filter.mode}:${filter.id}`);
+  if (input.needsOrganizing !== undefined) params.set("needsOrganizing", String(input.needsOrganizing));
+  if (input.facetParentId !== undefined) params.set("facetParentId", input.facetParentId);
   for (const tag of input.tags || []) if (tag.trim()) params.append("tag", tag.trim());
   if (input.sort) params.set("sort", input.sort);
   if (input.cursor) params.set("cursor", input.cursor);
@@ -628,7 +678,7 @@ export function openLibraryStreamSession(fileId: string, candidate: LibraryReadC
 export interface LibrarySavedQuery {
   id: string;
   name: string;
-  filters: { scope: string; lifecycle?: "active" | "trashed"; query: string; folderId: string; tags: string[]; type?: "image" | "video" | "audio" | "document" | "other"; grouped?: boolean; cloudCopy?: boolean; readable?: boolean; sort: "name_asc" | "name_desc" | "modified_desc" | "modified_asc" | "ingested_desc" | "ingested_asc" };
+  filters: { scope: string; lifecycle?: "active" | "trashed"; query: string; folderId: string; tags: string[]; type?: "image" | "video" | "audio" | "document" | "other"; grouped?: boolean; cloudCopy?: boolean; readable?: boolean; browseId?: string; browseMode?: "direct" | "subtree"; indexFilters?: Array<{ id: string; mode: "direct" | "subtree" }>; needsOrganizing?: boolean; sort: "name_asc" | "name_desc" | "modified_desc" | "modified_asc" | "ingested_desc" | "ingested_asc" };
   createdAt: string;
   updatedAt: string;
 }

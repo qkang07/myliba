@@ -42,7 +42,7 @@ func (c *cloudClient) publishLocalIndex(objectID string) error {
 	}
 	// ObjectID remains the old resource lookup key; FileID inside the encrypted
 	// index is the stable logical identity introduced by P2.
-	record := cloudRecord{Format: 4, LibraryID: c.libraryID(), ObjectID: objectID,
+	record := cloudRecord{Format: c.catalogWriterFormat(), LibraryID: c.libraryID(), ObjectID: objectID,
 		RevisionID: revision, AuthorID: c.runtime.id, AuthorEpoch: c.authorEpoch(), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), BlockIDs: []string{}}
 	record, err = c.sealManifest(record, cloudManifest{IndexOnly: true, LocalIndex: &index})
 	if err != nil {

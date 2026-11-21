@@ -328,6 +328,11 @@ func validTransferIdentity(value string) bool {
 }
 
 func applyTransferredClassification(tx *sql.Tx, resourceID, folderName string, tags []string, stamp string) error {
+	if classificationModeTx(tx) == "active" {
+		// Activated libraries classify through index operations only; the
+		// transfer's legacy folderName/tags are discarded (§9.2 item 4).
+		return nil
+	}
 	folderName = strings.TrimSpace(folderName)
 	if folderName != "" && len([]rune(folderName)) <= 80 {
 		folderID := newID()

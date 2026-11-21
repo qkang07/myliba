@@ -1,7 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -118,6 +120,60 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(wantedTags)
+	classificationFilter, err := parseClassificationSearch(query)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	libraryID := c.libraryID()
+	protectedFiles := map[string]bool{}
+	visibleNodes := map[string]bool{}
+	classificationGeneration := ""
+	classificationMatcher := classificationSearchMatcher{}
+	if c.runtime.db != nil {
+		protectedFiles, err = c.protectedLibraryFileIDs()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "无法确认文件保护状态")
+			return
+		}
+		visibleNodes, err = visibleClassificationNodeIDs(c.runtime.db, libraryID, protectedFiles)
+		if err != nil {
+			writeError(w, 500, "无法计算受保护索引可见性")
+			return
+		}
+		if classificationFilter.Browse != nil && !visibleNodes[classificationFilter.Browse.ID] {
+			writeError(w, http.StatusNotFound, "分类索引不存在")
+			return
+		}
+		for _, condition := range classificationFilter.Filters {
+			if !visibleNodes[condition.ID] {
+				writeError(w, http.StatusNotFound, "分类索引不存在")
+				return
+			}
+		}
+		if classificationFilter.FacetParentID != "" && !visibleNodes[classificationFilter.FacetParentID] {
+			writeError(w, http.StatusNotFound, "分类索引不存在")
+			return
+		}
+		if err = validateClassificationSearch(c.runtime.db, libraryID, classificationFilter); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "分类索引不存在")
+			} else {
+				writeError(w, 500, "无法校验分类索引筛选")
+			}
+			return
+		}
+		classificationGeneration, err = classificationSearchGeneration(c.runtime.db, libraryID)
+		if err != nil {
+			writeError(w, 500, "无法读取分类索引代号")
+			return
+		}
+		classificationMatcher, err = loadClassificationSearchMatcher(c.runtime.db, libraryID, needle, classificationFilter)
+		if err != nil {
+			writeError(w, 500, "无法读取分类索引筛选")
+			return
+		}
+	}
 	peerStatuses := c.runtime.peerStatuses()
 	cutoff := time.Now().Add(-time.Minute)
 	availability := ""
@@ -220,8 +276,8 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(sourceList)
 	}
-	generation := cloudHash([]byte(catalogGen + ":" + lifecycleGeneration + ":" + wantedLifecycle))[:16]
-	filterGeneration := cloudHash([]byte(generation + "\x00" + scope + "\x00" + needle + "\x00" + folderID + "\x00" + fileType + "\x00" + grouped + "\x00" + cloudCopy + "\x00" + readable + "\x00" + availability + "\x00" + strings.Join(wantedTags, "\x00") + "\x00" + order + "\x00" + strconv.Itoa(limit)))[:16]
+	generation := cloudHash([]byte(catalogGen + ":" + lifecycleGeneration + ":" + wantedLifecycle + ":" + classificationGeneration))[:16]
+	filterGeneration := cloudHash([]byte(generation + "\x00" + scope + "\x00" + needle + "\x00" + folderID + "\x00" + fileType + "\x00" + grouped + "\x00" + cloudCopy + "\x00" + readable + "\x00" + availability + "\x00" + strings.Join(wantedTags, "\x00") + "\x00" + classificationFilter.cursorKey() + "\x00" + order + "\x00" + strconv.Itoa(limit)))[:16]
 	offset := 0
 	if raw := query.Get("cursor"); raw != "" {
 		cursorGen, cursorOffset, ok := strings.Cut(raw, ":")
@@ -244,7 +300,7 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 				return true
 			}
 		}
-		return false
+		return classificationMatcher.keyword[file.FileID]
 	}
 	matchesFolder := func(file cloudFileView) bool {
 		if folderID == "" {
@@ -275,19 +331,20 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 	}
 	folders := map[string]libraryFolderFacet{}
 	tagCounts := map[string]int{}
+	indexItems := append([]libraryIndexFacet(nil), classificationMatcher.facetNodes...)
 	var pageItems []cloudFileView
 	total := 0
 	sqlDone := false
 	// Without a live-readability predicate the whole page, count and facets come
 	// from SQLite; replica availability is still overlaid per row on read.
 	if projectionReady && readable == "" {
-		projectedFolders, projectedTags, used, facetErr := c.searchProjectionFacets(scope, wantedLifecycle, needle, folderID, fileType, grouped, cloudCopy, wantedTags)
+		projectedFolders, projectedTags, projectedIndexes, used, facetErr := c.searchProjectionFacets(scope, wantedLifecycle, needle, folderID, fileType, grouped, cloudCopy, wantedTags, classificationFilter)
 		if facetErr != nil {
 			writeError(w, 500, "无法读取检索 facet")
 			return
 		}
 		if used {
-			projectedPage, projectedTotal, pageUsed, pageErr := c.searchProjectionPage(scope, wantedLifecycle, needle, folderID, fileType, grouped, cloudCopy, order, wantedTags, limit, offset)
+			projectedPage, projectedTotal, pageUsed, pageErr := c.searchProjectionPage(scope, wantedLifecycle, needle, folderID, fileType, grouped, cloudCopy, order, wantedTags, classificationFilter, limit, offset)
 			if pageErr != nil {
 				writeError(w, 500, "无法分页读取检索投影")
 				return
@@ -299,6 +356,7 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 				for _, facet := range projectedTags {
 					tagCounts[facet.Name] = facet.Count
 				}
+				indexItems = projectedIndexes
 				pageItems, total, sqlDone = projectedPage, projectedTotal, true
 			}
 		}
@@ -307,7 +365,10 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 		files := []cloudFileView{}
 		candidatesLoaded := false
 		if projectionReady {
-			projected, used, searchErr := c.readSearchCandidates(scope, needle, fileType, grouped, cloudCopy)
+			// Classification names participate in keyword search but are not part
+			// of the legacy FTS projection, so the Go fallback applies text after
+			// loading the stable non-text candidate set.
+			projected, used, searchErr := c.readSearchCandidates(scope, "", fileType, grouped, cloudCopy)
 			if searchErr != nil {
 				writeError(w, 500, "无法读取检索投影")
 				return
@@ -400,7 +461,8 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 			if !matchesText(file) {
 				continue
 			}
-			if matchesTags(file) {
+			matchesClassification := classificationMatcher.matches(file.FileID, true)
+			if matchesTags(file) && matchesClassification {
 				id, name := file.FolderID, file.FolderName
 				if id == "" {
 					id, name = "unfiled", "未归组"
@@ -409,7 +471,7 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 				facet.ID, facet.Name, facet.Count = id, name, facet.Count+1
 				folders[id] = facet
 			}
-			if matchesFolder(file) {
+			if matchesFolder(file) && matchesClassification {
 				seen := map[string]bool{}
 				for _, tag := range file.Tags {
 					key := strings.ToLower(tag)
@@ -419,7 +481,14 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			if matchesFolder(file) && matchesTags(file) {
+			if matchesFolder(file) && matchesTags(file) && classificationMatcher.matches(file.FileID, false) {
+				for at := range indexItems {
+					if classificationMatcher.facetMatches[at][file.FileID] {
+						indexItems[at].Count++
+					}
+				}
+			}
+			if matchesFolder(file) && matchesTags(file) && matchesClassification {
 				matched = append(matched, file)
 			}
 		}
@@ -444,6 +513,15 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 			end = total
 		}
 		pageItems = matched[offset:end]
+	}
+	if c.runtime.db != nil {
+		visibleFacets := indexItems[:0]
+		for _, facet := range indexItems {
+			if visibleNodes[facet.ID] {
+				visibleFacets = append(visibleFacets, facet)
+			}
+		}
+		indexItems = visibleFacets
 	}
 	if folderID != "" {
 		if _, found := folders[folderID]; !found {
@@ -563,8 +641,8 @@ func (c *cloudClient) searchLibrary(w http.ResponseWriter, r *http.Request) {
 			"scope": scope, "deviceIndexes": scope != "cloud", "generation": generation,
 			"lastCatalogAt": lastCatalogAt, "sources": sourceList, "knownNodes": knownList, "unindexedSources": unindexedSources, "sourceLastCatalogAt": sourceLastCatalogAt, "sourceFrontiers": sourceFrontiers, "offlineSources": offlineSources,
 		},
-		"facets": map[string]any{"folders": folderItems, "tags": tagItems},
-		"jobs":   jobs, "nodeId": c.runtime.id, "libraryId": c.libraryID(), "peers": c.runtime.activePeers(),
+		"facets": map[string]any{"folders": folderItems, "tags": tagItems, "indexes": indexItems},
+		"jobs":   jobs, "nodeId": c.runtime.id, "libraryId": libraryID, "peers": c.runtime.activePeers(),
 		"peerStatus": c.runtime.peerStatuses(), "directEndpoint": c.runtime.endpoint, "lan": lan,
 	})
 }
@@ -1145,9 +1223,88 @@ func (c *cloudClient) mergeCatalogSearch(files []cloudFileView, includeLocal boo
 	return c.mergeCatalogSearchFromRecords(files, records, includeLocal)
 }
 
+// protectedLibraryFileIDs returns the conservative public-visibility deny set.
+// A logical file is hidden when any current source snapshot marks its copy as
+// protected; another public replica must not make the same logical identity
+// visible again.
+func (c *cloudClient) protectedLibraryFileIDs() (map[string]bool, error) {
+	if c == nil || c.runtime == nil || c.runtime.disk == nil {
+		return map[string]bool{}, nil
+	}
+	records, err := c.validRecords()
+	if err != nil {
+		return nil, err
+	}
+	protected := map[string]bool{}
+	for _, record := range latestCloudRecords(c.contentRecordsFromValid(records)) {
+		manifest, openErr := c.openManifest(record)
+		if openErr != nil || !manifest.Protected {
+			continue
+		}
+		fileID := manifest.FileID
+		if fileID == "" {
+			fileID = record.ObjectID
+		}
+		protected[fileID] = true
+	}
+	latest := map[string]cloudRecord{}
+	indexes := map[string]fileIndexView{}
+	objectIDs := map[string]bool{}
+	for _, record := range records {
+		manifest, openErr := c.openManifest(record)
+		if openErr != nil || !manifest.IndexOnly || manifest.LocalIndex == nil {
+			continue
+		}
+		key := record.ObjectID + "/" + record.AuthorID
+		old, found := latest[key]
+		if !found || catalogAfter(record, old) {
+			latest[key] = record
+			indexes[key] = *manifest.LocalIndex
+		}
+		objectIDs[record.ObjectID] = true
+	}
+	for key, index := range indexes {
+		if !index.Protected {
+			continue
+		}
+		fileID := index.FileID
+		if fileID == "" {
+			fileID = latest[key].ObjectID
+		}
+		protected[fileID] = true
+	}
+	if c.indexer != nil && len(objectIDs) != 0 {
+		local, localErr := c.indexer.localOrganizationBatch(objectIDs)
+		if localErr != nil {
+			return nil, localErr
+		}
+		for objectID, index := range local {
+			if !index.Protected {
+				continue
+			}
+			fileID := index.FileID
+			if fileID == "" {
+				fileID = objectID
+			}
+			protected[fileID] = true
+		}
+	}
+	return protected, nil
+}
+
 func (c *cloudClient) mergeCatalogSearchFromRecords(files []cloudFileView, records []cloudRecord, includeLocal bool) ([]cloudFileView, error) {
 	latest := map[string]cloudRecord{}
 	indexes := map[string]fileIndexView{}
+	protectedFiles := map[string]bool{}
+	for _, file := range files {
+		logicalID := file.FileID
+		if logicalID == "" {
+			logicalID = file.ID
+		}
+		if file.Protected && logicalID != "" {
+			protectedFiles[logicalID] = true
+		}
+	}
 	// Each device publishes replacement snapshots, including empty tags and
 	// ungrouping. Older snapshots must never resurrect removed classifications.
 	for _, record := range records {
@@ -1166,6 +1323,13 @@ func (c *cloudClient) mergeCatalogSearchFromRecords(files []cloudFileView, recor
 	organizationRecords := map[string]cloudRecord{}
 	localOrganization := map[string]bool{}
 	for key, index := range indexes {
+		logicalID := index.FileID
+		if logicalID == "" {
+			logicalID = latest[key].ObjectID
+		}
+		if index.Protected && logicalID != "" {
+			protectedFiles[logicalID] = true
+		}
 		if !index.OrganizationKnown {
 			continue
 		}
@@ -1194,6 +1358,13 @@ func (c *cloudClient) mergeCatalogSearchFromRecords(files []cloudFileView, recor
 		for id, index := range local {
 			organization[id] = index
 			localOrganization[id] = true
+			logicalID := index.FileID
+			if logicalID == "" {
+				logicalID = id
+			}
+			if index.Protected && logicalID != "" {
+				protectedFiles[logicalID] = true
+			}
 		}
 	}
 	result := []cloudFileView{}
@@ -1213,6 +1384,9 @@ func (c *cloudClient) mergeCatalogSearchFromRecords(files []cloudFileView, recor
 		logicalID := id
 		if file.FileID != "" {
 			logicalID = file.FileID
+		}
+		if protectedFiles[logicalID] {
+			return
 		}
 		if _, known := organization[id]; !known && file.Protected {
 			return

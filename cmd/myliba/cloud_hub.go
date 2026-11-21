@@ -30,18 +30,21 @@ type cloudNode struct {
 }
 
 type cloudHub struct {
-	mu            sync.Mutex
-	pruneMu       sync.Mutex
-	pruned        map[string]bool
-	prunePath     string
-	lease         *cleanupLease
-	writers       *catalogWriterRegistry
-	nodes         map[string]cloudNode
-	heartbeatSeen map[string]bool
-	signals       map[string][]cloudPeerSignal
-	signalWake    map[string]chan struct{}
-	disk          *cloudDisk
-	registryPath  string
+	mu                   sync.Mutex
+	pruneMu              sync.Mutex
+	pruned               map[string]bool
+	prunePath            string
+	lease                *cleanupLease
+	writers              *catalogWriterRegistry
+	nodes                map[string]cloudNode
+	heartbeatSeen        map[string]bool
+	signals              map[string][]cloudPeerSignal
+	signalWake           map[string]chan struct{}
+	disk                 *cloudDisk
+	registryPath         string
+	libraryFormats       map[string]libraryFormatState
+	libraryFormatPath    string
+	libraryFormatsPaused bool
 }
 
 func newCloudHub() (*cloudHub, error) {
@@ -57,7 +60,7 @@ func newCloudHub() (*cloudHub, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &cloudHub{nodes: map[string]cloudNode{}, heartbeatSeen: map[string]bool{}, signals: map[string][]cloudPeerSignal{}, signalWake: map[string]chan struct{}{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json"), prunePath: filepath.Join(dir, "pruned-catalog.json"), pruned: map[string]bool{}}
+	c := &cloudHub{nodes: map[string]cloudNode{}, heartbeatSeen: map[string]bool{}, signals: map[string][]cloudPeerSignal{}, signalWake: map[string]chan struct{}{}, disk: disk, registryPath: filepath.Join(dir, "cloud-nodes.json"), prunePath: filepath.Join(dir, "pruned-catalog.json"), pruned: map[string]bool{}, libraryFormats: map[string]libraryFormatState{}, libraryFormatPath: filepath.Join(dir, "library-formats.json")}
 	writers, err := newCatalogWriterRegistry(dir)
 	if err != nil {
 		return nil, err
@@ -99,6 +102,7 @@ func newCloudHub() (*cloudHub, error) {
 			return nil, err
 		}
 	}
+	c.loadLibraryFormats()
 	return c, nil
 }
 
@@ -474,6 +478,13 @@ func (c *cloudHub) routesWithAuth(mux *http.ServeMux, authorize func(http.Handle
 					http.Error(w, "invalid catalog record", 400)
 					return
 				}
+				if status, message, confirmed := c.libraryFormatGateLocked(record, id); status != 0 {
+					http.Error(w, message, status)
+					return
+				} else if confirmed {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				if err := c.writers.admit(record); err != nil {
 					status := http.StatusForbidden
 					if errors.Is(err, errWriterEpochStale) {
@@ -549,15 +560,25 @@ func (c *cloudHub) hubCatalogCapabilities(w http.ResponseWriter, r *http.Request
 	minimum := 3
 	var epoch int64
 	retired := false
+	libraryMinimum := 3
+	classificationMode := "uninitialized"
 	if libraryID != "" {
 		c.pruneMu.Lock()
 		state, exists := c.writers.writerState(libraryID, authorID)
+		formatState, initialized := c.libraryFormats[libraryID]
+		paused := c.libraryFormatsPaused
 		c.pruneMu.Unlock()
 		if exists {
 			minimum = state.MinFormat
 			epoch = state.Epoch
 			retired = state.Retired
 		}
+		if paused || (initialized && formatState.Corrupt) {
+			classificationMode = "unavailable"
+		} else if initialized {
+			classificationMode = "active"
+			libraryMinimum = formatState.MinFormat
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"maxCatalogFormat": 4, "minWriterFormat": minimum, "logicalFileIdentity": true, "writerEpoch": epoch, "writerRetired": retired, "hubWriterGate": true})
+	writeJSON(w, http.StatusOK, map[string]any{"maxCatalogFormat": 5, "minWriterFormat": minimum, "logicalFileIdentity": true, "writerEpoch": epoch, "writerRetired": retired, "hubWriterGate": true, "libraryMinWriterFormat": libraryMinimum, "classificationMode": classificationMode})
 }

@@ -40,6 +40,12 @@ final class LocalIndexPublisher {
         PendingOperation(String id,String author,long counter,String kind,String payload,String createdAt){this.id=id;this.author=author;this.counter=counter;this.kind=kind;this.payload=payload;this.createdAt=createdAt;}
     }
 
+    private static final class ClassificationCapability {
+        final int maxFormat;
+        final String mode;
+        ClassificationCapability(int maxFormat,String mode){this.maxFormat=maxFormat;this.mode=mode;}
+    }
+
     LocalIndexPublisher(Context context){this.context=context;}
 
     void sync(String hub,String token,String node)throws Exception{
@@ -49,11 +55,35 @@ final class LocalIndexPublisher {
         }
     }
 
+    void rejoinWriter(String hub,String token,String node,long epoch)throws Exception{
+        synchronized(PUBLISH_LOCK){
+            if(epoch<1)throw new IOException("新作者 epoch 无效");
+            SharedPreferences settings=context.getSharedPreferences(ResourceNodeService.PREFS,Context.MODE_PRIVATE);
+            byte[] key=LocalIndexCrypto.key(CloudSecretStore.read(settings,"index_key"));
+            byte[] body=new JSONObject().put("libraryId",LocalIndexCrypto.hash(key)).put("authorId",node).put("epoch",epoch).toString().getBytes(StandardCharsets.UTF_8);
+            HttpURLConnection connection=(HttpURLConnection)new URL(hub+"/cloud/writers/rejoin").openConnection();
+            try{
+                connection.setRequestMethod("POST");connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(10000);connection.setReadTimeout(30000);
+                connection.setRequestProperty("Authorization","Bearer "+token);connection.setRequestProperty("Content-Type","application/json; charset=utf-8");connection.setDoOutput(true);connection.setFixedLengthStreamingMode(body.length);
+                try(OutputStream out=connection.getOutputStream()){out.write(body);}
+                if(connection.getResponseCode()!=200)throw new IOException("Hub 注册新作者 epoch 失败（HTTP "+connection.getResponseCode()+"）");
+            }finally{connection.disconnect();}
+        }
+    }
+
     private void syncLocked(String hub,String token,String node)throws Exception{
         SharedPreferences settings=context.getSharedPreferences(ResourceNodeService.PREFS,Context.MODE_PRIVATE);
         if(!settings.getBoolean("index_enabled",false)){pendingCount=0;status="索引同步未启用";return;}
         byte[] key=LocalIndexCrypto.key(CloudSecretStore.read(settings,"index_key"));
-        requireFormatFour(hub,token);
+        String sharedLibrary=LocalIndexCrypto.hash(key);
+        ClassificationCapability capability=classificationCapability(hub,token,sharedLibrary,node);
+        if(capability.maxFormat<5)throw new IOException("Hub 不支持 format 5 目录记录，请更新 Hub");
+        if("unavailable".equals(capability.mode))throw new IOException("Hub 文集格式状态暂不可用");
+        try(LocalLibrary local=new LocalLibrary(context)){
+            if(!sharedLibrary.equals(local.classificationLibraryId()))local.bindSharedClassification(sharedLibrary,node);
+            if(!"active".equals(local.classificationMode()))throw new IOException("本机分类索引未初始化");
+        }
+        int catalogFormat=5;
         // Read membership and operations before publishing. A retired device
         // cannot emit another record under its old author epoch.
         folderConflictCount=applyRemoteOperations(hub,token,key);
@@ -70,10 +100,10 @@ final class LocalIndexPublisher {
         List<PendingOperation> operations=new ArrayList<>();
         Set<String> liveIDs=new HashSet<>();
         int liveCount;
-        File formatFourAck=new File(directory,"format4.ack");
+        File formatAck=new File(directory,"format"+catalogFormat+".ack");
         try(LocalLibrary library=new LocalLibrary(context)){
             SQLiteDatabase db=library.getWritableDatabase();
-            if(!formatFourAck.isFile())db.execSQL("INSERT OR IGNORE INTO index_outbox(file_id,item_uri,token) SELECT COALESCE(NULLIF(logical_file_id,''),file_id),uri,lower(hex(randomblob(16))) FROM items");
+            if(!formatAck.isFile())db.execSQL("INSERT OR IGNORE INTO index_outbox(file_id,item_uri,token) SELECT COALESCE(NULLIF(logical_file_id,''),file_id),uri,lower(hex(randomblob(16))) FROM items");
             db.beginTransactionNonExclusive();
             try{
                 try(Cursor all=db.rawQuery("SELECT COALESCE(NULLIF(logical_file_id,''),file_id) FROM items",null)){while(all.moveToNext())liveIDs.add(all.getString(0));}
@@ -95,7 +125,8 @@ final class LocalIndexPublisher {
                         pending.put(id,new Pending(id,queueToken,index));
                     }
                 }
-                try(Cursor rows=db.rawQuery("SELECT op_id,author_id,counter,kind,payload_json,created_at FROM library_operations WHERE state='pending' ORDER BY author_id,counter",null)){
+                String operationSQL="SELECT op_id,author_id,counter,kind,payload_json,created_at FROM library_operations WHERE state='pending' ORDER BY author_id,counter";
+                try(Cursor rows=db.rawQuery(operationSQL,null)){
                     while(rows.moveToNext())operations.add(new PendingOperation(rows.getString(0),rows.getString(1),rows.getLong(2),rows.getString(3),rows.getString(4),rows.getString(5)));
                 }
                 db.setTransactionSuccessful();
@@ -128,7 +159,7 @@ final class LocalIndexPublisher {
                     index.getJSONObject("original").put("local",new JSONArray());
                 }
                 String manifest=new JSONObject().put("indexOnly",true).put("localIndex",index).toString();
-                String digest=LocalIndexCrypto.hash(("format4\n"+manifest).getBytes(StandardCharsets.UTF_8));
+                String digest=LocalIndexCrypto.hash(("format"+catalogFormat+"\n"+manifest).getBytes(StandardCharsets.UTF_8));
                 File ack=new File(directory,item.id+".ack"),record=new File(directory,item.id+".record"),fingerprint=new File(directory,item.id+".digest");
                 if(!digest.equals(read(ack))){
                     if(!digest.equals(read(fingerprint))||!record.isFile()){
@@ -138,7 +169,7 @@ final class LocalIndexPublisher {
                                 if(!Instant.parse(stamp).isAfter(previousTime))stamp=previousTime.plusNanos(1).toString();}
                             catch(Exception ignored){/* A damaged pending record is rebuilt from the durable outbox. */}
                         }
-                        write(record,LocalIndexCrypto.seal(key,item.id,index.getString("revisionId"),node,authorEpoch,stamp,manifest));
+                        write(record,sealCatalog(key,catalogFormat,item.id,index.getString("revisionId"),node,authorEpoch,stamp,manifest));
                         write(fingerprint,digest);
                     }
                     upload(hub,token,read(record).getBytes(StandardCharsets.UTF_8));
@@ -148,17 +179,17 @@ final class LocalIndexPublisher {
             }catch(InterruptedException ex){throw ex;
             }catch(Exception ex){failed++;if(firstFailure.isEmpty())firstFailure=ex.getMessage()==null?ex.getClass().getSimpleName():ex.getMessage();}
         }
-        if(failed==0&&!formatFourAck.isFile())write(formatFourAck,"1");
+        if(failed==0&&!formatAck.isFile())write(formatAck,"1");
         File operationDirectory=new File(directory,"operations");
         if(!operationDirectory.isDirectory()&&!operationDirectory.mkdirs())throw new IOException("无法保存整理操作同步状态");
         for(PendingOperation operation:operations){
             if(Thread.currentThread().isInterrupted())throw new InterruptedException();
             try{
                 File record=new File(operationDirectory,operation.id+".record");
-                if(needsFormatFourRecord(record)){
+                if(needsCatalogRecord(record,catalogFormat)){
                     JSONObject envelope=new JSONObject().put("opId",operation.id).put("authorId",operation.author).put("counter",operation.counter).put("kind",operation.kind).put("payload",new JSONObject(operation.payload));
                     String manifest=new JSONObject().put("operation",envelope).toString();
-                    write(record,LocalIndexCrypto.seal(key,"operation-"+operation.id,operation.id,node,authorEpoch,Instant.now().toString(),manifest));
+                    write(record,sealCatalog(key,catalogFormat,"operation-"+operation.id,operation.id,node,authorEpoch,Instant.now().toString(),manifest));
                 }
                 upload(hub,token,read(record).getBytes(StandardCharsets.UTF_8));
                 acknowledgeOperation(operation.id);sent++;
@@ -166,21 +197,21 @@ final class LocalIndexPublisher {
             }catch(Exception ex){failed++;if(firstFailure.isEmpty())firstFailure=ex.getMessage()==null?ex.getClass().getSimpleName():ex.getMessage();}
         }
         String receiveError="";
-        try{publishReceipt(directory,hub,token,key,node,authorEpoch);}catch(Exception ex){receiveError=" · 应用回执未同步："+(ex.getMessage()==null?ex.getClass().getSimpleName():ex.getMessage());}
+        try{publishReceipt(directory,hub,token,key,node,authorEpoch,catalogFormat);}catch(Exception ex){receiveError=" · 应用回执未同步："+(ex.getMessage()==null?ex.getClass().getSimpleName():ex.getMessage());}
         pendingCount=outboxCount()+operationOutboxCount();
         status="索引与整理操作已交接 Hub · "+liveCount+" 个文件 · 本轮更新 "+sent+" 项 · 待发布 "+pendingCount+" 项 · 本端已应用 "+appliedCount+" 项 · 其他节点回执 "+receiptCount+" 份"+(folderConflictCount==0?"":" · 归组待处理 "+folderConflictCount+" 项")+(renameConflictCount==0?"":" · 改名待处理 "+renameConflictCount+" 项")+(quarantinedCount==0?"":" · "+quarantinedCount+" 项操作需升级客户端")+receiveError+(failed==0?"":" · "+failed+" 项失败，将重试："+firstFailure)+(discarded==0?"":" · 忽略 "+discarded+" 项未发布删除");
     }
 
-    private void publishReceipt(File directory,String hub,String token,byte[] key,String node,long authorEpoch)throws Exception{
+    private void publishReceipt(File directory,String hub,String token,byte[] key,String node,long authorEpoch,int catalogFormat)throws Exception{
         JSONObject frontiers;
         try(LocalLibrary local=new LocalLibrary(context)){frontiers=local.appliedFrontiers();}
         if(frontiers.length()==0)return;
         String manifest=new JSONObject().put("receipt",new JSONObject().put("nodeId",node).put("frontiers",frontiers)).toString();
-        String digest=LocalIndexCrypto.hash(("format4\n"+manifest).getBytes(StandardCharsets.UTF_8));
+        String digest=LocalIndexCrypto.hash(("format"+catalogFormat+"\n"+manifest).getBytes(StandardCharsets.UTF_8));
         File ack=new File(directory,"receipt.ack"),record=new File(directory,"receipt.record"),fingerprint=new File(directory,"receipt.digest");
         if(digest.equals(read(ack)))return;
-        if(!digest.equals(read(fingerprint))||!record.isFile()){
-            write(record,LocalIndexCrypto.seal(key,"library-receipt-"+node,java.util.UUID.randomUUID().toString(),node,authorEpoch,Instant.now().toString(),manifest));
+        if(!digest.equals(read(fingerprint))||needsCatalogRecord(record,catalogFormat)){
+            write(record,sealCatalog(key,catalogFormat,"library-receipt-"+node,java.util.UUID.randomUUID().toString(),node,authorEpoch,Instant.now().toString(),manifest));
             write(fingerprint,digest);
         }
         upload(hub,token,read(record).getBytes(StandardCharsets.UTF_8));
@@ -191,7 +222,7 @@ final class LocalIndexPublisher {
         String raw=read(new File(directory,id+".record"));
         if(raw.isEmpty())return null;
         JSONObject record=new JSONObject(raw);
-        String manifest=LocalIndexCrypto.open(key,record.optInt("format",3),record.optBoolean("keepHistory",false),id,record.getString("revisionId"),record.getString("authorId"),record.getString("createdAt"),record.getString("nonce"),record.getString("sealed"));
+        String manifest=LocalIndexCrypto.open(key,record.optInt("format",3),record.optBoolean("keepHistory",false),id,record.getString("revisionId"),record.getString("authorId"),record.optLong("authorEpoch",0),record.getString("createdAt"),record.getString("nonce"),record.getString("sealed"));
         return new JSONObject(manifest).getJSONObject("localIndex");
     }
 
@@ -239,13 +270,13 @@ final class LocalIndexPublisher {
                 try{get.setRequestMethod("GET");get.setConnectTimeout(10000);get.setReadTimeout(30000);get.setRequestProperty("Authorization","Bearer "+token);if(get.getResponseCode()!=200)continue;raw=readResponse(get,1<<20);}finally{get.disconnect();}
                 JSONObject record=new JSONObject(new String(raw,StandardCharsets.UTF_8));int format=record.optInt("format",0);
                 if(format<3||!library.equals(record.optString("libraryId")))continue;
-                String manifest=LocalIndexCrypto.open(key,format,record.optBoolean("keepHistory",false),record.optString("objectId"),record.optString("revisionId"),record.optString("authorId"),record.optString("createdAt"),record.optString("nonce"),record.optString("sealed"));
+                String manifest=LocalIndexCrypto.open(key,format,record.optBoolean("keepHistory",false),record.optString("objectId"),record.optString("revisionId"),record.optString("authorId"),record.optLong("authorEpoch",0),record.optString("createdAt"),record.optString("nonce"),record.optString("sealed"));
                 JSONObject opened=new JSONObject(manifest);JSONObject receipt=opened.optJSONObject("receipt");
                 if(receipt!=null){String receiptNode=receipt.optString("nodeId");JSONObject frontiers=receipt.optJSONObject("frontiers");if(receiptNode.equals(record.optString("authorId"))&&frontiers!=null&&frontiers.length()>0)receipts.add(new LocalLibrary.RemoteReceipt(receiptNode,frontiers.toString(),record.optString("createdAt")));continue;}
                 JSONObject snapshot=opened.optJSONObject("snapshot");
                 if(snapshot!=null){
                     String author=snapshot.optString("authorId"),object=record.optString("objectId");long frontier=snapshot.optLong("frontier",0),from=snapshot.optLong("fromCounter",1);
-                    if(author.isEmpty()||!object.equals("library-snapshot/"+author)||from<1||frontier<from||frontier>100000)continue;
+                    if(author.isEmpty()||!object.equals("library-snapshot/"+author)||from<1||frontier<from||frontier-from+1>1000)continue;
                     if(snapshot.optInt("schemaVersion")!=1){operations.add(new LocalLibrary.RemoteOperation(record.optString("revisionId"),author,frontier,"snapshot.unsupported","{}"));continue;}
                     byte[] compressed=Base64.getDecoder().decode(snapshot.optString("operationsB64"));
                     byte[] expanded;try(GZIPInputStream zip=new GZIPInputStream(new ByteArrayInputStream(compressed));ByteArrayOutputStream out=new ByteArrayOutputStream()){
@@ -288,8 +319,9 @@ final class LocalIndexPublisher {
             if(connection.getResponseCode()!=204)throw new IOException("索引发布 HTTP "+connection.getResponseCode());
         }finally{connection.disconnect();}
     }
-    private static void requireFormatFour(String hub,String token)throws Exception{
-        HttpURLConnection connection=(HttpURLConnection)new URL(hub+"/cloud/capabilities").openConnection();
+    private static ClassificationCapability classificationCapability(String hub,String token,String library,String author)throws Exception{
+        String query="?libraryId="+library+"&authorId="+java.net.URLEncoder.encode(author,"UTF-8");
+        HttpURLConnection connection=(HttpURLConnection)new URL(hub+"/cloud/capabilities"+query).openConnection();
         try{
             connection.setRequestMethod("GET");connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(10000);connection.setReadTimeout(10000);
             connection.setRequestProperty("Authorization","Bearer "+token);
@@ -297,13 +329,18 @@ final class LocalIndexPublisher {
             try(InputStream input=connection.getInputStream()){
                 ByteArrayOutputStream output=new ByteArrayOutputStream();byte[] buffer=new byte[1024];int count;
                 while((count=input.read(buffer))!=-1){if(output.size()+count>4096)throw new IOException("Hub 目录能力响应过大");output.write(buffer,0,count);}
-                if(new JSONObject(new String(output.toByteArray(),StandardCharsets.UTF_8)).optInt("maxCatalogFormat",0)<4)throw new IOException("Hub 不支持 format 4 目录记录，请更新 Hub");
+                JSONObject value=new JSONObject(new String(output.toByteArray(),StandardCharsets.UTF_8));
+                return new ClassificationCapability(value.optInt("maxCatalogFormat",0),value.optString("classificationMode","uninitialized"));
             }
         }finally{connection.disconnect();}
     }
 
+    private static String sealCatalog(byte[] key,int format,String object,String revision,String author,long epoch,String stamp,String manifest)throws Exception{
+        return format>=5?LocalIndexCrypto.seal5(key,object,revision,author,epoch,stamp,manifest):LocalIndexCrypto.seal(key,object,revision,author,epoch,stamp,manifest);
+    }
+
     private static boolean safeID(String value){return value.length()>=16&&value.length()<=128&&value.matches("[A-Za-z0-9-]+");}
-    private static boolean needsFormatFourRecord(File record){try{return !record.isFile()||new JSONObject(read(record)).optInt("format",3)<4;}catch(Exception ex){return true;}}
+    private static boolean needsCatalogRecord(File record,int format){try{return !record.isFile()||new JSONObject(read(record)).optInt("format",3)!=format;}catch(Exception ex){return true;}}
     private static String read(File file)throws IOException{
         if(!file.exists()&&!new File(file.getPath()+".bak").exists())return "";
         return new String(new AtomicFile(file).readFully(),StandardCharsets.UTF_8);

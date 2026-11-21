@@ -30,22 +30,22 @@ import (
 var assets embed.FS
 
 type server struct {
-	db             *sql.DB
-	cloud          *cloudClient
-	thumbnailDir   string
-	videoDir       string
-	ffmpegPath     string
-	ffprobePath    string
-	thumbnailMu    sync.Mutex
-	thumbnailLocks map[string]*sync.Mutex
-	videoMu        sync.Mutex
-	videoJobs      map[string]*videoJob
-	videoSlots     chan struct{}
-	jobsWake       chan struct{}
-	jobsStop       chan struct{}
+	db               *sql.DB
+	cloud            *cloudClient
+	thumbnailDir     string
+	videoDir         string
+	ffmpegPath       string
+	ffprobePath      string
+	thumbnailMu      sync.Mutex
+	thumbnailLocks   map[string]*sync.Mutex
+	videoMu          sync.Mutex
+	videoJobs        map[string]*videoJob
+	videoSlots       chan struct{}
+	jobsWake         chan struct{}
+	jobsStop         chan struct{}
 	preprocessPaused atomic.Bool
-	folderAccessMu sync.Mutex
-	folderAccess   map[string]folderAccessSession
+	folderAccessMu   sync.Mutex
+	folderAccess     map[string]folderAccessSession
 }
 
 type resource struct {
@@ -159,6 +159,14 @@ func main() {
 	}
 	app.cloud = cloud
 	cloud.indexer = app
+	if err := initializeClassificationLibrary(db, cloud.libraryID()); err != nil {
+		log.Fatal(err)
+	}
+	if report, err := refreshClassificationProjection(db, cloud.libraryID(), cloudRuntime.id); err != nil {
+		log.Printf("classification startup: %v", err)
+	} else {
+		log.Printf("classification ready: nodes=%d memberships=%d", report.NodeCount, report.MembershipCount)
+	}
 	if err := app.ensureDefaultMediaStore(dataDir); err != nil {
 		log.Fatal(err)
 	}
@@ -183,9 +191,16 @@ func main() {
 	mux.HandleFunc("GET /api/health", app.health)
 	mux.HandleFunc("GET /api/cloud/files", cloud.list)
 	mux.HandleFunc("GET /api/library/search", cloud.searchLibrary)
+	mux.HandleFunc("GET /api/library/indexes", app.listClassificationIndexes)
+	mux.HandleFunc("GET /api/library/indexes/{id}", app.getClassificationIndex)
+	mux.HandleFunc("POST /api/library/indexes", app.createClassificationIndex)
+	mux.HandleFunc("PUT /api/library/indexes/{id}", app.updateClassificationIndex)
+	mux.HandleFunc("DELETE /api/library/indexes/{id}", app.deleteClassificationIndex)
+	mux.HandleFunc("POST /api/library/index-memberships", app.changeClassificationMemberships)
+	mux.HandleFunc("GET /api/library/index-conflicts", app.libraryIndexConflicts)
+	mux.HandleFunc("POST /api/library/index-conflicts/{opId}/resolve", app.resolveLibraryIndexConflict)
+	mux.HandleFunc("GET /api/library/classification-status", app.classificationStatus)
 	mux.HandleFunc("GET /api/library/offline-index", cloud.offlineLibraryIndex)
-	mux.HandleFunc("GET /api/library/legacy-folders", app.listLegacyFolders)
-	mux.HandleFunc("POST /api/library/legacy-folders/merge", app.mergeLegacyFolders)
 	mux.HandleFunc("GET /api/library/members", app.listLibraryMembers)
 	mux.HandleFunc("GET /api/library/snapshots/status", cloud.librarySnapshotStatus)
 	mux.HandleFunc("GET /api/library/cleanup/plan", cloud.libraryCleanupPlanAPI)
@@ -329,7 +344,8 @@ CREATE TABLE IF NOT EXISTS roots (
 	path TEXT NOT NULL UNIQUE,
 	added_at TEXT NOT NULL,
 	last_scan_at TEXT,
-	auto_preprocess INTEGER NOT NULL DEFAULT 1
+	auto_preprocess INTEGER NOT NULL DEFAULT 1,
+	preserve_structure INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS resources (
 	id TEXT PRIMARY KEY,
@@ -448,6 +464,7 @@ CREATE TABLE IF NOT EXISTS file_asset_locations (
 		return err
 	}
 	hasAutoPreprocess := false
+	hasPreserveStructure := false
 	for columns.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
@@ -458,6 +475,9 @@ CREATE TABLE IF NOT EXISTS file_asset_locations (
 		}
 		if name == "auto_preprocess" {
 			hasAutoPreprocess = true
+		}
+		if name == "preserve_structure" {
+			hasPreserveStructure = true
 		}
 	}
 	if err := columns.Err(); err != nil {
@@ -495,6 +515,9 @@ CREATE TABLE IF NOT EXISTS file_asset_locations (
 	if !hasAutoPreprocess {
 		_, err = db.Exec(`ALTER TABLE roots ADD COLUMN auto_preprocess INTEGER NOT NULL DEFAULT 1`)
 	}
+	if err == nil && !hasPreserveStructure {
+		_, err = db.Exec(`ALTER TABLE roots ADD COLUMN preserve_structure INTEGER NOT NULL DEFAULT 1`)
+	}
 	if err == nil {
 		_, err = db.Exec(`ALTER TABLE folders ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''`)
 		if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -517,7 +540,7 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 func (s *server) roots(w http.ResponseWriter, _ *http.Request) {
 	started := time.Now()
 	log.Printf("local API /api/roots: database query starting")
-	rows, err := s.db.Query(`SELECT r.id, r.path, r.added_at, COALESCE(r.last_scan_at, ''), r.auto_preprocess, COUNT(x.id)
+	rows, err := s.db.Query(`SELECT r.id, r.path, r.added_at, COALESCE(r.last_scan_at, ''), r.auto_preprocess, r.preserve_structure, COUNT(x.id)
 		FROM roots r LEFT JOIN resources x ON x.root_id=r.id GROUP BY r.id ORDER BY r.added_at`)
 	if err != nil {
 		log.Printf("local API /api/roots: database query failed after %s: %v", time.Since(started), err)
@@ -530,12 +553,12 @@ func (s *server) roots(w http.ResponseWriter, _ *http.Request) {
 	for rows.Next() {
 		var id, path, added, scanned string
 		var count int
-		var autoPreprocess bool
-		if err := rows.Scan(&id, &path, &added, &scanned, &autoPreprocess, &count); err != nil {
+		var autoPreprocess, preserveStructure bool
+		if err := rows.Scan(&id, &path, &added, &scanned, &autoPreprocess, &preserveStructure, &count); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		result = append(result, map[string]any{"id": id, "path": path, "addedAt": added, "lastScanAt": scanned, "autoPreprocess": autoPreprocess, "count": count})
+		result = append(result, map[string]any{"id": id, "path": path, "addedAt": added, "lastScanAt": scanned, "autoPreprocess": autoPreprocess, "preserveStructure": preserveStructure, "count": count})
 	}
 	log.Printf("local API /api/roots: completed in %s", time.Since(started))
 	writeJSON(w, http.StatusOK, result)
@@ -543,8 +566,9 @@ func (s *server) roots(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Path           string `json:"path"`
-		AutoPreprocess *bool  `json:"autoPreprocess"`
+		Path              string `json:"path"`
+		AutoPreprocess    *bool  `json:"autoPreprocess"`
+		PreserveStructure *bool  `json:"preserveStructure"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "请输入有效的目录路径")
@@ -574,6 +598,12 @@ func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if input.PreserveStructure != nil {
+			if _, err := s.db.Exec(`UPDATE roots SET preserve_structure=? WHERE id=?`, *input.PreserveStructure, id); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "path": path, "existing": true})
 		return
 	}
@@ -583,10 +613,14 @@ func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	id = newID()
 	autoPreprocess := true
+	preserveStructure := true
 	if input.AutoPreprocess != nil {
 		autoPreprocess = *input.AutoPreprocess
 	}
-	_, err = s.db.Exec(`INSERT INTO roots(id,path,added_at,auto_preprocess) VALUES(?,?,?,?)`, id, path, now(), autoPreprocess)
+	if input.PreserveStructure != nil {
+		preserveStructure = *input.PreserveStructure
+	}
+	_, err = s.db.Exec(`INSERT INTO roots(id,path,added_at,auto_preprocess,preserve_structure) VALUES(?,?,?,?,?)`, id, path, now(), autoPreprocess, preserveStructure)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -597,14 +631,20 @@ func (s *server) addRoot(w http.ResponseWriter, r *http.Request) {
 func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 	rootID := r.PathValue("id")
 	var rootPath string
-	var autoPreprocess bool
-	if err := s.db.QueryRow(`SELECT path,auto_preprocess FROM roots WHERE id=?`, rootID).Scan(&rootPath, &autoPreprocess); err != nil {
+	var autoPreprocess, preserveStructure bool
+	if err := s.db.QueryRow(`SELECT path,auto_preprocess,preserve_structure FROM roots WHERE id=?`, rootID).Scan(&rootPath, &autoPreprocess, &preserveStructure); err != nil {
 		writeError(w, http.StatusNotFound, "目录不存在")
 		return
 	}
 	if info, err := os.Stat(rootPath); err != nil || !info.IsDir() {
 		writeError(w, http.StatusGone, "目录当前不可访问")
 		return
+	}
+	if preserveStructure && s.cloud != nil {
+		if _, err := refreshClassificationProjection(s.db, s.cloud.libraryID(), s.cloud.runtime.id); err != nil {
+			writeError(w, http.StatusInternalServerError, "无法准备目录索引："+err.Error())
+			return
+		}
 	}
 	seen := map[string]struct{}{}
 	var count int
@@ -660,6 +700,11 @@ func (s *server) scanRoot(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := s.syncUnifiedResource(id); err != nil {
 			return err
+		}
+		if preserveStructure && s.cloud != nil {
+			if err := s.classifyScannedResource(s.cloud.libraryID(), s.cloud.runtime.id, rootID, rootPath, path, id); err != nil {
+				return err
+			}
 		}
 		_, err = s.db.Exec(`DELETE FROM resource_fts WHERE resource_id=?`, id)
 		if err == nil {
@@ -1075,6 +1120,9 @@ func (s *server) serveFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) addTag(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	var input struct {
 		Name string `json:"name"`
 	}
@@ -1134,6 +1182,9 @@ func (s *server) addTag(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) addTagBatch(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	var input struct {
 		IDs  []string `json:"ids"`
 		Name string   `json:"name"`
@@ -1204,6 +1255,9 @@ func (s *server) addTagBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) removeTag(w http.ResponseWriter, r *http.Request) {
+	if s.rejectIfClassificationActive(w) {
+		return
+	}
 	resourceID := r.PathValue("id")
 	tx, err := s.db.Begin()
 	if err != nil {

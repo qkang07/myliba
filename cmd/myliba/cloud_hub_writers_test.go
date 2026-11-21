@@ -94,6 +94,15 @@ func TestHubWriterGateFormatAndEpoch(t *testing.T) {
 	if resp.Code != 200 {
 		t.Fatalf("rejoin: %d %s", resp.Code, resp.Body.String())
 	}
+	// A client may lose the successful response before committing its local
+	// epoch. Retrying the same rejoin must return the original success.
+	req = httptest.NewRequest(http.MethodPost, "/cloud/writers/rejoin", bytes.NewReader(rejoinBody))
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp = httptest.NewRecorder()
+	mux.ServeHTTP(resp, req)
+	if resp.Code != 200 || !strings.Contains(resp.Body.String(), "alreadyRejoined") {
+		t.Fatalf("idempotent rejoin: %d %s", resp.Code, resp.Body.String())
+	}
 	// After rejoin, writing with new epoch succeeds.
 	data, id = hubTestRecord(4, library, "node-a", "v7", "2026-11-07T00:00:00Z", 3)
 	if code := put(data, id); code != 204 {
@@ -153,5 +162,57 @@ func TestHubWriterGateRebuildFromCatalog(t *testing.T) {
 	state, ok := hub.writers.writerState(library, "legacy-node")
 	if !ok || state.MinFormat != 4 || state.Epoch != 1 {
 		t.Fatalf("rebuild did not recover writer state: %+v", state)
+	}
+}
+
+func TestHubLibraryFormatBoundaryPersists(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MYLIBA_HUB_DATA_DIR", dir)
+	token := "0123456789abcdef0123456789abcdef"
+	library := cloudHash([]byte("format-5-library"))
+	put := func(mux *http.ServeMux, data []byte, id string) int {
+		request := httptest.NewRequest(http.MethodPut, "/cloud/catalog/"+id, bytes.NewReader(data))
+		request.SetPathValue("id", id)
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		return response.Code
+	}
+
+	hub, err := newCloudHub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	hub.routes(mux, token)
+	data, id := hubTestRecord(5, library, "node-a", "v5", "2026-11-21T00:00:00Z", 0)
+	if code := put(mux, data, id); code != http.StatusNoContent {
+		t.Fatalf("establish format 5: %d", code)
+	}
+
+	restarted, err := newCloudHub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux = http.NewServeMux()
+	restarted.routes(mux, token)
+	data, id = hubTestRecord(4, library, "node-b", "v4", "2026-11-22T00:00:00Z", 0)
+	if code := put(mux, data, id); code != http.StatusConflict {
+		t.Fatalf("format downgrade after restart: %d", code)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/cloud/capabilities?libraryId="+library+"&authorId=node-b", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	var caps struct {
+		LibraryMinWriterFormat int    `json:"libraryMinWriterFormat"`
+		ClassificationMode     string `json:"classificationMode"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &caps) != nil {
+		t.Fatalf("capabilities: %d %s", response.Code, response.Body.String())
+	}
+	if caps.LibraryMinWriterFormat != 5 || caps.ClassificationMode != "active" {
+		t.Fatalf("unexpected library gate: %+v", caps)
 	}
 }

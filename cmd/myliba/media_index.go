@@ -1229,6 +1229,27 @@ func (s *server) buildFileIndex(id string, includeCloud bool) (fileIndexView, er
 	return index, nil
 }
 
+func (s *server) logicalFileProtected(fileID string) (bool, error) {
+	if fileID == "" {
+		return false, nil
+	}
+	var protected int
+	err := s.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM library_file_folders lf
+		JOIN folders f ON f.id=lf.folder_id
+		WHERE lf.file_id=? AND f.password_hash<>'')`, fileID).Scan(&protected)
+	return protected != 0, err
+}
+
+func (s *server) resourceProtected(resourceID string) (bool, string, error) {
+	fileID, err := s.unifiedFileID(resourceID)
+	if err != nil {
+		return false, "", err
+	}
+	protected, err := s.logicalFileProtected(fileID)
+	return protected, fileID, err
+}
+
 func mergeIndexedLocations(existing, more []indexedLocation) []indexedLocation {
 	for _, location := range more {
 		found := false

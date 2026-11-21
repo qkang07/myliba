@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -340,13 +341,13 @@ func (c *cloudClient) readSearchCandidates(scope, needle, fileType, grouped, clo
 // searchProjectionPage performs the final stable filtering and page selection
 // in SQLite when no live-readability predicate is requested. Facets and
 // coverage are still computed separately from the revision projection.
-func (c *cloudClient) searchProjectionPage(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, order string, tags []string, limit, offset int) ([]cloudFileView, int, bool, error) {
+func (c *cloudClient) searchProjectionPage(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, order string, tags []string, classification libraryClassificationSearch, limit, offset int) ([]cloudFileView, int, bool, error) {
 	c.searchMu.Lock()
 	defer c.searchMu.Unlock()
 	if c.runtime.db == nil || !c.searchReady {
 		return nil, 0, false, nil
 	}
-	condition, args := c.searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, tags, true, true)
+	condition, args := c.searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, tags, classification, true, true, true)
 	sortOrder := "p.name ASC,p.file_id ASC"
 	switch order {
 	case "", "name_asc":
@@ -414,7 +415,7 @@ func (c *cloudClient) searchProjectionPage(scope, lifecycle, needle, folderID, f
 // queries. Folder facets exclude the folder condition (they count across all
 // folders); tag facets exclude the tag condition (they count across all tags),
 // matching the cross-filtered facet semantics of the Go fallback.
-func (c *cloudClient) searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy string, tags []string, includeFolder, includeTags bool) (string, []any) {
+func (c *cloudClient) searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy string, tags []string, classification libraryClassificationSearch, includeFolder, includeTags, includeBrowse bool) (string, []any) {
 	projectionScope := 1
 	if scope == "cloud" {
 		projectionScope = 0
@@ -445,15 +446,19 @@ func (c *cloudClient) searchProjectionWhere(scope, lifecycle, needle, folderID, 
 	}
 	if needle != "" {
 		pattern := "%" + needle + "%"
+		textClause := ""
 		if strings.ContainsAny(needle, "%_") {
 			pattern = "%" + strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(needle) + "%"
-			where = append(where, `(p.name_search LIKE ? ESCAPE '\' OR p.folder_search LIKE ? ESCAPE '\' OR p.tags_search LIKE ? ESCAPE '\')`)
+			textClause = `(p.name_search LIKE ? ESCAPE '\' OR p.folder_search LIKE ? ESCAPE '\' OR p.tags_search LIKE ? ESCAPE '\')`
 		} else if len([]rune(needle)) >= 3 {
-			where = append(where, `p.rowid IN (SELECT rowid FROM library_search_fts WHERE name_search LIKE ? OR folder_search LIKE ? OR tags_search LIKE ?)`)
+			textClause = `p.rowid IN (SELECT rowid FROM library_search_fts WHERE name_search LIKE ? OR folder_search LIKE ? OR tags_search LIKE ?)`
 		} else {
-			where = append(where, `(p.name_search LIKE ? OR p.folder_search LIKE ? OR p.tags_search LIKE ?)`)
+			textClause = `(p.name_search LIKE ? OR p.folder_search LIKE ? OR p.tags_search LIKE ?)`
 		}
+		classificationClause, classificationArgs := classificationKeywordSQL("p", c.libraryID(), "%"+strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(foldedTagKey(needle))+"%")
+		where = append(where, "("+textClause+" OR "+classificationClause+")")
 		args = append(args, pattern, pattern, pattern)
+		args = append(args, classificationArgs...)
 	}
 	if includeFolder {
 		if folderID == "unfiled" {
@@ -472,6 +477,9 @@ func (c *cloudClient) searchProjectionWhere(scope, lifecycle, needle, folderID, 
 			args = append(args, foldedTagKey(tag))
 		}
 	}
+	classificationWhere, classificationArgs := classificationSearchSQL("p", c.libraryID(), classification, includeBrowse)
+	where = append(where, classificationWhere...)
+	args = append(args, classificationArgs...)
 	return strings.Join(where, " AND "), args
 }
 
@@ -545,44 +553,83 @@ func (c *cloudClient) searchProjectionCoverage(scope string) (string, []string, 
 // searchProjectionFacets counts folder and tag facets in SQLite with the same
 // cross-filtering as the Go fallback: folder facets apply every filter except
 // the folder selection, tag facets apply every filter except the tag selection.
-func (c *cloudClient) searchProjectionFacets(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy string, tags []string) ([]libraryFolderFacet, []libraryTagFacet, bool, error) {
+func (c *cloudClient) searchProjectionFacets(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy string, tags []string, classification libraryClassificationSearch) ([]libraryFolderFacet, []libraryTagFacet, []libraryIndexFacet, bool, error) {
 	c.searchMu.Lock()
 	defer c.searchMu.Unlock()
 	if c.runtime.db == nil || !c.searchReady {
-		return nil, nil, false, nil
+		return nil, nil, nil, false, nil
 	}
-	folderCond, folderArgs := c.searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, tags, false, true)
+	folderCond, folderArgs := c.searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, tags, classification, false, true, true)
 	folderRows, err := c.runtime.db.Query(`SELECT fid,fname,cnt FROM (SELECT CASE WHEN p.folder_id='' THEN 'unfiled' ELSE p.folder_id END AS fid, CASE WHEN p.folder_id='' THEN '未归组' ELSE p.folder_name END AS fname, COUNT(*) OVER (PARTITION BY CASE WHEN p.folder_id='' THEN 'unfiled' ELSE p.folder_id END) AS cnt, ROW_NUMBER() OVER (PARTITION BY CASE WHEN p.folder_id='' THEN 'unfiled' ELSE p.folder_id END ORDER BY p.name DESC,p.file_id DESC) AS rn FROM library_search_current AS p WHERE `+folderCond+`) WHERE rn=1 ORDER BY fname,fid`, folderArgs...)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
 	folders := []libraryFolderFacet{}
 	for folderRows.Next() {
 		var facet libraryFolderFacet
 		if err := folderRows.Scan(&facet.ID, &facet.Name, &facet.Count); err != nil {
 			folderRows.Close()
-			return nil, nil, false, err
+			return nil, nil, nil, false, err
 		}
 		folders = append(folders, facet)
 	}
 	if err := folderRows.Err(); err != nil {
 		folderRows.Close()
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
 	folderRows.Close()
-	tagCond, tagArgs := c.searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, tags, true, false)
+	tagCond, tagArgs := c.searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, tags, classification, true, false, true)
 	tagRows, err := c.runtime.db.Query(`SELECT t.tag_name,COUNT(*) FROM library_search_tags AS t JOIN library_search_current AS p ON p.scope=t.scope AND p.file_id=t.file_id WHERE `+tagCond+` GROUP BY t.tag_name ORDER BY t.tag_name`, tagArgs...)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
-	defer tagRows.Close()
 	tagItems := []libraryTagFacet{}
 	for tagRows.Next() {
 		var facet libraryTagFacet
 		if err := tagRows.Scan(&facet.Name, &facet.Count); err != nil {
-			return nil, nil, false, err
+			tagRows.Close()
+			return nil, nil, nil, false, err
 		}
 		tagItems = append(tagItems, facet)
 	}
-	return folders, tagItems, true, tagRows.Err()
+	if err := tagRows.Err(); err != nil {
+		tagRows.Close()
+		return nil, nil, nil, false, err
+	}
+	tagRows.Close()
+	indexItems := []libraryIndexFacet{}
+	if classification.FacetRequested {
+		indexCond, indexArgs := c.searchProjectionWhere(scope, lifecycle, needle, folderID, fileType, grouped, cloudCopy, tags, classification, true, true, false)
+		var nodeRows *sql.Rows
+		if classification.FacetParentID == "" {
+			nodeRows, err = c.runtime.db.Query(`SELECT index_id,name FROM classification_nodes WHERE library_id=? AND parent_id IS NULL AND deleted=0 ORDER BY name_key,index_id`, c.libraryID())
+		} else {
+			nodeRows, err = c.runtime.db.Query(`SELECT index_id,name FROM classification_nodes WHERE library_id=? AND parent_id=? AND deleted=0 ORDER BY name_key,index_id`, c.libraryID(), classification.FacetParentID)
+		}
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		for nodeRows.Next() {
+			var facet libraryIndexFacet
+			if err = nodeRows.Scan(&facet.ID, &facet.Name); err != nil {
+				nodeRows.Close()
+				return nil, nil, nil, false, err
+			}
+			facet.Mode = "subtree"
+			indexItems = append(indexItems, facet)
+		}
+		if err = nodeRows.Err(); err != nil {
+			nodeRows.Close()
+			return nil, nil, nil, false, err
+		}
+		nodeRows.Close()
+		for at := range indexItems {
+			membershipCond, membershipArgs := classificationConditionSQL("p", c.libraryID(), libraryIndexCondition{Mode: "subtree", ID: indexItems[at].ID})
+			countArgs := append(append([]any{}, indexArgs...), membershipArgs...)
+			if err = c.runtime.db.QueryRow(`SELECT COUNT(*) FROM library_search_current AS p WHERE `+indexCond+` AND `+membershipCond, countArgs...).Scan(&indexItems[at].Count); err != nil {
+				return nil, nil, nil, false, err
+			}
+		}
+	}
+	return folders, tagItems, indexItems, true, nil
 }

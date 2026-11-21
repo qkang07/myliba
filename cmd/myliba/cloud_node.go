@@ -181,8 +181,11 @@ func newCloudRuntime(db *sql.DB, storageOnly bool) (*cloudRuntime, error) {
 			}
 		}
 		// Direct and relayed storage endpoints share cloudDisk routes. Check
-		// admission there so neither path can bypass Hub serialization.
+		// admission there so neither path can bypass Hub serialization. Their
+		// capability route also follows the Hub's authoritative library gate;
+		// a storage node never activates classification independently.
 		disk.catalogAdmission = rt.catalogCommittedByHub
+		disk.catalogCapabilityLookup = rt.hubClassificationCapabilitiesFor
 	}
 	return rt, nil
 }
@@ -389,6 +392,15 @@ func (c *cloudRuntime) request(ctx context.Context, method, base, path, token st
 	return c.client.Do(req)
 }
 
+type cloudPutStatusError struct {
+	kind   string
+	status int
+}
+
+func (e *cloudPutStatusError) Error() string {
+	return fmt.Sprintf("cloud %s PUT: HTTP %d", e.kind, e.status)
+}
+
 func (c *cloudRuntime) put(ctx context.Context, base, kind, id, token string, data []byte) error {
 	response, err := c.request(ctx, http.MethodPut, base, "/cloud/"+kind+"/"+id, token, bytes.NewReader(data))
 	if err != nil {
@@ -396,7 +408,7 @@ func (c *cloudRuntime) put(ctx context.Context, base, kind, id, token string, da
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("cloud %s PUT: HTTP %d", kind, response.StatusCode)
+		return &cloudPutStatusError{kind: kind, status: response.StatusCode}
 	}
 	return nil
 }
@@ -526,6 +538,13 @@ func (c *cloudRuntime) syncCatalog(ctx context.Context, base, token string) erro
 			return checkErr
 		}
 		if err := c.put(ctx, base, "catalog", id, token, data); err != nil {
+			// During a classification preparation the Hub freezes new writes
+			// (423); after activation it rejects old-format stragglers (409).
+			// Both are permanent for that record, so keep syncing the rest.
+			var statusErr *cloudPutStatusError
+			if errors.As(err, &statusErr) && (statusErr.status == http.StatusLocked || statusErr.status == http.StatusConflict) {
+				continue
+			}
 			return err
 		}
 	}
